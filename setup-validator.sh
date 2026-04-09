@@ -20,7 +20,7 @@
 #     --network <testnet|mainnet> \
 #     [--ledger-disk /dev/nvme0n1] \
 #     [--accounts-disk /dev/nvme1n1] \
-#     [--auto-disks] \
+#     [--no-auto-disks] \
 #     [--swap-size 128G] \
 #     [--dry-run]
 
@@ -33,7 +33,7 @@ NETWORK="testnet"
 LEDGER_DISK=""
 ACCOUNTS_DISK=""
 SWAP_SIZE="128G"
-AUTO_DISKS=false
+AUTO_DISKS=true
 DRY_RUN=false
 SSH_HOST=""
 SSH_KEY=""
@@ -103,16 +103,18 @@ Optional:
                                          new-york, salt-lake-city, singapore, tokyo
                                 Testnet: dallas, new-york
   --ledger-disk <device>        Block device for ledger (e.g., /dev/nvme0n1)
+                                Disables auto-disk detection when specified
   --accounts-disk <device>      Block device for accounts (e.g., /dev/nvme1n1)
-  --auto-disks                  Auto-discover unformatted NVMe drives on server
+                                Disables auto-disk detection when specified
+  --no-auto-disks               Disable auto-discovery of NVMe drives
   --swap-size <size>            Swap file size (default: 128G)
   --dry-run                     Print commands without executing
   -h, --help                    Show this help
 
 Disk selection priority:
-  1. Explicit --ledger-disk / --accounts-disk flags
-  2. --auto-disks: scans server for unused/unformatted NVMe drives
-  3. Falls back to /home/sol/ directories if neither is specified
+  1. Explicit --ledger-disk / --accounts-disk flags (disables auto-detection)
+  2. Auto-detection (default): scans server for unused/unformatted NVMe drives
+  3. Falls back to /home/sol/ directories if no drives found
 EOF
   exit 1
 }
@@ -128,9 +130,9 @@ while [[ $# -gt 0 ]]; do
     --github-ssh-key) GITHUB_SSH_KEY="$2"; shift 2 ;;
     --jito-region)   JITO_REGION="$2";     shift 2 ;;
     --network)       NETWORK="$2";         shift 2 ;;
-    --ledger-disk)   LEDGER_DISK="$2";     shift 2 ;;
-    --accounts-disk) ACCOUNTS_DISK="$2";   shift 2 ;;
-    --auto-disks)    AUTO_DISKS=true;      shift   ;;
+    --ledger-disk)   LEDGER_DISK="$2"; AUTO_DISKS=false; shift 2 ;;
+    --accounts-disk) ACCOUNTS_DISK="$2"; AUTO_DISKS=false; shift 2 ;;
+    --no-auto-disks) AUTO_DISKS=false;     shift   ;;
     --swap-size)     SWAP_SIZE="$2";       shift 2 ;;
     --dry-run)       DRY_RUN=true;         shift   ;;
     -h|--help)       usage ;;
