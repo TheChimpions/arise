@@ -43,6 +43,7 @@ VOTE_ACCOUNT=""
 COMMISSION_BPS=""
 SOL_USER="sol"
 JITO_REGION=""
+GITHUB_SSH_KEY=""
 
 # ---------------------------------------------------------------------------
 # Jito region configs: REGION|BLOCK_ENGINE_URL|SHRED_RECEIVER|NTP_SERVER
@@ -95,6 +96,7 @@ Bootstrap (for fresh servers):
                                 reconnects as sol for the rest of the setup
 
 Optional:
+  --github-ssh-key <path>       SSH key for GitHub (to clone jito-solana repo)
   --network <testnet|mainnet>   Network to join (default: testnet)
   --jito-region <region>        Jito region (auto-detected from server IP if omitted)
                                 Mainnet: amsterdam, dublin, frankfurt, london,
@@ -123,6 +125,7 @@ while [[ $# -gt 0 ]]; do
     --identity)      IDENTITY_FILE="$2";   shift 2 ;;
     --vote-account)  VOTE_ACCOUNT="$2";    shift 2 ;;
     --commission-bps) COMMISSION_BPS="$2"; shift 2 ;;
+    --github-ssh-key) GITHUB_SSH_KEY="$2"; shift 2 ;;
     --jito-region)   JITO_REGION="$2";     shift 2 ;;
     --network)       NETWORK="$2";         shift 2 ;;
     --ledger-disk)   LEDGER_DISK="$2";     shift 2 ;;
@@ -200,7 +203,7 @@ fi
 # ---------------------------------------------------------------------------
 # SSH helpers
 # ---------------------------------------------------------------------------
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -i $SSH_KEY"
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $SSH_KEY"
 
 # Determine root connection — use --root-user if provided, otherwise
 # fall back to sol with sudo for system-level operations
@@ -315,6 +318,13 @@ chown -R ${SOL_USER}:${SOL_USER} /home/${SOL_USER}/.ssh
 echo "Sol user bootstrap complete"
 BOOTEOF
   )
+
+  # Verify SSH connectivity to root user first (also accepts host key)
+  log_info "Testing SSH connection to ${ROOT_DEST}..."
+  if ! ssh $SSH_OPTS "$ROOT_DEST" "echo 'SSH connection OK'" 2>/dev/null; then
+    log_error "Cannot SSH to ${ROOT_DEST} — check SSH key and host"
+    exit 1
+  fi
 
   # Execute bootstrap as root
   BOOT_TMP=$(mktemp)
@@ -541,6 +551,14 @@ if [[ "$NETWORK" == "mainnet" ]]; then
   fi
   PUBLIC_RPC_ADDRESS="${SERVER_IP}:8899"
   log_info "Public RPC address: $PUBLIC_RPC_ADDRESS"
+fi
+
+# --- Prompt for commission if not provided (mainnet) ---
+if [[ "$NETWORK" == "mainnet" && -z "$COMMISSION_BPS" ]] && ! $DRY_RUN; then
+  echo ""
+  read -rp "Commission in basis points (e.g., 0 = 0%, 500 = 5%, 1000 = 10%) [0]: " COMMISSION_BPS
+  COMMISSION_BPS="${COMMISSION_BPS:-0}"
+  log_info "Commission: ${COMMISSION_BPS} bps"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1034,6 +1052,133 @@ echo "Rust and rustfmt ready: $(rustc --version)"
 SCRIPT
 
 # ---------------------------------------------------------------------------
+# Step 6b: Build and install Jito validator
+# ---------------------------------------------------------------------------
+if [[ -n "$GITHUB_SSH_KEY" ]]; then
+  log_info "Step 6b: Building Jito validator from source"
+
+  if [[ ! -f "$GITHUB_SSH_KEY" ]]; then
+    log_error "GitHub SSH key not found: $GITHUB_SSH_KEY"
+    exit 1
+  fi
+
+  # Copy GitHub SSH key to sol user
+  if $DRY_RUN; then
+    echo "[DRY RUN] scp $GITHUB_SSH_KEY -> $SOL_HOST:/home/${SOL_USER}/.ssh/github_key"
+  else
+    scp $SSH_OPTS "$GITHUB_SSH_KEY" "$SOL_HOST:/home/${SOL_USER}/.ssh/github_key"
+    remote "chmod 600 /home/${SOL_USER}/.ssh/github_key"
+
+    # Configure SSH to use this key for github.com
+    sol_script <<'SSHCONF'
+if ! grep -q "github.com" ~/.ssh/config 2>/dev/null; then
+  cat >> ~/.ssh/config <<'EOF'
+Host github.com
+  IdentityFile ~/.ssh/github_key
+  StrictHostKeyChecking accept-new
+EOF
+  chmod 600 ~/.ssh/config
+  echo "GitHub SSH config added"
+else
+  echo "GitHub SSH config already exists"
+fi
+SSHCONF
+  fi
+
+  # Check if jito-solana is already built at the active_release path
+  JITO_ALREADY_BUILT=$(remote "test -f /home/${SOL_USER}/.local/share/solana/install/releases/active_release/bin/agave-validator && echo YES || echo NO" 2>/dev/null || echo "NO")
+
+  if [[ "$JITO_ALREADY_BUILT" == "YES" ]]; then
+    log_info "Jito validator already built — skipping"
+  else
+    # Fetch branches and prompt for selection
+    log_info "Fetching branches from jito-solana..."
+    BRANCHES=$(remote "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/github_key git@github.com 2>/dev/null; git ls-remote --heads git@github.com:TheChimpions/jito-solana.git 2>/dev/null | awk '{print \$2}' | sed 's|refs/heads/||' | grep -E '(jito|tuxr)$' | sort -V" 2>/dev/null || true)
+
+    if [[ -z "$BRANCHES" ]]; then
+      log_error "Could not fetch branches — check GitHub SSH key"
+      exit 1
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "  Select Jito branch to build"
+    echo "=========================================="
+    local_i=1
+    declare -a BRANCH_LIST=()
+    while IFS= read -r branch; do
+      [[ -z "$branch" ]] && continue
+      printf "  %d) %s\n" "$local_i" "$branch"
+      BRANCH_LIST+=("$branch")
+      ((local_i++))
+    done <<< "$BRANCHES"
+    echo ""
+
+    while true; do
+      read -rp "Select branch: " choice
+      if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < local_i )); then
+        JITO_BRANCH="${BRANCH_LIST[$((choice - 1))]}"
+        break
+      else
+        echo "Invalid selection. Enter a number between 1 and $((local_i - 1))."
+      fi
+    done
+
+    log_info "Building Jito branch: $JITO_BRANCH"
+
+    # Clone, checkout, build
+    sol_script <<BUILDEOF
+set -e
+. "\$HOME/.cargo/env"
+export LIBCLANG_PATH=/usr/lib/llvm-18/lib
+
+# Clone if not already cloned
+if [ ! -d ~/jito-solana ]; then
+  git clone git@github.com:TheChimpions/jito-solana.git ~/jito-solana
+  echo "Cloned jito-solana"
+else
+  echo "jito-solana already cloned"
+  cd ~/jito-solana
+  git fetch --all
+fi
+
+cd ~/jito-solana
+git checkout ${JITO_BRANCH}
+git submodule update --init --recursive
+
+CI_COMMIT=\$(git rev-parse HEAD)
+echo "Building commit: \$CI_COMMIT on branch ${JITO_BRANCH}"
+
+scripts/cargo-install-all.sh --validator-only ~/.local/share/solana/install/releases/active_release
+
+echo "Jito validator built successfully"
+BUILDEOF
+  fi
+
+  # Ensure PATH is in .bashrc
+  sol_script <<'PATHEOF'
+SOLANA_BIN='PATH="/home/sol/.local/share/solana/install/releases/active_release/bin:$PATH"'
+if ! grep -q "releases/active_release/bin" ~/.bashrc 2>/dev/null; then
+  echo "$SOLANA_BIN" >> ~/.bashrc
+  echo "Added solana bin to .bashrc"
+else
+  echo "Solana bin already in .bashrc"
+fi
+
+# Also add to .profile for login shells
+if ! grep -q "releases/active_release/bin" ~/.profile 2>/dev/null; then
+  echo "export $SOLANA_BIN" >> ~/.profile
+  echo "Added solana bin to .profile"
+else
+  echo "Solana bin already in .profile"
+fi
+PATHEOF
+
+else
+  log_warn "Step 6b: No --github-ssh-key provided — skipping Jito build"
+fi
+
+# ---------------------------------------------------------------------------
 # Step 7: Copy identity keypair to server
 # ---------------------------------------------------------------------------
 log_info "Step 7: Copying identity keypair to server"
@@ -1049,8 +1194,27 @@ else
   fi
 fi
 
+# Generate unstaked identity and symlink identity.json -> unstaked
+log_info "Step 7b: Setting up unstaked identity and identity.json symlink"
+
+sol_script <<'SCRIPT'
+export PATH="$HOME/.local/share/solana/install/releases/active_release/bin:$PATH"
+
+if [ -f ~/unstaked_identity.json ]; then
+  echo "unstaked_identity.json already exists"
+else
+  solana-keygen new --outfile ~/unstaked_identity.json --no-passphrase
+  echo "Generated unstaked_identity.json"
+fi
+
+# Symlink identity.json -> unstaked_identity.json
+# Validator starts with unstaked identity; switch to staked manually
+ln -sf unstaked_identity.json ~/identity.json
+echo "identity.json -> unstaked_identity.json"
+SCRIPT
+
 # ---------------------------------------------------------------------------
-# Step 6b: Create mostly_confirmed_threshold
+# Step 7c: Create mostly_confirmed_threshold
 # ---------------------------------------------------------------------------
 log_info "Step 7b: Creating mostly_confirmed_threshold"
 
@@ -1259,6 +1423,10 @@ ufw allow 22/tcp
 ufw allow 8000:10000/tcp
 ufw allow 8000:10000/udp
 
+# DoubleZero interface rules
+ufw allow in on doublezero0 to any port 44880 proto udp
+ufw allow out on doublezero0 to any port 44880 proto udp
+
 # Enable (idempotent - won't prompt if already active)
 echo "y" | ufw enable
 
@@ -1278,7 +1446,7 @@ if grep -q "^PasswordAuthentication yes" "$SSHD_CONFIG" 2>/dev/null || \
    ! grep -q "^PasswordAuthentication no" "$SSHD_CONFIG" 2>/dev/null; then
   sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG"
   sed -i 's/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "$SSHD_CONFIG"
-  systemctl reload sshd
+  systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
   echo "SSH hardened - password auth disabled"
 else
   echo "SSH already hardened"
