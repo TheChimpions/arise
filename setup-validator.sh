@@ -591,7 +591,8 @@ apt-get install -y \
   make \
   libprotobuf-dev \
   protobuf-compiler \
-  libclang-dev
+  libclang-dev \
+  docker.io
 SCRIPT
 
 # ---------------------------------------------------------------------------
@@ -1467,6 +1468,48 @@ else
   echo "fail2ban already running"
 fi
 SCRIPT
+
+# ---------------------------------------------------------------------------
+# Step 14: jag-snap (Docker-based snapshot tool)
+# ---------------------------------------------------------------------------
+if [[ -n "$GITHUB_SSH_KEY" ]]; then
+  log_info "Step 14: Setting up jag-snap"
+
+  sol_script <<'SCRIPT'
+if [ -d ~/jag-snap ]; then
+  echo "jag-snap already cloned"
+else
+  git clone git@github.com:jaguar-labs/jag-snap.git ~/jag-snap
+  echo "Cloned jag-snap"
+fi
+SCRIPT
+
+  root_script <<'SCRIPT'
+# Ensure docker is running
+systemctl enable --now docker
+
+# Add sol user to docker group so it can run containers
+usermod -aG docker sol
+SCRIPT
+
+  root_script <<SCRIPT
+cd /home/${SOL_USER}/jag-snap
+
+# Build the image
+docker build -t jag-snap .
+echo "jag-snap image built"
+
+# Remove existing container if present
+docker rm -f jag-snap 2>/dev/null || true
+
+# Run jag-snap
+docker run -d --name jag-snap --network host jag-snap
+echo "jag-snap container started"
+SCRIPT
+
+else
+  log_warn "Step 14: No --github-ssh-key provided — skipping jag-snap setup"
+fi
 
 # ---------------------------------------------------------------------------
 # Done
