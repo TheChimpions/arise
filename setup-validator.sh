@@ -65,6 +65,18 @@ TESTNET_REGIONS=(
 )
 
 # ---------------------------------------------------------------------------
+# BloXroute shred receiver configs: REGION|LAT,LON|SHRED1,SHRED2
+# ---------------------------------------------------------------------------
+BLOXROUTE_REGIONS=(
+  "frankfurt|50.1109,8.6821|fra1-shreds.blxrbdn.com:8888,fra2-shreds.blxrbdn.com:8888"
+  "amsterdam|52.3676,4.9041|ams1-shreds.blxrbdn.com:8888,ams2-shreds.blxrbdn.com:8888"
+  "new-york|40.7128,-74.0060|ny1-shreds.blxrbdn.com:8888,ny2-shreds.blxrbdn.com:8888"
+  "singapore|1.3521,103.8198|sg1-shreds.blxrbdn.com:8888,sg2-shreds.blxrbdn.com:8888"
+  "sao-paulo|-23.5505,-46.6333|sp1-shreds.blxrbdn.com:8888,sp2-shreds.blxrbdn.com:8888"
+  "south-africa|-33.9249,18.4241|sa1-shreds.blxrbdn.com:8888,sa2-shreds.blxrbdn.com:8888"
+)
+
+# ---------------------------------------------------------------------------
 # Colors
 # ---------------------------------------------------------------------------
 RED='\033[0;31m'
@@ -399,10 +411,11 @@ lookup_region() {
   return 1
 }
 
-detect_jito_region() {
-  log_info "Detecting server region from IP geolocation..."
+detect_server_location() {
+  # Geolocate the server — sets SERVER_IP, SERVER_CITY, SERVER_COUNTRY, SERVER_LAT, SERVER_LON
+  # Runs in main shell so variables persist for both Jito and BloXroute detection
+  log_info "Detecting server location from IP geolocation..."
 
-  # Get server public IP and geolocate it
   SERVER_GEO=$(ssh $SSH_OPTS "$PROBE_HOST" "curl -s https://ipinfo.io 2>/dev/null || curl -s https://ifconfig.co/json 2>/dev/null || true")
 
   if [[ -z "$SERVER_GEO" ]]; then
@@ -410,7 +423,6 @@ detect_jito_region() {
     return 1
   fi
 
-  # Extract city, region, country, coordinates
   SERVER_CITY=$(echo "$SERVER_GEO" | grep -o '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"city"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
   SERVER_COUNTRY=$(echo "$SERVER_GEO" | grep -o '"country"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"country"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
   SERVER_LOC=$(echo "$SERVER_GEO" | grep -o '"loc"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"loc"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
@@ -425,6 +437,13 @@ detect_jito_region() {
 
   SERVER_LAT=$(echo "$SERVER_LOC" | cut -d',' -f1)
   SERVER_LON=$(echo "$SERVER_LOC" | cut -d',' -f2)
+}
+
+detect_jito_region() {
+  # Requires SERVER_LAT and SERVER_LON to be set (via detect_server_location)
+  if [[ -z "${SERVER_LAT:-}" || -z "${SERVER_LON:-}" ]]; then
+    return 1
+  fi
 
   # Known Jito region coordinates for distance calculation
   declare -A REGION_COORDS
@@ -468,62 +487,53 @@ detect_jito_region() {
   return 1
 }
 
-prompt_jito_region() {
-  echo ""
-  echo "=========================================="
-  echo "  Jito Region Selection ($NETWORK)"
-  echo "=========================================="
+detect_bloxroute_region() {
+  local srv_lat="$1"
+  local srv_lon="$2"
+  local best_region=""
+  local best_dist=999999
 
-  # Build numbered list
-  local i=1
-  declare -a region_names=()
-  while IFS='|' read -r name block_engine shred_receiver ntp; do
-    region_names+=("$name")
-    local marker=""
-    if [[ -n "$1" && "$name" == "$1" ]]; then
-      marker=" <-- detected (closest to server)"
-    fi
-    printf "  %d) %-20s %s%s\n" "$i" "$name" "$block_engine" "$marker"
-    ((i++))
-  done < <(get_regions_for_network)
+  for entry in "${BLOXROUTE_REGIONS[@]}"; do
+    local name coords shreds
+    name=$(echo "$entry" | cut -d'|' -f1)
+    coords=$(echo "$entry" | cut -d'|' -f2)
+    shreds=$(echo "$entry" | cut -d'|' -f3)
+    local rlat rlon
+    rlat=$(echo "$coords" | cut -d',' -f1)
+    rlon=$(echo "$coords" | cut -d',' -f2)
 
-  echo ""
+    dist=$(awk "BEGIN {
+      dlat = $srv_lat - $rlat;
+      dlon = ($srv_lon - $rlon) * 0.7;
+      print sqrt(dlat*dlat + dlon*dlon)
+    }")
 
-  # If we have a suggestion, default to it
-  local default_num=""
-  if [[ -n "$1" ]]; then
-    for idx in "${!region_names[@]}"; do
-      if [[ "${region_names[$idx]}" == "$1" ]]; then
-        default_num=$((idx + 1))
-        break
-      fi
-    done
-  fi
-
-  while true; do
-    if [[ -n "$default_num" ]]; then
-      read -rp "Select region [${default_num}]: " choice
-      choice="${choice:-$default_num}"
-    else
-      read -rp "Select region: " choice
-    fi
-
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
-      JITO_REGION="${region_names[$((choice - 1))]}"
-      break
-    else
-      echo "Invalid selection. Enter a number between 1 and $((i - 1))."
+    if awk "BEGIN { exit !($dist < $best_dist) }"; then
+      best_dist="$dist"
+      best_region="$shreds"
     fi
   done
 
-  log_info "Selected Jito region: $JITO_REGION"
+  if [[ -n "$best_region" ]]; then
+    echo "$best_region"
+    return 0
+  fi
+  return 1
 }
+
+# --- Geolocate server (used by both Jito and BloXroute) ---
+if ! $DRY_RUN; then
+  detect_server_location || true
+fi
 
 # --- Resolve Jito region ---
 if [[ -z "$JITO_REGION" ]] && ! $DRY_RUN; then
-  SUGGESTED_REGION=""
-  SUGGESTED_REGION=$(detect_jito_region 2>/dev/null) || true
-  prompt_jito_region "$SUGGESTED_REGION"
+  JITO_REGION=$(detect_jito_region 2>/dev/null) || true
+  if [[ -n "$JITO_REGION" ]]; then
+    log_info "Auto-selected Jito region: $JITO_REGION"
+  else
+    log_warn "Could not auto-detect Jito region — you will need to fill in shred receiver and block engine values in validator.sh before starting"
+  fi
 elif [[ -n "$JITO_REGION" ]]; then
   if ! lookup_region "$JITO_REGION" >/dev/null; then
     log_error "Unknown Jito region: $JITO_REGION"
@@ -543,6 +553,17 @@ if [[ -n "$JITO_REGION" ]]; then
   log_info "Block engine:     $JITO_BLOCK_ENGINE"
   log_info "Shred receiver:   $JITO_SHRED_RECEIVER"
   log_info "NTP server:       $JITO_NTP_SERVER"
+fi
+
+# --- Resolve BloXroute shred receivers based on server location ---
+BLOXROUTE_SHREDS=""
+if [[ "$NETWORK" == "mainnet" && -n "${SERVER_LAT:-}" && -n "${SERVER_LON:-}" ]]; then
+  BLOXROUTE_SHREDS=$(detect_bloxroute_region "$SERVER_LAT" "$SERVER_LON" 2>/dev/null) || true
+  if [[ -n "$BLOXROUTE_SHREDS" ]]; then
+    log_info "BloXroute shreds: $BLOXROUTE_SHREDS"
+  else
+    log_warn "Could not detect closest BloXroute region"
+  fi
 fi
 
 # --- Resolve public RPC address from server IP ---
@@ -1096,7 +1117,7 @@ SSHCONF
   else
     # Fetch branches and prompt for selection
     log_info "Fetching branches from jito-solana..."
-    BRANCHES=$(remote "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/github_key git@github.com 2>/dev/null; git ls-remote --heads git@github.com:TheChimpions/jito-solana.git 2>/dev/null | awk '{print \$2}' | sed 's|refs/heads/||' | grep -E '(jito|tuxr)$' | sort -V" 2>/dev/null || true)
+    BRANCHES=$(remote "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/github_key git@github.com 2>/dev/null; git ls-remote --heads git@github.com:TheChimpions/jito-solana.git 2>/dev/null | awk '{print \$2}' | sed 's|refs/heads/||' | grep -E 'tuxr$' | sort -V" 2>/dev/null || true)
 
     if [[ -z "$BRANCHES" ]]; then
       log_error "Could not fetch branches — check GitHub SSH key"
@@ -1276,7 +1297,7 @@ if [[ "$NETWORK" == "mainnet" ]]; then
     --merkle-root-upload-authority GZctHpWXmsZC1YHACTGGcHhYxjdRqQvTpYkb9LMvxDib \\
     --commission-bps ${COMMISSION_BPS:-0} \\
     --block-engine-url ${JITO_BLOCK_ENGINE:-<FILL_IN_BLOCK_ENGINE_URL>} \\
-    --shred-receiver-address ${JITO_SHRED_RECEIVER:-<FILL_IN_SHRED_RECEIVER_ADDRESS>} \\
+    --shred-receiver-address ${JITO_SHRED_RECEIVER:-<FILL_IN_SHRED_RECEIVER_ADDRESS>},233.84.178.1:7733${BLOXROUTE_SHREDS:+,${BLOXROUTE_SHREDS}} \\
     --only-known-rpc \\
     --log /home/${SOL_USER}/logs/agave-validator.log \\
     --accounts ${ACCOUNTS_PATH} \\
