@@ -1368,6 +1368,7 @@ Type=simple
 Restart=always
 RestartSec=1
 User=${SOL_USER}
+WorkingDirectory=/home/${SOL_USER}
 LimitNOFILE=1000000
 LimitMEMLOCK=2000000000
 LogRateLimitIntervalSec=0
