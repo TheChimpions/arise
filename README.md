@@ -96,6 +96,7 @@ On the **target server**:
 | Flag | Description |
 |---|---|
 | `--github-ssh-key` | SSH key for GitHub (required to build Jito + run jag-snap) |
+| `--jito-repo` | Jito-Solana git repo URL (default: `git@github.com:jito-foundation/jito-solana.git`) |
 | `--network` | `testnet` or `mainnet` (default: `testnet`) |
 | `--jito-region` | Override auto-detection (e.g. `frankfurt`, `new-york`, `singapore`) |
 | `--ledger-disk` | Explicit ledger disk (e.g. `/dev/nvme0n1`). Disables auto-detection. |
