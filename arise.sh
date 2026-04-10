@@ -197,7 +197,6 @@ PROBE_HOST="${ROOT_DEST:-$SOL_HOST}"
 # Network-specific config
 # ---------------------------------------------------------------------------
 if [[ "$NETWORK" == "testnet" ]]; then
-  RPC_URL="https://api.testnet.solana.com"
   ENTRYPOINTS=(
     "entrypoint.testnet.solana.com:8001"
     "entrypoint2.testnet.solana.com:8001"
@@ -211,7 +210,6 @@ if [[ "$NETWORK" == "testnet" ]]; then
     "9QxCLckBiJc783jnMvXZubK4wH86Eqqvashtrwvcsgkv"
   )
 else
-  RPC_URL="https://api.mainnet-beta.solana.com"
   ENTRYPOINTS=(
     "entrypoint.mainnet-beta.solana.com:8001"
     "entrypoint2.mainnet-beta.solana.com:8001"
