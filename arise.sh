@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 #
+#   █████╗ ██████╗ ██╗███████╗███████╗
+#  ██╔══██╗██╔══██╗██║██╔════╝██╔════╝
+#  ███████║██████╔╝██║███████╗█████╗
+#  ██╔══██║██╔══██╗██║╚════██║██╔══╝
+#  ██║  ██║██║  ██║██║███████║███████╗
+#  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚══════╝╚══════╝
+#
 # Solana Validator Server Setup Script
 #
 # Idempotent script that configures a remote server (via SSH) to run a Solana validator.
@@ -12,7 +19,7 @@
 #   - Server has NVMe drives available for ledger/accounts/snapshots
 #
 # Usage:
-#   ./setup-validator.sh \
+#   ./arise.sh \
 #     --host <user@host> \
 #     --ssh-key <path-to-ssh-key> \
 #     --identity <path-to-staked_identity.json> \
