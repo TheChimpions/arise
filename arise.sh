@@ -51,6 +51,7 @@ COMMISSION_BPS=""
 SOL_USER="sol"
 JITO_REGION=""
 GITHUB_SSH_KEY=""
+JITO_REPO_URL="git@github.com:jito-foundation/jito-solana.git"
 
 # ---------------------------------------------------------------------------
 # Jito region configs: REGION|BLOCK_ENGINE_URL|SHRED_RECEIVER|NTP_SERVER
@@ -116,6 +117,8 @@ Bootstrap (for fresh servers):
 
 Optional:
   --github-ssh-key <path>       SSH key for GitHub (to clone jito-solana repo)
+  --jito-repo <url>             Jito-Solana git repo to build from
+                                (default: git@github.com:jito-foundation/jito-solana.git)
   --network <testnet|mainnet>   Network to join (default: testnet)
   --jito-region <region>        Jito region (auto-detected from server IP if omitted)
                                 Mainnet: amsterdam, dublin, frankfurt, london,
@@ -147,6 +150,7 @@ while [[ $# -gt 0 ]]; do
     --vote-account)  VOTE_ACCOUNT="$2";    shift 2 ;;
     --commission-bps) COMMISSION_BPS="$2"; shift 2 ;;
     --github-ssh-key) GITHUB_SSH_KEY="$2"; shift 2 ;;
+    --jito-repo)     JITO_REPO_URL="$2";   shift 2 ;;
     --jito-region)   JITO_REGION="$2";     shift 2 ;;
     --network)       NETWORK="$2";         shift 2 ;;
     --ledger-disk)   LEDGER_DISK="$2"; AUTO_DISKS=false; shift 2 ;;
@@ -180,6 +184,7 @@ SSH_HOST="${SSH_HOST##*@}"
 
 # Build SSH destinations
 SOL_HOST="${SOL_USER}@${SSH_HOST}"
+ROOT_DEST=""
 if [[ -n "$ROOT_HOST" ]]; then
   ROOT_DEST="${ROOT_HOST}@${SSH_HOST}"
 fi
@@ -192,7 +197,6 @@ PROBE_HOST="${ROOT_DEST:-$SOL_HOST}"
 # Network-specific config
 # ---------------------------------------------------------------------------
 if [[ "$NETWORK" == "testnet" ]]; then
-  RPC_URL="https://api.testnet.solana.com"
   ENTRYPOINTS=(
     "entrypoint.testnet.solana.com:8001"
     "entrypoint2.testnet.solana.com:8001"
@@ -206,7 +210,6 @@ if [[ "$NETWORK" == "testnet" ]]; then
     "9QxCLckBiJc783jnMvXZubK4wH86Eqqvashtrwvcsgkv"
   )
 else
-  RPC_URL="https://api.mainnet-beta.solana.com"
   ENTRYPOINTS=(
     "entrypoint.mainnet-beta.solana.com:8001"
     "entrypoint2.mainnet-beta.solana.com:8001"
@@ -225,14 +228,6 @@ fi
 # SSH helpers
 # ---------------------------------------------------------------------------
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $SSH_KEY"
-
-# Determine root connection — use --root-user if provided, otherwise
-# fall back to sol with sudo for system-level operations
-if [[ -n "$ROOT_HOST" ]]; then
-  ROOT_DEST="${ROOT_HOST}@${SSH_HOST}"
-else
-  ROOT_DEST=""
-fi
 
 # Run a script as root on the server
 # Uses ROOT_DEST if available (pre-bootstrap), otherwise sol with sudo (post-bootstrap)
@@ -397,7 +392,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Jito region detection & interactive prompts
+# Jito region detection
 # ---------------------------------------------------------------------------
 get_regions_for_network() {
   if [[ "$NETWORK" == "mainnet" ]]; then
@@ -872,12 +867,12 @@ for dev in /dev/nvme*n1; do
     continue
   fi
 
-  # Get size in GB for display
+  # Get size in bytes (for sorting) and GB (for display)
   size_bytes=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
   size_gb=$((size_bytes / 1073741824))
 
-  # Report: device, size
-  echo "${dev}|none|${size_gb}GB"
+  # Report: device, fs, size_display, size_bytes
+  echo "${dev}|none|${size_gb}GB|${size_bytes}"
   available+=("$dev")
 done
 
@@ -892,37 +887,22 @@ DISKSCRIPT
     log_warn "Falling back to /home/${SOL_USER}/ directories"
   else
     log_info "Discovered unused NVMe drives:"
-    # Parse discovered disks
+    # Parse discovered disks and sort by size descending (largest first)
+    # Format per line: dev|fs|size_gb|size_bytes
+    SORTED_LINES=$(echo "$DISCOVERED_DISKS" | grep -v '^$' | grep -v '^NO_DISKS_FOUND' | sort -t'|' -k4 -rn)
+
     declare -a DISK_LIST=()
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      dev=$(echo "$line" | cut -d'|' -f1)
-      fs=$(echo "$line" | cut -d'|' -f2)
-      size=$(echo "$line" | cut -d'|' -f3)
-      log_info "  $dev  filesystem=$fs  size=$size"
+    while IFS='|' read -r dev fs size_gb _size_bytes; do
+      [[ -z "$dev" ]] && continue
+      log_info "  $dev  filesystem=$fs  size=$size_gb"
       DISK_LIST+=("$dev")
-    done <<< "$DISCOVERED_DISKS"
+    done <<< "$SORTED_LINES"
 
     DISK_COUNT=${#DISK_LIST[@]}
 
     if [[ $DISK_COUNT -ge 2 ]]; then
-      # Two or more drives: sort by size descending on the server
-      SORT_TMP=$(mktemp)
-      cat > "$SORT_TMP" <<'SORTEOF'
-for dev in "$@"; do
-  sz=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
-  echo "$sz $dev"
-done | sort -rn | awk '{print $2}'
-SORTEOF
-      scp -q $SSH_OPTS "$SORT_TMP" "$PROBE_HOST:/tmp/_sort_disks.sh"
-      rm -f "$SORT_TMP"
-      if [[ -n "$ROOT_DEST" && "$ROOT_HOST" == "root" ]]; then
-        SORTED_DISKS=$(ssh $SSH_OPTS "$PROBE_HOST" "bash /tmp/_sort_disks.sh ${DISK_LIST[*]}; rm -f /tmp/_sort_disks.sh")
-      else
-        SORTED_DISKS=$(ssh $SSH_OPTS "$PROBE_HOST" "sudo bash /tmp/_sort_disks.sh ${DISK_LIST[*]}; rm -f /tmp/_sort_disks.sh")
-      fi
-      LEDGER_DISK=$(echo "$SORTED_DISKS" | head -1)
-      ACCOUNTS_DISK=$(echo "$SORTED_DISKS" | sed -n '2p')
+      LEDGER_DISK="${DISK_LIST[0]}"
+      ACCOUNTS_DISK="${DISK_LIST[1]}"
       log_info "Auto-assigned: ledger=$LEDGER_DISK  accounts=$ACCOUNTS_DISK"
     elif [[ $DISK_COUNT -eq 1 ]]; then
       # Single drive: use it for both ledger and accounts (separate dirs)
@@ -1122,12 +1102,22 @@ SSHCONF
   if [[ "$JITO_ALREADY_BUILT" == "YES" ]]; then
     log_info "Jito validator already built — skipping"
   else
-    # Fetch branches and prompt for selection
-    log_info "Fetching branches from jito-solana..."
-    BRANCHES=$(remote "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/github_key git@github.com 2>/dev/null; git ls-remote --heads git@github.com:TheChimpions/jito-solana.git 2>/dev/null | awk '{print \$2}' | sed 's|refs/heads/||' | grep -E 'tuxr$' | sort -V" 2>/dev/null || true)
+    log_info "Using jito-solana repo: $JITO_REPO_URL"
+
+    # Prompt for a branch filter — user can narrow long branch lists
+    echo ""
+    read -rp "Branch filter (substring/regex, leave blank for all): " BRANCH_FILTER
+    echo ""
+
+    log_info "Fetching branches from $JITO_REPO_URL..."
+    if [[ -n "$BRANCH_FILTER" ]]; then
+      BRANCHES=$(remote "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/github_key git@github.com 2>/dev/null; git ls-remote --heads ${JITO_REPO_URL} 2>/dev/null | awk '{print \$2}' | sed 's|refs/heads/||' | grep -E '${BRANCH_FILTER}' | sort -V" 2>/dev/null || true)
+    else
+      BRANCHES=$(remote "ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/github_key git@github.com 2>/dev/null; git ls-remote --heads ${JITO_REPO_URL} 2>/dev/null | awk '{print \$2}' | sed 's|refs/heads/||' | sort -V" 2>/dev/null || true)
+    fi
 
     if [[ -z "$BRANCHES" ]]; then
-      log_error "Could not fetch branches — check GitHub SSH key"
+      log_error "Could not fetch branches — check GitHub SSH key, repo URL, or branch filter"
       exit 1
     fi
 
@@ -1144,6 +1134,11 @@ SSHCONF
       ((local_i++))
     done <<< "$BRANCHES"
     echo ""
+
+    if [[ ${#BRANCH_LIST[@]} -eq 0 ]]; then
+      log_error "No branches matched filter '$BRANCH_FILTER'"
+      exit 1
+    fi
 
     while true; do
       read -rp "Select branch: " choice
@@ -1165,8 +1160,8 @@ export LIBCLANG_PATH=/usr/lib/llvm-18/lib
 
 # Clone if not already cloned
 if [ ! -d ~/jito-solana ]; then
-  git clone git@github.com:TheChimpions/jito-solana.git ~/jito-solana
-  echo "Cloned jito-solana"
+  git clone ${JITO_REPO_URL} ~/jito-solana
+  echo "Cloned jito-solana from ${JITO_REPO_URL}"
 else
   echo "jito-solana already cloned"
   cd ~/jito-solana
@@ -1247,7 +1242,7 @@ SCRIPT
 # ---------------------------------------------------------------------------
 # Step 7c: Create mostly_confirmed_threshold
 # ---------------------------------------------------------------------------
-log_info "Step 7b: Creating mostly_confirmed_threshold"
+log_info "Step 7c: Creating mostly_confirmed_threshold"
 
 sol_script <<SCRIPT
 cat > ~/mostly_confirmed_threshold <<'EOF'
@@ -1257,21 +1252,9 @@ echo "mostly_confirmed_threshold created"
 SCRIPT
 
 # ---------------------------------------------------------------------------
-# Step 7: Create validator startup script
+# Step 8: Create validator startup script
 # ---------------------------------------------------------------------------
 log_info "Step 8: Creating validator.sh"
-
-# Build entrypoint flags
-ENTRYPOINT_FLAGS=""
-for ep in "${ENTRYPOINTS[@]}"; do
-  ENTRYPOINT_FLAGS+="    --entrypoint $ep \\"$'\n'
-done
-
-# Build known-validator flags
-KNOWN_FLAGS=""
-for kv in "${KNOWN_VALIDATORS[@]}"; do
-  KNOWN_FLAGS+="    --known-validator $kv \\"$'\n'
-done
 
 # Determine paths based on whether disks were provided/discovered
 if [[ -n "$LEDGER_DISK" || -n "$ACCOUNTS_DISK" ]]; then

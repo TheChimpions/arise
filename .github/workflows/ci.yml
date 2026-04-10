@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  lint:
+    name: ShellCheck + syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: bash -n arise.sh
+
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: "."
+          severity: warning
+          # SC2029: variables expanded client-side in ssh commands (intentional)
+          # SC2086: unquoted $SSH_OPTS (intentional word-splitting)
+          ignore_paths: ""
+
+  smoke:
+    name: CLI smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Help flag exits with usage
+        run: |
+          # usage() exits 1 — expected
+          ! ./arise.sh -h > /dev/null 2>&1
+
+      - name: Missing --host fails with clear error
+        run: |
+          output=$(./arise.sh 2>&1 || true)
+          echo "$output" | grep -q -- "--host is required" || {
+            echo "Expected '--host is required' error, got:"
+            echo "$output"
+            exit 1
+          }
+
+      - name: Unknown flag fails
+        run: |
+          output=$(./arise.sh --nonsense-flag foo 2>&1 || true)
+          echo "$output" | grep -q "Unknown option" || {
+            echo "Expected 'Unknown option' error, got:"
+            echo "$output"
+            exit 1
+          }
+
+      - name: Invalid network value fails
+        run: |
+          # Create throwaway files so --ssh-key/--identity file-exists checks pass
+          fake_key=$(mktemp)
+          fake_identity=$(mktemp)
+          trap 'rm -f "$fake_key" "$fake_identity"' EXIT
+
+          output=$(./arise.sh \
+            --host 1.2.3.4 \
+            --ssh-key "$fake_key" \
+            --identity "$fake_identity" \
+            --vote-account VOTEXXX \
+            --network bogus 2>&1 || true)
+          echo "$output" | grep -q "must be 'testnet' or 'mainnet'" || {
+            echo "Expected network validation error, got:"
+            echo "$output"
+            exit 1
+          }
