@@ -175,4 +175,4 @@ To go live with your staked identity, follow the Jito hot-swap procedure. Do not
 
 ## License
 
-Experimental. Use at your own risk.
+[MIT](LICENSE) — experimental, use at your own risk.
