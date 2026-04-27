@@ -569,12 +569,18 @@ if [[ "$NETWORK" == "mainnet" && -n "${SERVER_LAT:-}" && -n "${SERVER_LON:-}" ]]
 fi
 
 # --- Resolve public RPC address from server IP ---
+# jag-snap proxies the validator's RPC on port 18899, so when it's enabled
+# the validator advertises that port instead of the local 8899.
 PUBLIC_RPC_ADDRESS=""
-if [[ "$NETWORK" == "mainnet" ]]; then
+if [[ "$NETWORK" == "mainnet" || -n "$GITHUB_SSH_KEY" ]]; then
   if [[ -z "${SERVER_IP:-}" ]]; then
     SERVER_IP=$(ssh $SSH_OPTS "$PROBE_HOST" "curl -s https://ipinfo.io/ip 2>/dev/null || curl -s https://ifconfig.me 2>/dev/null || true")
   fi
-  PUBLIC_RPC_ADDRESS="${SERVER_IP}:8899"
+  if [[ -n "$GITHUB_SSH_KEY" ]]; then
+    PUBLIC_RPC_ADDRESS="${SERVER_IP}:18899"
+  else
+    PUBLIC_RPC_ADDRESS="${SERVER_IP}:8899"
+  fi
   log_info "Public RPC address: $PUBLIC_RPC_ADDRESS"
 fi
 
@@ -1334,7 +1340,13 @@ else
     --limit-ledger-size \\
     --no-port-check \\
     --use-snapshot-archives-at-startup when-newest \\
-    --full-rpc-api
+"
+  if [[ -n "$PUBLIC_RPC_ADDRESS" ]]; then
+    VALIDATOR_SCRIPT+="    --public-rpc-address ${PUBLIC_RPC_ADDRESS} \\
+    --rpc-bind-address 127.0.0.1 \\
+"
+  fi
+  VALIDATOR_SCRIPT+="    --full-rpc-api
 "
 fi
 
@@ -1447,6 +1459,14 @@ echo "y" | ufw enable
 
 ufw status verbose
 SCRIPT
+
+# jag-snap proxies the validator RPC on 18899 — open it when jag-snap is set up.
+if [[ -n "$GITHUB_SSH_KEY" ]]; then
+  root_script <<'SCRIPT'
+ufw allow 18899/tcp
+echo "Allowed 18899/tcp for jag-snap"
+SCRIPT
+fi
 
 # ---------------------------------------------------------------------------
 # Step 12: SSH hardening
