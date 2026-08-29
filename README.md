@@ -46,6 +46,7 @@ A one-shot, idempotent setup script that takes a fresh Ubuntu server and turns i
 10. **systemd** — creates `sol.service` and `sol-fix-mounts.service` (enabled but not started)
 11. **Log rotation, firewall, SSH hardening, fail2ban**
 12. **jag-snap** — clones and runs the jag-snap snapshot container
+13. **XDP** (on by default, `--no-xdp` to disable) — accelerated retransmit per the [Anza XDP setup guide](https://www.anza.xyz/blog/agave-xdp-setup-guide): detects the NIC/driver/kernel, tunes ring sizes to powers of 2 (persisted across reboots), grants the validator the required capabilities, and adds the experimental retransmit/PoH flags
 
 ---
 
@@ -85,7 +86,7 @@ On the **target server**:
 | `--ssh-key` | Path to SSH private key |
 | `--identity` | Path to `staked_identity.json` |
 | `--vote-account` | Vote account pubkey |
-| `--commission-bps` | Commission in basis points (mainnet only, e.g. `0`) |
+| `--commission-bps` | **Jito** commission in basis points — the cut of Jito MEV tips taken via the tip distribution program (mainnet only, e.g. `0` = 0%, `500` = 5%). This is the Jito tip commission, **not** the validator vote commission. |
 
 **Bootstrap (fresh servers):**
 | Flag | Description |
@@ -104,6 +105,18 @@ On the **target server**:
 | `--no-auto-disks` | Disable NVMe auto-discovery entirely |
 | `--swap-size` | Swap file size (default: `128G`) |
 | `--dry-run` | Print commands without executing them |
+
+**XDP (accelerated retransmit — [Anza XDP setup guide](https://www.anza.xyz/blog/agave-xdp-setup-guide)):**
+
+XDP is **on by default**: it grants capabilities, tunes NIC ring sizes, and adds the experimental retransmit/PoH flags. Requires Agave **v3.0.9+** and kernel **6.8+** (**6.14+** for the `igb` driver).
+
+| Flag | Description |
+|---|---|
+| `--no-xdp` | Disable XDP setup entirely |
+| `--xdp-cpu-cores` | Value for `--experimental-retransmit-xdp-cpu-cores` (default: `1`) |
+| `--poh-pinned-core` | Value for `--experimental-poh-pinned-cpu-core` (default: `10`). Must be a **different physical core** than the XDP cores. |
+| `--xdp-interface` | NIC to attach XDP to (default: auto-detect from the default route; bond members are resolved automatically) |
+| `--xdp-zero-copy` | `auto` \| `on` \| `off` (default: `auto`). Auto disables zero-copy for the `bnxt_en` and `ice` drivers, which don't support it. |
 
 ### Disk selection priority
 
@@ -137,6 +150,24 @@ tail -f ~/logs/agave-validator.log     # mainnet
 # Monitor catchup
 solana catchup --our-localhost
 ```
+
+### Verifying XDP (unless `--no-xdp` was used)
+
+```bash
+# Confirm the capabilities and ring tuning landed
+systemctl cat sol | grep -i capab
+systemctl status xdp-nic-tuning.service
+
+# Inspect the NIC the script picked up
+sudo ethtool -i <nic_name>     # driver
+sudo ethtool -g <nic_name>     # current vs max ring sizes (current should be a power of 2)
+
+# Confirm the flags are in validator.sh, then watch retransmit-stage metrics after start
+grep experimental-retransmit ~/validator.sh
+```
+
+XDP and PoH must run on **separate physical cores** — verify `--xdp-cpu-cores` and
+`--poh-pinned-core` don't collide on your CPU topology before going live.
 
 ### Swapping to staked identity
 

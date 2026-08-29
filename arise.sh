@@ -53,6 +53,13 @@ JITO_REGION=""
 GITHUB_SSH_KEY=""
 JITO_REPO_URL="git@github.com:jito-foundation/jito-solana.git"
 
+# XDP (Anza accelerated retransmit) — https://www.anza.xyz/blog/agave-xdp-setup-guide
+ENABLE_XDP=true
+XDP_CPU_CORES="1"        # value for --experimental-retransmit-xdp-cpu-cores
+POH_PINNED_CORE="10"     # value for --experimental-poh-pinned-cpu-core (separate physical core)
+XDP_INTERFACE=""         # override auto-detected NIC (use bond member for bonded setups)
+XDP_ZERO_COPY="auto"     # auto|on|off — auto disables for bnxt_en/ice drivers
+
 # ---------------------------------------------------------------------------
 # Jito region configs: REGION|BLOCK_ENGINE_URL|SHRED_RECEIVER|NTP_SERVER
 # ---------------------------------------------------------------------------
@@ -108,7 +115,10 @@ Required:
   --ssh-key <path>              Path to SSH private key
   --identity <path>             Path to staked_identity.json
   --vote-account <pubkey>       Vote account public key
-  --commission-bps <bps>        Commission in basis points (mainnet, e.g., 0)
+  --commission-bps <bps>        Jito commission in basis points — the cut taken from
+                                Jito MEV tips via the tip distribution program
+                                (mainnet, e.g., 0 = 0%, 500 = 5%). This is the Jito
+                                tip commission, NOT the validator vote commission.
 
 Bootstrap (for fresh servers):
   --root-user <user>            Initial SSH user with root/sudo access (default: root)
@@ -132,6 +142,21 @@ Optional:
   --swap-size <size>            Swap file size (default: 128G)
   --dry-run                     Print commands without executing
   -h, --help                    Show this help
+
+XDP (accelerated retransmit, per Anza XDP setup guide):
+  XDP is set up by default: grant the validator the required capabilities,
+  tune NIC ring sizes to powers of 2, and add the experimental retransmit/PoH
+  flags. Requires Agave v3.0.9+ and kernel 6.8+ (6.14+ for the igb driver).
+  --no-xdp                      Disable XDP setup entirely
+  --xdp-cpu-cores <n>           Value for --experimental-retransmit-xdp-cpu-cores
+                                (default: 1)
+  --poh-pinned-core <n>         Value for --experimental-poh-pinned-cpu-core
+                                (default: 10). MUST be a different physical core
+                                than the XDP cores.
+  --xdp-interface <iface>       NIC to attach XDP to (default: auto-detect from the
+                                default route; bond members are resolved automatically)
+  --xdp-zero-copy <auto|on|off> Zero-copy mode (default: auto). Auto disables it for
+                                the bnxt_en and ice drivers, which don't support it.
 
 Disk selection priority:
   1. Explicit --ledger-disk / --accounts-disk flags (disables auto-detection)
@@ -157,6 +182,12 @@ while [[ $# -gt 0 ]]; do
     --accounts-disk) ACCOUNTS_DISK="$2"; AUTO_DISKS=false; shift 2 ;;
     --no-auto-disks) AUTO_DISKS=false;     shift   ;;
     --swap-size)     SWAP_SIZE="$2";       shift 2 ;;
+    --enable-xdp)    ENABLE_XDP=true;      shift   ;;
+    --no-xdp)        ENABLE_XDP=false;     shift   ;;
+    --xdp-cpu-cores) XDP_CPU_CORES="$2";   shift 2 ;;
+    --poh-pinned-core) POH_PINNED_CORE="$2"; shift 2 ;;
+    --xdp-interface) XDP_INTERFACE="$2";   shift 2 ;;
+    --xdp-zero-copy) XDP_ZERO_COPY="$2";   shift 2 ;;
     --dry-run)       DRY_RUN=true;         shift   ;;
     -h|--help)       usage ;;
     *) log_error "Unknown option: $1"; usage ;;
@@ -177,6 +208,17 @@ done
 if [[ "$NETWORK" != "testnet" && "$NETWORK" != "mainnet" ]]; then
   log_error "--network must be 'testnet' or 'mainnet'"
   exit 1
+fi
+
+if $ENABLE_XDP; then
+  if [[ "$XDP_ZERO_COPY" != "auto" && "$XDP_ZERO_COPY" != "on" && "$XDP_ZERO_COPY" != "off" ]]; then
+    log_error "--xdp-zero-copy must be 'auto', 'on', or 'off'"
+    exit 1
+  fi
+  if [[ "$XDP_CPU_CORES" == "$POH_PINNED_CORE" ]]; then
+    log_error "--xdp-cpu-cores ($XDP_CPU_CORES) and --poh-pinned-core ($POH_PINNED_CORE) must differ — XDP and PoH require separate physical cores"
+    exit 1
+  fi
 fi
 
 # Strip user@ prefix from --host if accidentally included
@@ -587,9 +629,9 @@ fi
 # --- Prompt for commission if not provided (mainnet) ---
 if [[ "$NETWORK" == "mainnet" && -z "$COMMISSION_BPS" ]] && ! $DRY_RUN; then
   echo ""
-  read -rp "Commission in basis points (e.g., 0 = 0%, 500 = 5%, 1000 = 10%) [0]: " COMMISSION_BPS
+  read -rp "Jito commission in basis points (cut of Jito MEV tips; e.g., 0 = 0%, 500 = 5%, 1000 = 10%) [0]: " COMMISSION_BPS
   COMMISSION_BPS="${COMMISSION_BPS:-0}"
-  log_info "Commission: ${COMMISSION_BPS} bps"
+  log_info "Jito commission: ${COMMISSION_BPS} bps"
 fi
 
 # ---------------------------------------------------------------------------
@@ -604,6 +646,8 @@ apt-get upgrade -y
 apt-get install -y \
   curl \
   wget \
+  vim \
+  jq \
   htop \
   iotop \
   sysstat \
@@ -612,6 +656,9 @@ apt-get install -y \
   logrotate \
   nvme-cli \
   mdadm \
+  ethtool \
+  pciutils \
+  lshw \
   libssl-dev \
   libudev-dev \
   pkg-config \
@@ -1258,6 +1305,152 @@ echo "mostly_confirmed_threshold created"
 SCRIPT
 
 # ---------------------------------------------------------------------------
+# Step 7d: XDP setup — detect NIC, tune ring sizes, build validator flags
+# Reference: https://www.anza.xyz/blog/agave-xdp-setup-guide
+# ---------------------------------------------------------------------------
+# Holds the validator command-line flags injected into validator.sh (Step 8)
+# and the systemd capability lines injected into sol.service (Step 9).
+XDP_VALIDATOR_FLAGS=""
+XDP_CAPS=""
+
+# Largest power of 2 that is <= $1 (used to clamp NIC ring sizes to a power of 2)
+pow2_floor() {
+  local n="$1" p=1
+  [[ "$n" =~ ^[0-9]+$ ]] || { echo ""; return 1; }
+  (( n >= 1 )) || { echo ""; return 1; }
+  while (( p * 2 <= n )); do (( p *= 2 )); done
+  echo "$p"
+}
+
+if $ENABLE_XDP; then
+  log_info "Step 7d: Setting up XDP (per Anza XDP setup guide)"
+
+  if $DRY_RUN; then
+    log_info "[DRY RUN] Would detect NIC/driver/kernel, tune ring sizes, and add XDP flags"
+  else
+    # --- Detect interface, driver, kernel and ring maxima on the server ---
+    XDP_INFO=$(root_script <<XDPDETECT
+IFACE="${XDP_INTERFACE}"
+if [ -z "\$IFACE" ]; then
+  IFACE=\$(ip route show default 2>/dev/null | awk '/default/{print \$5; exit}')
+fi
+# Resolve the underlying member if this is a bonded interface
+if [ -n "\$IFACE" ] && [ -d "/sys/class/net/\$IFACE/bonding" ]; then
+  MEMBER=\$(awk '{print \$1}' "/sys/class/net/\$IFACE/bonding/slaves" 2>/dev/null)
+  if [ -n "\$MEMBER" ]; then
+    echo "XDP_BOND=\$IFACE"
+    IFACE="\$MEMBER"
+  fi
+fi
+echo "XDP_IFACE=\$IFACE"
+if [ -z "\$IFACE" ]; then
+  echo "XDP_ERROR=no_interface"
+  exit 0
+fi
+echo "XDP_DRIVER=\$(ethtool -i "\$IFACE" 2>/dev/null | awk -F': ' '/^driver:/{print \$2}')"
+echo "XDP_KERNEL=\$(uname -r)"
+echo "XDP_RX_MAX=\$(ethtool -g "\$IFACE" 2>/dev/null | awk '/Pre-set maximums:/{f=1} f&&/^RX:/{print \$2; exit}')"
+echo "XDP_TX_MAX=\$(ethtool -g "\$IFACE" 2>/dev/null | awk '/Pre-set maximums:/{f=1} f&&/^TX:/{print \$2; exit}')"
+XDPDETECT
+)
+
+    XDP_BOND=$(echo "$XDP_INFO"  | sed -n 's/^XDP_BOND=//p')
+    XDP_IFACE=$(echo "$XDP_INFO" | sed -n 's/^XDP_IFACE=//p')
+    XDP_DRIVER=$(echo "$XDP_INFO" | sed -n 's/^XDP_DRIVER=//p')
+    XDP_KERNEL=$(echo "$XDP_INFO" | sed -n 's/^XDP_KERNEL=//p')
+    XDP_RX_MAX=$(echo "$XDP_INFO" | sed -n 's/^XDP_RX_MAX=//p')
+    XDP_TX_MAX=$(echo "$XDP_INFO" | sed -n 's/^XDP_TX_MAX=//p')
+
+    if [[ -z "$XDP_IFACE" || "$XDP_INFO" == *"XDP_ERROR=no_interface"* ]]; then
+      log_error "Could not detect a network interface for XDP — pass --xdp-interface <iface>"
+      exit 1
+    fi
+
+    [[ -n "$XDP_BOND" ]] && log_info "Bonded interface $XDP_BOND -> using member $XDP_IFACE"
+    log_info "XDP interface:    $XDP_IFACE"
+    log_info "XDP NIC driver:   ${XDP_DRIVER:-unknown}"
+    log_info "Kernel:           ${XDP_KERNEL:-unknown}"
+
+    # --- Kernel version check (igb needs 6.14+, all others 6.8+) ---
+    REQ_MINOR=8
+    [[ "$XDP_DRIVER" == "igb" ]] && REQ_MINOR=14
+    KMAJ=$(echo "$XDP_KERNEL" | cut -d. -f1)
+    KMIN=$(echo "$XDP_KERNEL" | cut -d. -f2)
+    if [[ "$KMAJ" =~ ^[0-9]+$ && "$KMIN" =~ ^[0-9]+$ ]]; then
+      if (( KMAJ < 6 || ( KMAJ == 6 && KMIN < REQ_MINOR ) )); then
+        log_warn "Kernel $XDP_KERNEL is below the XDP requirement (6.${REQ_MINOR}+ for the ${XDP_DRIVER:-current} driver) — XDP may not load"
+      fi
+    fi
+
+    # --- Tune NIC ring sizes to a power of 2 (XDP requirement) ---
+    XDP_RXP=$(pow2_floor "$XDP_RX_MAX" 2>/dev/null || true)
+    XDP_TXP=$(pow2_floor "$XDP_TX_MAX" 2>/dev/null || true)
+    if [[ -n "$XDP_RXP" && -n "$XDP_TXP" ]]; then
+      log_info "Setting $XDP_IFACE ring sizes to rx=$XDP_RXP tx=$XDP_TXP (max rx=$XDP_RX_MAX tx=$XDP_TX_MAX)"
+      root_script <<XDPRING
+IFACE="${XDP_IFACE}"
+# Apply now (tolerate "no change" errors when already set)
+ethtool -G "\$IFACE" rx ${XDP_RXP} tx ${XDP_TXP} 2>/dev/null || true
+
+# Persist across reboots — re-applied once the interface is up
+cat > /etc/systemd/system/xdp-nic-tuning.service <<UNIT
+[Unit]
+Description=XDP NIC ring tuning for Agave validator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'ethtool -G ${XDP_IFACE} rx ${XDP_RXP} tx ${XDP_TXP} || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable xdp-nic-tuning.service
+echo "NIC ring tuning applied and persisted for \$IFACE"
+XDPRING
+    else
+      log_warn "Could not read ring maxima for $XDP_IFACE — skipping ring-size tuning (set manually with: ethtool -G $XDP_IFACE rx <pow2> tx <pow2>)"
+    fi
+
+    # --- Resolve zero-copy mode ---
+    XDP_ZC=false
+    case "$XDP_ZERO_COPY" in
+      on)  XDP_ZC=true ;;
+      off) XDP_ZC=false ;;
+      auto)
+        if [[ "$XDP_DRIVER" == "bnxt_en" || "$XDP_DRIVER" == "ice" ]]; then
+          log_warn "Driver $XDP_DRIVER does not support zero-copy XDP — disabling it"
+          XDP_ZC=false
+        else
+          XDP_ZC=true
+        fi ;;
+    esac
+
+    # --- Build the validator flags (injected after the exec line in Step 8) ---
+    XDP_VALIDATOR_FLAGS="    --experimental-retransmit-xdp-cpu-cores ${XDP_CPU_CORES} \\
+    --experimental-poh-pinned-cpu-core ${POH_PINNED_CORE} \\
+    --experimental-retransmit-xdp-interface ${XDP_IFACE} \\
+"
+    if $XDP_ZC; then
+      XDP_VALIDATOR_FLAGS+="    --experimental-retransmit-xdp-zero-copy \\
+"
+    fi
+
+    # --- Capabilities for the systemd service (Step 9) ---
+    # AmbientCapabilities is required for a non-root (User=sol) service to actually
+    # gain the capabilities; CapabilityBoundingSet matches the Anza guide.
+    XDP_CAPS="AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON"
+
+    log_info "XDP zero-copy:    $($XDP_ZC && echo enabled || echo disabled)"
+    log_info "XDP flags:        retransmit-xdp-cpu-cores=${XDP_CPU_CORES}, poh-pinned-cpu-core=${POH_PINNED_CORE}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Step 8: Create validator startup script
 # ---------------------------------------------------------------------------
 log_info "Step 8: Creating validator.sh"
@@ -1280,7 +1473,9 @@ PATH=/home/${SOL_USER}/.local/share/solana/install/releases/active_release/bin:/
 
 if [[ "$NETWORK" == "mainnet" ]]; then
   VALIDATOR_SCRIPT+="exec agave-validator \\
-    --identity /home/${SOL_USER}/identity.json \\
+"
+  VALIDATOR_SCRIPT+="${XDP_VALIDATOR_FLAGS}"
+  VALIDATOR_SCRIPT+="    --identity /home/${SOL_USER}/identity.json \\
     --authorized-voter /home/${SOL_USER}/staked_identity.json \\
     --vote-account ${VOTE_ACCOUNT} \\
 "
@@ -1316,7 +1511,9 @@ if [[ "$NETWORK" == "mainnet" ]]; then
 else
   # Testnet uses solana-validator
   VALIDATOR_SCRIPT+="exec solana-validator \\
-    --identity /home/${SOL_USER}/staked_identity.json \\
+"
+  VALIDATOR_SCRIPT+="${XDP_VALIDATOR_FLAGS}"
+  VALIDATOR_SCRIPT+="    --identity /home/${SOL_USER}/staked_identity.json \\
     --vote-account ${VOTE_ACCOUNT} \\
 "
   for kv in "${KNOWN_VALIDATORS[@]}"; do
@@ -1398,6 +1595,7 @@ WorkingDirectory=/home/${SOL_USER}
 LimitNOFILE=1000000
 LimitMEMLOCK=2000000000
 LogRateLimitIntervalSec=0
+${XDP_CAPS}
 Environment="PATH=/home/${SOL_USER}/.local/share/solana/install/active_release/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=/home/${SOL_USER}/validator.sh
 
