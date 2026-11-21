@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Stub ssh. Responses come from $STUB_RESPONSES: lines of "<glob>|<output>".
+# The first glob matching the joined argv wins. Every call is appended to $STUB_LOG.
+args="$*"
+[[ -n "${STUB_LOG:-}" ]] && printf '%s\n' "$args" >> "$STUB_LOG"
+
+if [[ -n "${STUB_RESPONSES:-}" && -f "$STUB_RESPONSES" ]]; then
+  while IFS='|' read -r pattern output; do
+    [[ -z "$pattern" || "$pattern" == \#* ]] && continue
+    # shellcheck disable=SC2053
+    if [[ "$args" == $pattern ]]; then
+      [[ -n "$output" ]] && printf '%b\n' "$output"
+      exit "${STUB_EXIT:-0}"
+    fi
+  done < "$STUB_RESPONSES"
+fi
+exit "${STUB_EXIT:-0}"

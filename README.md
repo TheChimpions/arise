@@ -1,4 +1,4 @@
-```
+.```
  █████╗ ██████╗ ██╗███████╗███████╗
 ██╔══██╗██╔══██╗██║██╔════╝██╔════╝
 ███████║██████╔╝██║███████╗█████╗
@@ -7,7 +7,7 @@
 ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚══════╝╚══════╝
 ```
 
-A one-shot, idempotent setup script that takes a fresh Ubuntu server and turns it into a Solana validator (testnet or mainnet). Handles disk setup, kernel tuning, Jito build, region detection, systemd services, firewall, and jag-snap.
+A one-shot, idempotent setup script that takes a fresh Ubuntu server and turns it into a Solana validator (testnet or mainnet). Handles disk setup, kernel tuning, Jito build, region detection, systemd services, firewall, jag-snap, and the optional Hexis arb client.
 
 > **"Arise."** — one command, and the validator rises from the shadows.
 
@@ -24,6 +24,7 @@ A one-shot, idempotent setup script that takes a fresh Ubuntu server and turns i
 - **No warranty.** If this script eats your stake, bricks your server, or summons a shadow army, that's on you.
 
 **Verify after setup**, before starting the validator:
+
 - `cat ~/validator.sh` on the server — confirm every flag is correct
 - Check `--shred-receiver-address`, `--block-engine-url`, `--public-rpc-address`, `--commission-bps`
 - Confirm `/mnt/ledger` and `/mnt/accounts` are mounted and owned by `sol`
@@ -40,24 +41,27 @@ A one-shot, idempotent setup script that takes a fresh Ubuntu server and turns i
 4. **Disk setup** — auto-detects unused NVMe drives, formats and mounts them as `/mnt/ledger` and `/mnt/accounts`
 5. **Swap** — creates a swap file (default 128G)
 6. **NTP** — configures chrony with the Jito region's NTP server
-7. **Rust + Solana CLI** — installs via rustup, clones and builds Jito-Solana from source (requires `--github-ssh-key`)
+7. **Rust + Solana CLI** — installs via rustup, clones and builds Jito-Solana from source (requires `--github-ssh-key`). With `--hexis`, both are skipped in favour of the prebuilt Solana CLI, since the Hexis release already ships the validator binary.
 8. **Identity keypairs** — copies your staked identity, generates an unstaked identity, symlinks `identity.json`
 9. **Validator script** — generates `validator.sh` with region-specific Jito block engine, shred receiver, and BloXroute shred receivers based on server geolocation
 10. **systemd** — creates `sol.service` and `sol-fix-mounts.service` (enabled but not started)
 11. **Log rotation, firewall, SSH hardening, fail2ban**
 12. **jag-snap** — clones and runs the jag-snap snapshot container
-13. **XDP** (on by default, `--no-xdp` to disable) — accelerated retransmit per the [Anza XDP setup guide](https://www.anza.xyz/blog/agave-xdp-setup-guide): detects the NIC/driver/kernel, tunes ring sizes to powers of 2 (persisted across reboots), grants the validator the required capabilities, and adds the experimental retransmit/PoH flags
+13. **Hexis arb client** (off by default, `--hexis` to enable, mainnet only) — installs the Hexis `agave-validator` build into `/home/sol/hexis`, writes `arb-config.toml`, creates the revert-dump spool, opens the Control port to the Hexis fleet only, and drops an `arb-enable.sh` helper
+14. **XDP** (on by default, `--no-xdp` to disable) — accelerated retransmit per the [Anza XDP setup guide](https://www.anza.xyz/blog/agave-xdp-setup-guide): detects the NIC/driver/kernel, tunes ring sizes to powers of 2 (persisted across reboots), grants the validator the required capabilities, and adds the experimental retransmit/PoH flags
 
 ---
 
 ## Prerequisites
 
 On your **local machine**:
+
 - SSH private key with access to the target server
 - A `staked_identity.json` file (validator keypair with a vote account already created)
 - (Optional) A GitHub SSH key authorized to clone `jito-solana` and `jag-snap`
 
 On the **target server**:
+
 - Ubuntu 24.04 (or compatible)
 - NVMe drives available for ledger/accounts (or you can fall back to `$HOME` directories)
 - Initial SSH access via a user with sudo/root (typically `root` on a fresh VPS)
@@ -80,43 +84,147 @@ On the **target server**:
 ### Flags
 
 **Required:**
-| Flag | Description |
-|---|---|
-| `--host` | Server IP or hostname |
-| `--ssh-key` | Path to SSH private key |
-| `--identity` | Path to `staked_identity.json` |
-| `--vote-account` | Vote account pubkey |
+
+| Flag               | Description                                                                                                                                                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--host`           | Server IP or hostname                                                                                                                                                                                                    |
+| `--ssh-key`        | Path to SSH private key                                                                                                                                                                                                  |
+| `--identity`       | Path to `staked_identity.json`                                                                                                                                                                                           |
+| `--vote-account`   | Vote account pubkey                                                                                                                                                                                                      |
 | `--commission-bps` | **Jito** commission in basis points — the cut of Jito MEV tips taken via the tip distribution program (mainnet only, e.g. `0` = 0%, `500` = 5%). This is the Jito tip commission, **not** the validator vote commission. |
 
 **Bootstrap (fresh servers):**
-| Flag | Description |
-|---|---|
-| `--root-user` | Initial sudo user (default: `root`). Creates the `sol` user and reconnects as `sol`. |
+
+| Flag          | Description                                                                                                                                                                                                                                                                                                                                              |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--root-user` | Initial sudo user (default: `root`). Creates the `sol` user and reconnects as `sol`. The root login does not need your SSH key — if the key is refused, ssh asks for the root password once and reuses that connection for the whole bootstrap. Everything after the bootstrap runs as `sol` with sudo, and SSH hardening then turns password login off. |
 
 **Optional:**
-| Flag | Description |
-|---|---|
-| `--github-ssh-key` | SSH key for GitHub (required to build Jito + run jag-snap) |
-| `--jito-repo` | Jito-Solana git repo URL (default: `git@github.com:jito-foundation/jito-solana.git`) |
-| `--network` | `testnet` or `mainnet` (default: `testnet`) |
-| `--jito-region` | Override auto-detection (e.g. `frankfurt`, `new-york`, `singapore`) |
-| `--ledger-disk` | Explicit ledger disk (e.g. `/dev/nvme0n1`). Disables auto-detection. |
-| `--accounts-disk` | Explicit accounts disk. Disables auto-detection. |
-| `--no-auto-disks` | Disable NVMe auto-discovery entirely |
-| `--swap-size` | Swap file size (default: `128G`) |
-| `--dry-run` | Print commands without executing them |
+
+| Flag               | Description                                                                                                                                                                     |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--github-ssh-key` | SSH key for GitHub (required to build Jito + run jag-snap)                                                                                                                      |
+| `--jito-repo`      | Jito-Solana git repo URL (default: `git@github.com:jito-foundation/jito-solana.git`)                                                                                            |
+| `--build-jito`     | Build jito-solana from source even with `--hexis` (off by default — see below)                                                                                                  |
+| `--network`        | `testnet` or `mainnet` (default: `testnet`)                                                                                                                                     |
+| `--jito-region`    | Override auto-detection (e.g. `frankfurt`, `new-york`, `singapore`)                                                                                                             |
+| `--metrics-config` | `SOLANA_METRICS_CONFIG` exported by `validator.sh`. Defaults to the cluster metrics endpoint the SFDP requires (`mainnet-beta` or `tds` by network). Pass `""` to publish none. |
+| `--ledger-disk`    | Explicit ledger disk (e.g. `/dev/nvme0n1`). Disables auto-detection.                                                                                                            |
+| `--accounts-disk`  | Explicit accounts disk. Disables auto-detection.                                                                                                                                |
+| `--no-auto-disks`  | Disable NVMe auto-discovery entirely                                                                                                                                            |
+| `--swap-size`      | Swap file size (default: `128G`)                                                                                                                                                |
+| `--dry-run`        | Print commands without executing them                                                                                                                                           |
 
 **XDP (accelerated retransmit — [Anza XDP setup guide](https://www.anza.xyz/blog/agave-xdp-setup-guide)):**
 
 XDP is **on by default**: it grants capabilities, tunes NIC ring sizes, and adds the experimental retransmit/PoH flags. Requires Agave **v3.0.9+** and kernel **6.8+** (**6.14+** for the `igb` driver).
 
-| Flag | Description |
-|---|---|
-| `--no-xdp` | Disable XDP setup entirely |
-| `--xdp-cpu-cores` | Value for `--experimental-retransmit-xdp-cpu-cores` (default: `1`) |
-| `--poh-pinned-core` | Value for `--experimental-poh-pinned-cpu-core` (default: `10`). Must be a **different physical core** than the XDP cores. |
-| `--xdp-interface` | NIC to attach XDP to (default: auto-detect from the default route; bond members are resolved automatically) |
-| `--xdp-zero-copy` | `auto` \| `on` \| `off` (default: `auto`). Auto disables zero-copy for the `bnxt_en` and `ice` drivers, which don't support it. |
+| Flag                | Description                                                                                                                     |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `--no-xdp`          | Disable XDP setup entirely                                                                                                      |
+| `--xdp-cpu-cores`   | Value for the validator's `--xdp-cpu-cores` (default: `1`)                                                                      |
+| `--poh-pinned-core` | Value for the validator's `--poh-pinned-cpu-core` (default: `10`). Must be a **different physical core** than the XDP cores.    |
+| `--xdp-interface`   | NIC to attach XDP to (default: auto-detect from the default route; bond members are resolved automatically)                     |
+| `--xdp-zero-copy`   | `auto` \| `on` \| `off` (default: `auto`). Auto disables zero-copy for the `bnxt_en` and `ice` drivers, which don't support it. |
+
+Agave 4.3 renamed the validator's XDP flags (`--experimental-retransmit-xdp-cpu-cores` → `--xdp-cpu-cores`, `--experimental-poh-pinned-cpu-core` → `--poh-pinned-cpu-core`, and the same for `-interface` and `-zero-copy`), and 4.4 removed the old names. `arise.sh` writes the new names when the installed validator accepts them and the old ones otherwise. `ascend.sh` renames them in an existing `validator.sh` when the release it activates takes the new names, and refuses `--restart` if it would leave names the new binary rejects.
+
+**Hexis arb client ([hexis-validator-docs](https://github.com/hexishq/hexis-validator-docs)):**
+
+Off by default and **mainnet only**. When enabled, the Hexis `agave-validator` build is
+installed to `/home/sol/hexis` and put **first on `PATH`** in `validator.sh`, so the
+`exec agave-validator` line runs it. The arb pipeline always boots **disabled** —
+nothing arbitrages until you run `arb-enable.sh` against a running validator.
+
+Because the Hexis release _is_ the validator binary, `--hexis` **skips the jito-solana
+source build and the Rust toolchain** — a compile whose output would never be executed.
+Instead it installs the prebuilt Solana CLI for `solana-keygen` (identity and arb
+keypairs) and `solana` (catchup, monitoring), which takes seconds rather than the better
+part of an hour. `--github-ssh-key` is then only needed for jag-snap. Pass `--build-jito`
+to compile from source anyway.
+
+| Flag                           | Description                                                                                                                                                         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--hexis`                      | Enable Hexis arb client setup                                                                                                                                       |
+| `--hexis-tag`                  | Release tag fetched with your **local** `gh` CLI from `hexishq/hexis-validator-docs`, checksum-verified, then uploaded                                              |
+| `--hexis-binary`               | Pre-downloaded `agave-validator-linux-amd64` to upload (use instead of `--hexis-tag`)                                                                               |
+| `--hexis-setup-binary`         | Pre-downloaded `hexis-setup` binary (LUT / marginfi / token-ledger tooling)                                                                                         |
+| `--hexis-setup-tag`            | Release tag for `hexis-setup`, which ships separately from the validator (default: `v1.0-hexis-setup`). Empty string skips it.                                      |
+| `--hexis-config`               | Upload this `arb-config.toml` verbatim instead of generating one                                                                                                    |
+| `--hexis-signer`               | Arb signer keypair — the `signing_key.json` Hexis gave you — copied to `/home/sol/hexis/arb_signer_keypair.json`. Generated on the server when omitted.             |
+| `--hexis-dir`                  | Install dir (default: `/home/sol/hexis`)                                                                                                                            |
+| `--hexis-program-id`           | On-chain arb program                                                                                                                                                |
+| `--hexis-profit-wallet`        | Address the program pays profit into. Defaults to the Hexis shared rewards pool. Only set it if Hexis hands you a different pool address.                           |
+| `--hexis-jup-key`              | Jupiter API key. Defaults to the Hexis fleet key; also read from `$HEXIS_JUP_KEY`.                                                                                  |
+| `--hexis-metrics-config`       | Value exported as `SOLANA_METRICS_CONFIG_ARB` in `validator.sh`. Defaults to the Hexis metrics host; also read from `$SOLANA_METRICS_CONFIG_ARB`.                   |
+| `--hexis-lookup-tables`        | Comma-separated extra address lookup tables (see `lut.md`)                                                                                                          |
+| `--hexis-jupiter-token-ledger` | Jupiter TokenLedger (create with `hexis-setup`)                                                                                                                     |
+| `--hexis-okx-token-ledger`     | OKX TokenLedger PDA (create with `hexis-setup okx-token-ledger`)                                                                                                    |
+| `--hexis-base-mints`           | Comma-separated base mints. Order matters — `--hexis-marginfi-banks` must line up with it.                                                                          |
+| `--hexis-marginfi-account`     | marginfi v2 account used for flash loans. Defaults to the one from the Hexis config, whose authority is the arb signer they issue. See [Flash loans](#flash-loans). |
+| `--no-hexis-flash-loans`       | Drop `[flash_loan]` entirely — flash loans off                                                                                                                      |
+| `--hexis-marginfi-banks`       | Comma-separated banks, one per base mint, same order                                                                                                                |
+| `--hexis-marginfi-program-id`  | marginfi v2 program                                                                                                                                                 |
+| `--hexis-control-bind`         | Control listen address (default: `0.0.0.0:18082`). Must not be loopback — Hexis dials the host.                                                                     |
+| `--hexis-control-allow`        | The only source allowed through `ufw` to the Control port (default: `188.40.61.182`)                                                                                |
+| `--no-hexis-control`           | Leave the `[control]` table out and don't open the port                                                                                                             |
+
+The release lives in a **private** repo, and the download is a GitHub API call from
+_your_ machine using `gh`'s own token — `--github-ssh-key` is for git-over-SSH on the
+server and has nothing to do with it. Make sure `gh auth status` shows an account with
+access; the script checks this before it touches the server. Assets are verified against
+the release's `checksums.txt` and a mismatch aborts the run.
+
+**The two keys play different roles and only one of them is yours.**
+
+- **`signer_path`** — the keypair that signs arb transactions and pays their fees. Hexis
+  gives you this as `signing_key.json`; pass it with
+  `--hexis-signer ~/keys/signing_key.json` and it is copied to
+  `/home/sol/hexis/arb_signer_keypair.json` (0600). **Fund it** — an empty signer means
+  no arb lands. Omit the flag and one is generated on the server instead, which then
+  needs funding before it is any use.
+- **`profit_wallet`** — Hexis's shared rewards pool. You hold no key for it; the program
+  simply pays into it. It defaults to the pool address from the Hexis config and is
+  never generated. Only pass `--hexis-profit-wallet` if Hexis hands you a different pool.
+
+With `--hexis-config`, nothing is generated — that file owns `signer_path` and
+`profit_wallet`.
+
+**Defaults come from the Hexis mainnet sample config**, including the two fleet-wide
+credentials — the Jupiter API key and the `SOLANA_METRICS_CONFIG_ARB` metrics string.
+Both are the values Hexis hands to every operator, both are committed in this (public)
+repo, and both are overridable with `--hexis-jup-key` / `--hexis-metrics-config` or by
+exporting `HEXIS_JUP_KEY` / `SOLANA_METRICS_CONFIG_ARB`. **Check the rest against what
+Hexis gave you** — especially the token ledgers and the lookup tables, which are
+per-operator — before going live.
+
+Example:
+
+```bash
+./arise.sh \
+  --host <ip> --ssh-key ~/.ssh/id_ed25519 \
+  --identity ~/keys/staked_identity.json \
+  --vote-account <VOTE_ACCOUNT> \
+  --network mainnet --commission-bps 0 \
+  --hexis \
+  --hexis-tag <release-tag> \
+  --hexis-signer ~/keys/signing_key.json
+
+# The marginfi account, banks, profit pool and token ledgers all default to the
+# values from the Hexis config, so the signer is the only thing you supply.
+# Fund it before enabling the arb — it pays the transaction fees.
+```
+
+What it adds to `validator.sh`:
+
+```bash
+PATH=/home/sol/hexis:/home/sol/.local/share/solana/install/releases/active_release/bin:...
+export SOLANA_METRICS_CONFIG_ARB="..."
+exec agave-validator \
+    --tvu-shred-sigverify-threads 2 \
+    --arb-config /home/sol/hexis/arb-config.toml \
+    ...
+```
 
 ### Disk selection priority
 
@@ -163,11 +271,115 @@ sudo ethtool -i <nic_name>     # driver
 sudo ethtool -g <nic_name>     # current vs max ring sizes (current should be a power of 2)
 
 # Confirm the flags are in validator.sh, then watch retransmit-stage metrics after start
-grep experimental-retransmit ~/validator.sh
+grep -E 'xdp|poh-pinned' ~/validator.sh
 ```
 
 XDP and PoH must run on **separate physical cores** — verify `--xdp-cpu-cores` and
 `--poh-pinned-core` don't collide on your CPU topology before going live.
+
+### Turning the arb on (only with `--hexis`)
+
+`arb-config.toml` is read **once** at boot and a typo'd key aborts the boot. The
+pipeline itself always comes up **disabled**, including after a crash-restart — a
+restarted validator is a plain validator until you enable it again.
+
+```bash
+# Validator running and caught up, then:
+/home/sol/hexis/arb-enable.sh          # arb set --enabled true, --program-size (releases that still have it), okx-token-ledger, arb get
+
+# Day-to-day
+cd /home/sol/hexis
+./agave-validator --ledger /mnt/ledger arb get       # live config
+./agave-validator --ledger /mnt/ledger arb disable   # stops arb, validator keeps producing blocks
+
+# Control port (skip if --no-hexis-control)
+ss -lntp | grep 18082
+./agave-validator --ledger /mnt/ledger arb control-http2 get
+```
+
+### Cluster metrics (SFDP)
+
+The Solana Foundation Delegation Program requires validators to publish cluster metrics,
+so `validator.sh` exports `SOLANA_METRICS_CONFIG` pointing at `metrics.solana.com` —
+`db=mainnet-beta` or `db=tds` depending on `--network`. With `--hexis` it also exports
+`SOLANA_METRICS_CONFIG_ARB` for the arb; the two are independent and both are set.
+
+`ascend.sh` reports whether the host publishes cluster metrics and can repair one that
+doesn't:
+
+```bash
+# check — every ascend run warns if the export is missing
+./ascend.sh upgrade --host <ip> --ssh-key ~/.ssh/<key> --hexis-tag <tag>
+
+# repair, on any host, in any mode (shows a diff, keeps a .pre-metrics backup)
+./ascend.sh upgrade --host <ip> --ssh-key ~/.ssh/<key> --hexis-tag <tag> --fix-metrics
+```
+
+`migrate` adds the export while patching `validator.sh`, but only when the file has none
+— an existing config is the operator's and is never overwritten. A host already running
+Hexis is skipped by that patcher entirely, which is why `--fix-metrics` exists.
+
+### Upgrading and migrating
+
+`arise.sh` builds a host from scratch. For a host that already exists, use `ascend.sh`:
+
+```bash
+./ascend.sh upgrade --host <ip> --ssh-key ~/.ssh/<key> --hexis-tag <new-tag>
+./ascend.sh migrate --host <ip> --ssh-key ~/.ssh/<key> --hexis-tag <tag>
+./ascend.sh promote --host <ip> --ssh-key ~/.ssh/<key> --release <tag>
+```
+
+Releases live in `/home/sol/hexis/releases/<tag>/` and `/home/sol/hexis/agave-validator`
+is a symlink to the active one. `validator.sh` execs that symlink, so a version bump
+never edits it.
+
+`upgrade` stages a checksum-verified release and repoints the symlink; `--stage-only`
+uploads without activating, so even an unplanned restart stays on the current version.
+`promote --release <tag>` activates a staged release or rolls back to an older one, and
+`promote --list` shows what is staged. `migrate` puts Hexis onto a validator already
+running Jito or plain Agave —
+installs the binary and `hexis-setup`, generates the keypairs, writes `arb-config.toml`,
+opens the Control port, and patches the existing `validator.sh` after showing you the
+diff. It refuses rather than guesses if the startup script isn't a shape it recognises.
+
+Neither enables the arb, and neither restarts the validator unless you pass `--restart`
+— which runs `exit` (wait for the restart window, then stop; systemd brings it back), and
+accepts `--min-idle-time` (default `20`), `--max-delinquent-stake` (default `5`) and
+`--skip-new-snapshot-check` (on by default; `--wait-for-new-snapshot` turns it off). The
+`exit` is issued by the binary the running process is actually executing, so it never
+crosses a version boundary.
+Full detail and the by-hand equivalent: [HEXIS-UPGRADE.md](HEXIS-UPGRADE.md).
+
+### Flash loans
+
+Flash loans are **on by default**, using the marginfi v2 account from the Hexis config
+along with its banks and program id. That account pairs with the arb signer Hexis
+issues — a marginfi account can only be borrowed against by its own authority — so the
+two travel together. If you pass no `--hexis-signer` while that account is configured,
+both scripts warn that flash loans will fail, because a locally generated signer is not
+the account's authority.
+
+`--no-hexis-flash-loans` drops the whole `[flash_loan]` table and runs the arb without
+them.
+
+To use your own marginfi account instead, create it on the host after the first run —
+`hexis-setup` only lands there during a run:
+
+1. Fund the arb signer, then `/home/sol/hexis/hexis-setup marginfi create` (see
+   `marginfi.md`).
+2. Re-run with `--hexis-marginfi-account <PUBKEY>` and restart the validator —
+   `arb-config.toml` is read **once at boot**, so editing it without a restart changes
+   nothing.
+
+`--hexis-marginfi-banks` must list one bank per `--hexis-base-mints` entry, in the same
+order.
+
+Identity (signer, program, profit wallet, marginfi account) can be changed without a
+restart via `arb identity set` — see the Hexis docs. Don't pass extra `arb set` flags
+beyond the ones in `arb-enable.sh` unless whoever owns the stack asks you to.
+
+Revert dumps spool to `/home/sol/hexis/arb-reverts/{slot}/{arb_sig}/` and are deleted
+once Hexis `dumpd` acks them over Control.
 
 ### Swapping to staked identity
 
@@ -190,6 +402,10 @@ To go live with your staked identity, follow the Jito hot-swap procedure. Do not
 
 **Disks not detected** — check `lsblk` on the server. Auto-detection skips any drive that has mounted partitions or an existing filesystem. Use `--ledger-disk` / `--accounts-disk` to override.
 
+**`--hexis-tag` fails** — the release download runs `gh` on **your** machine, not the server. Make sure `gh auth status` works and your account can see `hexishq/hexis-validator-docs`, or download the asset yourself and pass `--hexis-binary`.
+
+**Arb never trades** — it boots disabled. Check `arb get`, then `/home/sol/hexis/arb-enable.sh`. If the validator refuses to boot at all, the config had a bad key: `agave-validator run` aborts on a typo in `arb-config.toml`.
+
 **Build fails** — the Jito build needs `--github-ssh-key` and the key must be authorized on the `TheChimpions/jito-solana` fork.
 
 ---
@@ -204,6 +420,30 @@ To go live with your staked identity, follow the Jito hot-swap procedure. Do not
 - Disaster recovery
 
 ---
+
+## Development
+
+```
+arise.sh          provision a fresh server into a validator
+ascend.sh         upgrade / migrate / promote on a server that already exists
+lib/hexis.sh      shared Hexis defaults, logging, config rendering, checksum verification
+test/run.sh       test suite — no dependencies
+```
+
+Both scripts source `lib/hexis.sh`, so they must be run from a checkout rather than
+copied somewhere on their own. Hexis config values (program id, profit pool, marginfi
+account and banks, token ledgers, lookup tables) live in that one file.
+
+```bash
+./test/run.sh              # everything
+./test/run.sh patcher      # only cases matching a name
+```
+
+`ssh`, `scp` and `gh` are stubbed (`test/stubs/`) and host responses come from glob→output
+fixtures (`test/fixtures/`), so the suite runs offline and touches no server. It covers the
+`validator.sh` rewriter (including the shapes it must refuse rather than mangle), config
+rendering, checksum verification, the flash-loan matrix, release staging and promotion, and
+CLI validation. CI runs it alongside `shellcheck`.
 
 ## License
 

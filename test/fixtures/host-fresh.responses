@@ -1,0 +1,6 @@
+# arise.sh target: nothing installed yet
+*echo ok*|ok
+*solana-keygen*pubkey*arb_signer_keypair.json*|ArbSigner1111111111111111111111111111111111
+*solana-keygen*|/home/sol/.local/share/solana/install/releases/active_release/bin/solana-keygen
+*agave-validator.incoming --version*|agave-validator 4.2.2 (src:abc)
+*grep -m1 '^marginfi_account'*|93rXRLxa3nJ6WkEbsxHCPS6doffoVf4yXb8hxWaphPsw
