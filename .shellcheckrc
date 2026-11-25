@@ -1,0 +1,3 @@
+# The scripts source lib/*.sh; follow those files so variables that are only
+# read there (the HEXIS_* settings) are not reported as unused.
+external-sources=true

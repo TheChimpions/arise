@@ -1,0 +1,15 @@
+# A host running Jito, no Hexis yet, bare `exec agave-validator`
+*echo ok*|ok
+*test -f /home/sol/validator.sh*|yes
+*test -x /home/sol/hexis/agave-validator *|no
+*test -x /home/sol/hexis/hexis-setup*|no
+*then echo missing*|missing
+*--arb-config*validator.sh*|no
+*--ledger*validator.sh*|/mnt/ledger
+*grep -m1 -E '^[[:space:]]*exec*|agave-validator
+*command -v agave-validator*|/home/sol/.local/share/solana/install/releases/active_release/bin/agave-validator
+*solana-keygen*pubkey*arb_signer_keypair.json*|ArbSigner1111111111111111111111111111111111
+*solana-keygen*|/home/sol/.local/share/solana/install/releases/active_release/bin/solana-keygen
+*agave-validator.incoming --version*|agave-validator 4.2.2 (src:abc)
+*readlink*|
+*grep -m1 '^marginfi_account'*|93rXRLxa3nJ6WkEbsxHCPS6doffoVf4yXb8hxWaphPsw

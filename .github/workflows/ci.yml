@@ -13,7 +13,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Bash syntax check
-        run: bash -n arise.sh
+        run: |
+          bash -n arise.sh
+          bash -n ascend.sh
+          bash -n reawaken.sh
+          bash -n system.sh
+          bash -n lib/hexis.sh
+          bash -n lib/firedancer.sh
+          bash -n test/run.sh
 
       - name: ShellCheck
         uses: ludeeus/action-shellcheck@master
@@ -23,6 +30,15 @@ jobs:
           # SC2029: variables expanded client-side in ssh commands (intentional)
           # SC2086: unquoted $SSH_OPTS (intentional word-splitting)
           ignore_paths: ""
+
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests
+        run: ./test/run.sh
 
   smoke:
     name: CLI smoke tests
@@ -49,6 +65,26 @@ jobs:
           output=$(./arise.sh --nonsense-flag foo 2>&1 || true)
           echo "$output" | grep -q "Unknown option" || {
             echo "Expected 'Unknown option' error, got:"
+            echo "$output"
+            exit 1
+          }
+
+      - name: ascend.sh requires a mode
+        run: |
+          output=$(./ascend.sh --host 1.2.3.4 2>&1 || true)
+          echo "$output" | grep -q "must be 'upgrade', 'migrate' or 'promote'" || {
+            echo "Expected mode error, got:"
+            echo "$output"
+            exit 1
+          }
+
+      - name: ascend.sh requires a binary source
+        run: |
+          fake_key=$(mktemp)
+          trap 'rm -f "$fake_key"' EXIT
+          output=$(./ascend.sh upgrade --host 1.2.3.4 --ssh-key "$fake_key" 2>&1 || true)
+          echo "$output" | grep -q -- "--hexis-tag or --hexis-binary is required" || {
+            echo "Expected binary-source error, got:"
             echo "$output"
             exit 1
           }

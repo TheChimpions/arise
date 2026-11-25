@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Stub gh. 'auth status' succeeds; 'release download' writes a fake asset plus a
+# matching checksums.txt so the real verification path runs for real.
+[[ -n "${STUB_LOG:-}" ]] && printf 'gh %s\n' "$*" >> "$STUB_LOG"
+case "$1" in
+  auth) exit 0 ;;
+  api)
+    # The release listing, as "<tag>|<assets>" lines the way the --jq filter gives them
+    if [[ "$*" == *"/releases"* && -n "${STUB_RELEASES:-}" ]]; then printf '%b\n' "$STUB_RELEASES"; fi
+    exit 0 ;;
+  release)
+    dir=""; patterns=()
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        --dir) dir="$2"; shift 2 ;;
+        --pattern) patterns+=("$2"); shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [[ -z "$dir" ]] && exit 0
+    mkdir -p "$dir"
+    wrote=0
+    for p in "${patterns[@]}"; do
+      case "$p" in
+        agave-validator-linux-amd64) printf 'FAKE-VALIDATOR' > "$dir/agave-validator-linux-amd64"; wrote=1 ;;
+        hexis-setup-linux-amd64)
+          [[ "${STUB_NO_HEXIS_SETUP:-0}" == 1 ]] && exit 1
+          printf 'FAKE-SETUP' > "$dir/hexis-setup-linux-amd64"; wrote=1 ;;
+      esac
+    done
+    if [[ $wrote == 1 ]]; then
+      : > "$dir/checksums.txt"
+      for f in "$dir"/agave-validator-linux-amd64 "$dir"/hexis-setup-linux-amd64; do
+        [[ -f "$f" ]] && printf '%s  %s\n' "$(shasum -a 256 "$f" | awk '{print $1}')" "$(basename "$f")" >> "$dir/checksums.txt"
+      done
+    fi
+    exit 0 ;;
+esac
+exit 0

@@ -1,0 +1,12 @@
+# Hexis host whose validator.sh has no SOLANA_METRICS_CONFIG (the SFDP gap)
+*echo ok*|ok
+*test -f /home/sol/validator.sh*|yes
+*test -x /home/sol/hexis/agave-validator *|yes
+*then echo missing*|current
+*--arb-config*validator.sh*|yes
+*--ledger*validator.sh*|/mnt/ledger
+*readlink*|4.2.1
+*SOLANA_METRICS_CONFIG=*|0
+*agave-validator.incoming --version*|agave-validator 4.2.2 (src:x)
+*agave-validator --version*|agave-validator 4.2.1 (src:x)
+*grep -m1 '^marginfi_account'*|93rXRLxa3nJ6WkEbsxHCPS6doffoVf4yXb8hxWaphPsw
