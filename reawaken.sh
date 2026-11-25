@@ -27,7 +27,7 @@
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
-for lib in hexis.sh firedancer.sh; do
+for lib in hexis.sh firedancer.sh remote.sh; do
   if [[ ! -f "${LIB_DIR}/${lib}" ]]; then
     echo "Missing ${LIB_DIR}/${lib} — run this from a checkout, not as a lone copied file" >&2
     exit 1
@@ -37,6 +37,8 @@ done
 source "${LIB_DIR}/hexis.sh"
 # shellcheck source=lib/firedancer.sh
 source "${LIB_DIR}/firedancer.sh"
+# shellcheck source=lib/remote.sh
+source "${LIB_DIR}/remote.sh"
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -45,6 +47,7 @@ MODE=""
 SSH_HOST=""
 SSH_KEY=""
 SOL_USER="sol"
+ADMIN_USER="monarch"          # holds sudo; sol does not
 VALIDATOR_SH=""              # defaults to /home/$SOL_USER/validator.sh
 AGAVE_SERVICE="sol"
 DRY_RUN=false
@@ -154,6 +157,8 @@ Config (stage):
 
 Paths:
   --user <name>                 Validator user (default: ${SOL_USER})
+  --admin-user <name>           User that holds sudo (default: ${ADMIN_USER}). All root
+                                work goes through it; the validator user has no sudo
   --validator-script <path>     Agave startup script (default: /home/<user>/validator.sh)
   --agave-service <name>        Agave systemd unit (default: ${AGAVE_SERVICE})
   --fd-dir <path>               Binary and config (default: /home/<user>/firedancer)
@@ -188,6 +193,7 @@ while [[ $# -gt 0 ]]; do
     --host)             SSH_HOST="$2"; shift 2 ;;
     --ssh-key)          SSH_KEY="$2"; shift 2 ;;
     --user)             SOL_USER="$2"; shift 2 ;;
+    --admin-user)       ADMIN_USER="$2"; shift 2 ;;
     --validator-script) VALIDATOR_SH="$2"; shift 2 ;;
     --agave-service)    AGAVE_SERVICE="$2"; shift 2 ;;
     --fd-tag)           FD_TAG="$2"; shift 2 ;;
@@ -284,50 +290,18 @@ if [[ "$MODE" == "stage" ]] || { [[ "$MODE" == "upgrade" ]] && ! $FD_PREVIOUS; }
   fi
 fi
 
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $SSH_KEY"
-SSH_CMD="ssh -o IdentitiesOnly=yes -i ${SSH_KEY}"
+# Connection settings, and the helpers that use them (root_script, sol_script,
+# remote, sol_write_file), come from lib/remote.sh. Root work goes through the
+# admin user; sol has no sudo.
+remote_init
+# Each remote script in this file sets its own error handling.
+REMOTE_STRICT=":"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-remote() {
-  if $DRY_RUN; then
-    echo "[DRY RUN] ssh $SOL_HOST: $*"
-  else
-    ssh $SSH_OPTS "$SOL_HOST" "$@"
-  fi
-}
-
 # Always runs, even under --dry-run. For reads that must not be faked.
-probe() { ssh -n $SSH_OPTS "$SOL_HOST" "$@" 2>/dev/null || true; }
-
-sol_script() {
-  if $DRY_RUN; then
-    echo "[DRY RUN] sol_script on $SOL_HOST: <script>"
-    cat
-    return
-  fi
-  local tmpscript
-  tmpscript=$(mktemp)
-  cat > "$tmpscript"
-  scp -q $SSH_OPTS "$tmpscript" "$SOL_HOST:/tmp/_reawaken.sh"
-  rm -f "$tmpscript"
-  ssh $SSH_OPTS "$SOL_HOST" 'bash /tmp/_reawaken.sh; rc=$?; rm -f /tmp/_reawaken.sh; exit $rc'
-}
-
-root_script() {
-  if $DRY_RUN; then
-    echo "[DRY RUN] root_script on $SOL_HOST: <script>"
-    cat
-    return
-  fi
-  local tmpscript
-  tmpscript=$(mktemp)
-  cat > "$tmpscript"
-  scp -q $SSH_OPTS "$tmpscript" "$SOL_HOST:/tmp/_reawaken_root.sh"
-  rm -f "$tmpscript"
-  ssh $SSH_OPTS "$SOL_HOST" "echo '${SUDO_PASS:-}' | sudo -S -p '' bash /tmp/_reawaken_root.sh; rc=\$?; rm -f /tmp/_reawaken_root.sh; exit \$rc"
-}
+probe() { ssh -n "${SSH_OPTS[@]}" "$SOL_HOST" "$@" 2>/dev/null || true; }
 
 confirm() {
   $ASSUME_YES && return 0
@@ -337,16 +311,9 @@ confirm() {
   [[ "$reply" == "yes" ]]
 }
 
-SUDO_PASS=""
 need_sudo() {
   $DRY_RUN && return 0
-  [[ -n "$SUDO_PASS" ]] && return 0
-  read -rsp "Sudo password for ${SOL_HOST}: " SUDO_PASS
-  echo ""
-  if ! ssh $SSH_OPTS "$SOL_HOST" "echo '${SUDO_PASS}' | sudo -S -p '' -v 2>/dev/null"; then
-    log_error "Sudo password validation failed"
-    exit 1
-  fi
+  ask_sudo_pass || exit 1
 }
 
 fact() { sed -n "s/^$1=//p" <<<"$FACTS" | head -1; }
@@ -384,7 +351,7 @@ mem_check() {
     probe "$script"
   else
     # The log directory belongs to the Firedancer user, which sol cannot write
-    ssh $SSH_OPTS "$SOL_HOST" "echo '${SUDO_PASS:-}' | sudo -S -p '' bash -c \"$script\"" 2>/dev/null || true
+    printf '%s\n' "$script" | root_exec "$ADMIN_HOST" sudo-pass "$SUDO_PASS" "bash -s" 2>/dev/null || true
   fi
 }
 
@@ -400,7 +367,7 @@ fi
 
 # The heredoc is expanded here on purpose: it carries this script's paths.
 # shellcheck disable=SC2087
-FACTS=$(ssh $SSH_OPTS "$SOL_HOST" "bash -s -- host-facts" 2>/dev/null <<FACTSEOF || true
+FACTS=$(ssh "${SSH_OPTS[@]}" "$SOL_HOST" "bash -s -- host-facts" 2>/dev/null <<FACTSEOF || true
 echo "vendor=\$(awk -F': ' '/^vendor_id/{print \$2; exit}' /proc/cpuinfo)"
 echo "family=\$(awk -F': ' '/^cpu family/{print \$2; exit}' /proc/cpuinfo)"
 echo "model=\$(awk -F': ' '/^model name/{print \$2; exit}' /proc/cpuinfo)"
@@ -665,8 +632,8 @@ SCRIPT
   log_info "cutover complete — Firedancer is booting"
   log_info "============================================"
   log_info "Watch it load the snapshot and catch up:"
-  log_info "  ${SSH_CMD} ${SOL_HOST} 'sudo journalctl -u firedancer -f'"
-  log_info "  ${SSH_CMD} ${SOL_HOST} 'sudo ${FD_BIN} ready --config ${FD_CONFIG}'"
+  log_info "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo journalctl -u firedancer -f'"
+  log_info "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo ${FD_BIN} ready --config ${FD_CONFIG}'"
   log_info "Then check the Control port and tell Hexis it is up:"
   log_info "  ${SSH_CMD} ${SOL_HOST} 'ss -lntp | grep ${FD_CONTROL_PORT}'"
   log_info ""
@@ -819,7 +786,7 @@ SCRIPT
   log_info "============================================"
   log_info "upgrade complete — Firedancer is booting on ${label}"
   log_info "============================================"
-  log_info "  ${SSH_CMD} ${SOL_HOST} 'sudo journalctl -u firedancer -f'"
+  log_info "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo journalctl -u firedancer -f'"
   log_info "Back to the release that ran before:"
   log_info "  $0 upgrade --previous --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
 }
@@ -1114,8 +1081,7 @@ fi
 
 if [[ -n "$FD_BINARY" ]]; then
   remote "mkdir -p ${FD_DIR}/releases && chmod 750 ${FD_DIR}"
-  scp -q $SSH_OPTS "$FD_BINARY" "$SOL_HOST:${FD_DIR}/firedancer.incoming"
-  remote "chmod +x ${FD_DIR}/firedancer.incoming"
+  sol_write_file "${FD_DIR}/firedancer.incoming" 755 < "$FD_BINARY"
 
   NEW_VERSION=$(probe "${FD_DIR}/firedancer.incoming version 2>/dev/null | head -1")
   if [[ -z "$NEW_VERSION" ]]; then
@@ -1157,8 +1123,8 @@ fi
 
 # --- Directories and the arb signer --------------------------------------------
 if [[ "$SIGNER_FROM" == "upload" ]]; then
-  scp -q $SSH_OPTS "$FD_SIGNER" "$SOL_HOST:${FD_SIGNER_PATH}.incoming"
-  remote "chmod 600 ${FD_SIGNER_PATH}.incoming"
+  # Streamed over SSH and created mode 600 — never readable by anyone else
+  sol_write_file "${FD_SIGNER_PATH}.incoming" 600 < "$FD_SIGNER"
 fi
 
 case "$SIGNER_FROM" in
@@ -1185,11 +1151,7 @@ echo "arb signer: \$(${FD_BIN} keys pubkey ${FD_SIGNER_PATH} 2>/dev/null || echo
 SCRIPT
 
 # --- Config: write, check against the real binary, then install -----------------
-CONFIG_TMP=$(mktemp)
-printf '%s\n' "$CONFIG_TEXT" > "$CONFIG_TMP"
-scp -q $SSH_OPTS "$CONFIG_TMP" "$SOL_HOST:${FD_CONFIG}.new"
-rm -f "$CONFIG_TMP"
-remote "chmod 640 ${FD_CONFIG}.new"
+printf '%s\n' "$CONFIG_TEXT" | sol_write_file "${FD_CONFIG}.new" 640
 
 log_info "Checking the config with 'firedancer mem'"
 CHECK=$(mem_check "${FD_CONFIG}.new")

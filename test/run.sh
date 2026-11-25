@@ -49,7 +49,7 @@ ascend() { ( cd "$ROOT" && ./ascend.sh "$@" ) 2>&1; }
 system() { ( cd "$ROOT" && ./system.sh "$@" ) 2>&1; }
 
 # Common argument sets
-arise_base=(--host 1.2.3.4 --vote-account V1 --network mainnet --commission-bps 0
+arise_base=(--host 1.2.3.4 --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network mainnet --commission-bps 0
             --jito-region frankfurt --no-auto-disks --no-xdp --dry-run)
 
 # ---------------------------------------------------------------------------
@@ -255,6 +255,156 @@ EOF
   fi
 fi
 
+# === clients and the security model ========================================
+if should_run "client"; then
+group "clients and security model"
+  F="$ROOT/test/fixtures"
+  PK=7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2
+  cl_base=(--host 1.2.3.4 --vote-account "$PK" --network mainnet --commission-bps 0
+           --jito-region frankfurt --no-auto-disks --dry-run
+           --ssh-key "$WORK/key" --identity "$WORK/id.json")
+
+  out="$(arise "${cl_base[@]}" --no-xdp)"
+
+  it "jito is the default client and builds from the public repo over https"
+  assert_contains "$out" "CLIENT_REPO=https://github.com/jito-foundation/jito-solana.git"
+
+  it "jito gets the Block Engine flags"
+  assert_contains "$out" "--block-engine-url https://frankfurt.mainnet.block-engine.jito.wtf"
+
+  it "the shred receivers are the Jito region and DoubleZero, nothing else"
+  assert_contains "$out" "--shred-receiver-address 64.130.50.14:1002,233.84.178.1:7733 \\"
+
+  it "RPC stays on localhost and out of gossip"
+  assert_contains "$out" "--private-rpc"
+
+  it "no public RPC address is advertised"
+  assert_not_contains "$out" "--public-rpc-address"
+
+  it "the port range is the 26 ports Agave 4 needs"
+  assert_contains "$out" "--dynamic-port-range 8000-8026"
+
+  it "the firewall opens that range and not 8000-10000"
+  assert_contains "$out" "FIREWALL_PORT_RANGE=8000:8026"
+
+  it "the old wide firewall rule is removed"
+  assert_contains "$out" "ufw delete allow 8000:10000/tcp"
+
+  it "no GitHub key is copied to the server"
+  assert_not_contains "$out" "IdentityFile ~/.ssh/github_key"
+
+  it "a GitHub key left by an older run is reported"
+  assert_contains "$out" "delete it and revoke it on GitHub"
+
+  it "jag-snap is not set up"
+  assert_not_contains "$out" "docker run"
+
+  it "sol's old sudo access is revoked"
+  assert_contains "$out" 'rm -f "/etc/sudoers.d/$SOL_USER"'
+
+  it "sshd is hardened through a drop-in that is checked before reload"
+  assert_contains "$out" 'DROPIN="$DROPIN_DIR/00-arise.conf"'
+
+  it "root login is turned off by default"
+  assert_contains "$out" "PERMIT_ROOT_LOGIN=no"
+
+  it "--keep-root-login keeps key-only root login"
+  assert_contains "$(arise "${cl_base[@]}" --no-xdp --keep-root-login)" "PERMIT_ROOT_LOGIN=prohibit-password"
+
+  it "CPU mitigations stay on unless asked"
+  assert_contains "$out" "DISABLE_CPU_MITIGATIONS=false"
+
+  it "no script is written to /tmp on the server"
+  assert_not_contains "$out" "/tmp/_setup_script"
+
+  it "perch is installed by default"
+  assert_contains "$out" "Installing perch watchtower"
+
+  it "--no-perch skips it"
+  assert_contains "$(arise "${cl_base[@]}" --no-xdp --no-perch)" "Skipping perch watchtower"
+
+  out="$(arise "${cl_base[@]}" --no-xdp --client agave --client-version v4.4.1)"
+
+  it "agave builds from the Anza repo"
+  assert_contains "$out" "CLIENT_REPO=https://github.com/anza-xyz/agave.git"
+
+  it "agave gets no Jito flags"
+  assert_not_contains "$out" "--block-engine-url"
+
+  it "agave gets no tip programs"
+  assert_not_contains "$out" "--tip-payment-program-pubkey"
+
+  out="$(arise "${cl_base[@]}" --client firedancer --fd-tag v1.2.3)"
+
+  it "firedancer builds nothing from source"
+  assert_contains "$out" "Firedancer ships as a binary"
+
+  it "firedancer writes validator.sh with the Block Engine settings for reawaken to read"
+  assert_contains "$out" "--block-engine-url https://frankfurt.mainnet.block-engine.jito.wtf"
+
+  it "firedancer leaves sol.service disabled"
+  assert_contains "$out" "IS_FIREDANCER=true"
+
+  it "firedancer hands over to reawaken stage with the release and the admin user"
+  assert_contains "$out" "reawaken.sh stage --host 1.2.3.4 --ssh-key $WORK/key --admin-user monarch --fd-tag v1.2.3 --generate-signer"
+
+  it "firedancer passes a supplied arb signer on"
+  assert_contains "$(arise "${cl_base[@]}" --client firedancer --fd-tag v1.2.3 --hexis-signer "$WORK/signer.json")" \
+    "--hexis-signer $WORK/signer.json"
+
+  it "firedancer points at cutover to start it"
+  assert_contains "$out" "reawaken.sh cutover --host 1.2.3.4"
+
+  it "firedancer is mainnet only"
+  assert_contains "$(arise --host 1.2.3.4 --vote-account "$PK" --network testnet --dry-run \
+    --ssh-key "$WORK/key" --identity "$WORK/id.json" --client firedancer)" "requires --network mainnet"
+
+  it "--hexis needs the jito client"
+  assert_contains "$(arise "${cl_base[@]}" --client agave --hexis --hexis-binary "$WORK/binary")" "--hexis needs --client jito"
+
+  it "an unknown client is refused"
+  assert_contains "$(arise "${cl_base[@]}" --client frankendancer)" "--client must be"
+
+  it "--fd-tag without the firedancer client is refused"
+  assert_contains "$(arise "${cl_base[@]}" --fd-tag v1)" "only go with --client firedancer"
+
+  it "a vote account that is not a pubkey is refused"
+  assert_contains "$(arise --host 1.2.3.4 --vote-account 'x;reboot' --network mainnet --dry-run \
+    --ssh-key "$WORK/key" --identity "$WORK/id.json")" "not a valid base58 pubkey"
+
+  it "a disk that is not a /dev path is refused"
+  assert_contains "$(arise "${cl_base[@]}" --ledger-disk 'nvme0n1; rm -rf /')" "must be a /dev path"
+
+  # --- lib/remote.sh ---
+  source "${ROOT}/lib/remote.sh"
+
+  it "a wrapped script is parsed whole and reads no stdin"
+  assert_eq "$(printf 'echo one\ncat\necho two\n' | wrap_script | bash)" "$(printf 'one\ntwo')"
+
+  it "a wrapped script stops at the first failing command"
+  assert_eq "$(printf 'echo one\nfalse\necho two\n' | wrap_script | bash; echo "rc=$?")" "$(printf 'one\nrc=1')"
+
+  it "a wrapped script's exit status is the script's"
+  printf 'exit 7\n' | wrap_script | bash; assert_eq "$?" "7"
+
+  it "emit_vars quotes values so they cannot run as code"
+  # shellcheck disable=SC2034  # read by name through emit_vars
+  HOSTILE='x"; touch '"$WORK"'/pwned; echo "'
+  ( emit_vars HOSTILE; echo 'printf "%s" "$HOSTILE" > /dev/null' ) | wrap_script | bash
+  assert_file_missing "$WORK/pwned"
+
+  it "the sudo password is sent on stdin, never on the command line"
+  SSH_KEY="$WORK/key"; SSH_HOST=1.2.3.4; SOL_USER=sol; ADMIN_USER=monarch; DRY_RUN=false; remote_init
+  STUB_LOG="$WORK/ssh.log" SUDO_PASS='s3cret-pass' bash -c "
+    source '${ROOT}/lib/hexis.sh'; source '${ROOT}/lib/remote.sh'
+    SSH_KEY='$WORK/key'; SSH_HOST=1.2.3.4; SOL_USER=sol; ADMIN_USER=monarch; DRY_RUN=false; remote_init
+    echo 'echo hi' | root_script"
+  assert_not_contains "$(cat "$WORK/ssh.log")" "s3cret-pass"
+
+  it "root scripts run through the admin user with sudo reading stdin"
+  assert_contains "$(cat "$WORK/ssh.log")" "monarch@1.2.3.4 sudo -k -S -p '' bash -s"
+fi
+
 # === flash loans ============================================================
 if should_run "flash"; then
 group "flash loans"
@@ -401,7 +551,8 @@ group "XDP / PoH flag rename"
   new_ok="*agave-validator --xdp-cpu-cores 1 --version*|yes"
   new_rejected="*agave-validator --xdp-cpu-cores 1 --version*|no"
   old_rejected="*agave-validator --experimental-retransmit-xdp-cpu-cores 1 --version*|no"
-  diff_back="*_ascend.sh*|--- /home/sol/validator.sh"
+  # sol_script streams its script over stdin, so the call is "sol@host bash -s"
+  diff_back="*sol@1.2.3.4 bash -s|--- /home/sol/validator.sh"
 
   printf '%s\n' "$old_xdp" "$new_ok" "$diff_back" > "$WORK/xdp-new.responses"
   cat "$F/host-hexis.responses" >> "$WORK/xdp-new.responses"
@@ -523,7 +674,7 @@ group "cluster metrics (SFDP)"
   it "arise exports SOLANA_METRICS_CONFIG on mainnet"
   assert_contains "$out" "export SOLANA_METRICS_CONFIG=\"$SFDP_METRICS_MAINNET\""
 
-  out="$(STUB_RESPONSES=$F/host-fresh.responses arise --host 1.2.3.4 --vote-account V1 \
+  out="$(STUB_RESPONSES=$F/host-fresh.responses arise --host 1.2.3.4 --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 \
         --network testnet --no-auto-disks --no-xdp --dry-run \
         --ssh-key "$WORK/key" --identity "$WORK/id.json")"
 
@@ -644,7 +795,7 @@ group "CLI validation"
 
   it "arise rejects --hexis on testnet"
   assert_contains "$(arise --host 1.2.3.4 --ssh-key "$WORK/key" --identity "$WORK/id.json" \
-    --vote-account V --network testnet --hexis)" "requires --network mainnet"
+    --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network testnet --hexis)" "requires --network mainnet"
 
   it "arise requires --host"
   assert_contains "$(arise)" "--host is required"
@@ -659,16 +810,24 @@ group "CLI validation"
     --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary")" \
     "ssh -o IdentitiesOnly=yes -i $WORK/key sol@1.2.3.4"
 
-  # Root may only have a password, and Step 12 turns password auth off, so root
-  # work after the bootstrap has to go through sol + sudo.
+  # --root-user only creates the admin user. Step 12 turns root login off, so
+  # root work after the bootstrap goes through the admin user + sudo, and never
+  # through sol, which has no sudo at all.
   out="$(STUB_RESPONSES=$ROOT/test/fixtures/host-fresh.responses arise "${arise_base[@]}" \
     --ssh-key "$WORK/key" --identity "$WORK/id.json" --root-user root)"
 
-  it "arise runs root scripts as sol even with --root-user"
-  assert_contains "$out" "root_script on sol@1.2.3.4"
+  it "arise runs root scripts as the admin user even with --root-user"
+  assert_contains "$out" "root script via monarch@1.2.3.4"
 
   it "arise never runs root scripts over the root login"
-  assert_not_contains "$out" "root_script on root@"
+  assert_not_contains "$out" "root script via root@"
+
+  it "arise never runs root scripts as sol"
+  assert_not_contains "$out" "root script via sol@"
+
+  it "--admin-user names the account that holds sudo"
+  assert_contains "$(STUB_RESPONSES=$ROOT/test/fixtures/host-fresh.responses arise "${arise_base[@]}" \
+    --ssh-key "$WORK/key" --identity "$WORK/id.json" --admin-user ops)" "root script via ops@1.2.3.4"
 
   it "ascend refuses to upgrade a host with no hexis install"
   assert_contains "$(STUB_RESPONSES=$ROOT/test/fixtures/host-jito.responses ascend upgrade \

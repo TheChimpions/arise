@@ -27,6 +27,14 @@ if [[ ! -f "$HEXIS_LIB" ]]; then
 fi
 # shellcheck source=lib/hexis.sh
 source "$HEXIS_LIB"
+# Remote execution: root work goes through the admin user, never through sol
+REMOTE_LIB="$(dirname "$HEXIS_LIB")/remote.sh"
+if [[ ! -f "$REMOTE_LIB" ]]; then
+  echo "Missing $REMOTE_LIB — run this from a checkout, not as a lone copied file" >&2
+  exit 1
+fi
+# shellcheck source=lib/remote.sh
+source "$REMOTE_LIB"
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -38,6 +46,7 @@ LIST_RELEASES=false
 SSH_HOST=""
 SSH_KEY=""
 SOL_USER="sol"
+ADMIN_USER="monarch"          # holds sudo; sol does not
 HEXIS_DIR=""                 # defaults to /home/$SOL_USER/hexis
 VALIDATOR_SH=""              # defaults to /home/$SOL_USER/validator.sh
 LEDGER_PATH=""               # parsed out of validator.sh when not given
@@ -94,6 +103,8 @@ Binary source (upgrade always, migrate always):
 
 Paths:
   --user <name>                 Validator user (default: ${SOL_USER})
+  --admin-user <name>           User that holds sudo (default: ${ADMIN_USER}). All root
+                                work goes through it; the validator user has no sudo
   --hexis-dir <path>            Install dir (default: /home/<user>/hexis)
   --validator-script <path>     Startup script (default: /home/<user>/validator.sh)
   --ledger <path>               Ledger dir (default: parsed from validator.sh)
@@ -156,6 +167,7 @@ while [[ $# -gt 0 ]]; do
     --host)            SSH_HOST="$2";  shift 2 ;;
     --ssh-key)         SSH_KEY="$2";   shift 2 ;;
     --user)            SOL_USER="$2";  shift 2 ;;
+    --admin-user)      ADMIN_USER="$2"; shift 2 ;;
     --hexis-dir)       HEXIS_DIR="$2"; shift 2 ;;
     --validator-script) VALIDATOR_SH="$2"; shift 2 ;;
     --ledger)          LEDGER_PATH="$2"; shift 2 ;;
@@ -236,11 +248,13 @@ if ! $METRICS_CONFIG_SET && [[ -z "$METRICS_CONFIG" ]]; then
   METRICS_CONFIG="$SFDP_METRICS_MAINNET"
 fi
 
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $SSH_KEY"
+# Connection settings, and the helpers that use them (root_script, sol_script,
+# remote, sol_write_file), come from lib/remote.sh. Root work goes through the
+# admin user; sol has no sudo.
+remote_init
+# Each remote script in this file sets its own error handling.
+REMOTE_STRICT=":"
 
-# Copy-pasteable form of the connection these scripts make themselves.
-# IdentitiesOnly stops ssh offering every agent key and tripping MaxAuthTries.
-SSH_CMD="ssh -o IdentitiesOnly=yes -i ${SSH_KEY}"
 
 # 'exit' waits for the restart window and then stops the validator. sol.service is
 # Restart=always, so systemd brings it straight back on whatever the symlink points at.
@@ -258,44 +272,8 @@ perch_before_exit() {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-remote() {
-  if $DRY_RUN; then
-    echo "[DRY RUN] ssh $SOL_HOST: $*"
-  else
-    ssh $SSH_OPTS "$SOL_HOST" "$@"
-  fi
-}
-
 # Always runs, even under --dry-run. For reads that must not be faked.
-probe() { ssh $SSH_OPTS "$SOL_HOST" "$@" 2>/dev/null || true; }
-
-sol_script() {
-  if $DRY_RUN; then
-    echo "[DRY RUN] sol_script on $SOL_HOST: <script>"
-    cat
-    return
-  fi
-  local tmpscript
-  tmpscript=$(mktemp)
-  cat > "$tmpscript"
-  scp -q $SSH_OPTS "$tmpscript" "$SOL_HOST:/tmp/_ascend.sh"
-  rm -f "$tmpscript"
-  ssh $SSH_OPTS "$SOL_HOST" 'bash /tmp/_ascend.sh; rc=$?; rm -f /tmp/_ascend.sh; exit $rc'
-}
-
-root_script() {
-  if $DRY_RUN; then
-    echo "[DRY RUN] root_script on $SOL_HOST: <script>"
-    cat
-    return
-  fi
-  local tmpscript
-  tmpscript=$(mktemp)
-  cat > "$tmpscript"
-  scp -q $SSH_OPTS "$tmpscript" "$SOL_HOST:/tmp/_ascend_root.sh"
-  rm -f "$tmpscript"
-  ssh $SSH_OPTS "$SOL_HOST" "echo '${SUDO_PASS:-}' | sudo -S bash /tmp/_ascend_root.sh; rc=\$?; rm -f /tmp/_ascend_root.sh; exit \$rc"
-}
+probe() { ssh "${SSH_OPTS[@]}" "$SOL_HOST" "$@" 2>/dev/null || true; }
 
 confirm() {
   $ASSUME_YES && return 0
@@ -579,8 +557,7 @@ else
   remote "mkdir -p ${HEXIS_DIR}/releases ${HEXIS_DIR}/arb-reverts && chmod 700 ${HEXIS_DIR}"
 
   # Upload to a scratch path first — the release name may depend on --version
-  scp -q $SSH_OPTS "$HEXIS_BINARY" "$SOL_HOST:${HEXIS_DIR}/agave-validator.incoming"
-  remote "chmod +x ${HEXIS_DIR}/agave-validator.incoming"
+  sol_write_file "${HEXIS_DIR}/agave-validator.incoming" 755 < "$HEXIS_BINARY"
 
   NEW_VERSION=$(probe "${HEXIS_DIR}/agave-validator.incoming --version 2>/dev/null | awk '{print \$2}'")
   if [[ -z "$NEW_VERSION" ]]; then
@@ -649,8 +626,7 @@ if [[ -n "$HEXIS_SETUP_BINARY" ]]; then
   if $DRY_RUN; then
     echo "[DRY RUN] scp $HEXIS_SETUP_BINARY -> $SOL_HOST:${HEXIS_DIR}/hexis-setup"
   else
-    scp -q $SSH_OPTS "$HEXIS_SETUP_BINARY" "$SOL_HOST:${HEXIS_DIR}/hexis-setup"
-    remote "chmod +x ${HEXIS_DIR}/hexis-setup"
+    sol_write_file "${HEXIS_DIR}/hexis-setup" 755 < "$HEXIS_SETUP_BINARY"
     log_info "hexis-setup installed at ${HEXIS_DIR}/hexis-setup"
   fi
 fi
@@ -667,16 +643,15 @@ if [[ -n "$HEXIS_CONFIG" ]]; then
     echo "[DRY RUN] scp $HEXIS_CONFIG -> $SOL_HOST:${HEXIS_DIR}/arb-config.toml"
   else
     remote "test -f ${HEXIS_DIR}/arb-config.toml && cp -a ${HEXIS_DIR}/arb-config.toml ${HEXIS_DIR}/arb-config.toml.bak || true"
-    scp -q $SSH_OPTS "$HEXIS_CONFIG" "$SOL_HOST:${HEXIS_DIR}/arb-config.toml"
-    remote "chmod 600 ${HEXIS_DIR}/arb-config.toml"
+    sol_write_file "${HEXIS_DIR}/arb-config.toml" 600 < "$HEXIS_CONFIG"
   fi
 elif [[ "$MODE" == "migrate" ]]; then
   if [[ -n "$HEXIS_SIGNER" ]]; then
     if $DRY_RUN; then
       echo "[DRY RUN] scp $HEXIS_SIGNER -> $SOL_HOST:${SIGNER_PATH}"
     else
-      scp -q $SSH_OPTS "$HEXIS_SIGNER" "$SOL_HOST:${SIGNER_PATH}"
-      remote "chmod 600 ${SIGNER_PATH}"
+      # Streamed over SSH and created mode 600 — never readable by anyone else
+      sol_write_file "$SIGNER_PATH" 600 < "$HEXIS_SIGNER"
     fi
   fi
 
@@ -843,8 +818,8 @@ SCRIPT
     if $DRY_RUN; then
       echo "[DRY RUN] ufw allow from ${HEXIS_CONTROL_ALLOW} to any port ${CONTROL_PORT} proto tcp"
     else
-      read -rsp "Sudo password for ${SOL_HOST} (to open the Control port): " SUDO_PASS
-      echo ""
+      log_info "Opening the Control port needs sudo"
+      ask_sudo_pass || exit 1
       root_script <<SCRIPT
 ufw allow from ${HEXIS_CONTROL_ALLOW} to any port ${CONTROL_PORT} proto tcp
 echo "Allowed ${CONTROL_PORT}/tcp from ${HEXIS_CONTROL_ALLOW} (Hexis Control)"
