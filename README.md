@@ -1,4 +1,4 @@
-.```
+```
  █████╗ ██████╗ ██╗███████╗███████╗
 ██╔══██╗██╔══██╗██║██╔════╝██╔════╝
 ███████║██████╔╝██║███████╗█████╗
@@ -7,9 +7,26 @@
 ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚══════╝╚══════╝
 ```
 
-A one-shot, idempotent setup script that takes a fresh Ubuntu server and turns it into a Solana validator (testnet or mainnet). Handles disk setup, kernel tuning, Jito build, region detection, systemd services, firewall, jag-snap, and the optional Hexis arb client.
+Scripts that take a Solana validator from a bare Ubuntu server to a running node and keep it moving afterwards: upgrades, a move onto the Hexis arb client, and a move onto Firedancer with the Hexis Concorde.
 
 > **"Arise."** — one command, and the validator rises from the shadows.
+
+| Script | What it is | What it does |
+|---|---|---|
+| `system.sh` | The System: status window and quests | **Start here for any server that already runs a validator.** Reports what the host runs and routes each move to the script that owns it |
+| `arise.sh` | Raising a new shadow soldier | Turns a fresh server into a validator: disks, kernel tuning, Jito build or Hexis binary, region detection, systemd, firewall, jag-snap |
+| `ascend.sh` | Levelling up | Upgrades the Hexis Agave client, or moves a Jito / plain Agave validator onto it |
+| `reawaken.sh` | A Re-Awakening | Moves a running validator onto Firedancer with the Hexis Concorde, upgrades it there, and takes it back |
+
+```bash
+# What does this host run, and what can be done from here? Read-only.
+./system.sh --host <ip> --ssh-key ~/.ssh/<key>
+
+# Then name the goal: upgrade | hexis | firedancer | agave
+./system.sh upgrade --host <ip> --ssh-key ~/.ssh/<key>
+```
+
+A server with no validator yet is the one case `system.sh` does not run for you: it needs your keys, so that is `arise.sh`, described first below. Everything for an existing host is under [After the script finishes](#after-the-script-finishes), starting at [`system.sh`](#which-script-for-which-host-systemsh).
 
 ---
 
@@ -33,7 +50,7 @@ A one-shot, idempotent setup script that takes a fresh Ubuntu server and turns i
 
 ---
 
-## What it does
+## What `arise.sh` does
 
 1. **Bootstrap** — creates the `sol` user and copies your SSH key (if run with `--root-user`)
 2. **System packages** — curl, build deps, docker.io, monitoring tools
@@ -379,7 +396,7 @@ that owns it, which still asks before it stops or starts a validator:
 |---|---|---|---|
 | `upgrade` | not available | `ascend.sh upgrade --restart` | `reawaken.sh upgrade` |
 | `hexis` | `ascend.sh migrate --restart` | already there | use `agave` |
-| `firedancer` | `reawaken.sh stage`, then `cutover` on the next call | same | already there |
+| `firedancer` | `reawaken.sh stage`, then `cutover` on the next call | same | already there, unless a cutover is unfinished: then `cutover` again |
 | `agave` | already there | already there | `reawaken.sh rollback` |
 
 ```bash
@@ -390,6 +407,11 @@ that owns it, which still asks before it stops or starts a validator:
 
 `--tag` picks a release other than the newest. A server with no validator is pointed at
 `arise.sh`, which needs your keys and is never run from here.
+
+A cutover that needed a reboot (see below) leaves its last steps undone, because
+Firedancer comes up by itself after the reboot. `system.sh` sees that jag-snap is still
+listening or that perch still watches the old RPC port, and sends the `firedancer` goal
+back to `cutover`, which then only does those steps.
 
 ### Moving to Firedancer (`reawaken.sh`)
 
@@ -417,10 +439,23 @@ so on a Hexis or Jito host there is normally nothing to pass but the release.
 
 `upgrade` stages the release exactly as `stage` does (binary, config refreshed against
 that release's Concorde tables, shown as a diff), checks the config with the new binary,
-waits for a window with no leader slot and restarts Firedancer. Every restart downloads
-a snapshot, so the validator is not voting until that has loaded. `--previous` points
-back at the release that was active before and restarts; it refuses when that older
-binary does not accept the current config.
+fetches a current full snapshot while the validator still runs, waits for a window with
+no leader slot and restarts Firedancer. The validator is not voting until the snapshot
+has loaded: about two minutes from a file on disk, about an hour when it has to be
+downloaded at start (see below). `--previous` points back at the release that was
+active before and restarts; it refuses when that older binary does not accept the
+current config.
+
+`cutover` and `rollback` wait for a window with no leader slot for 90 minutes, `upgrade`
+for 20; `--min-idle-time` changes either and `--now` skips the wait. The long default is
+for what a move between clients can need at worst: a reboot and a full snapshot download.
+
+**The reboot.** Firedancer needs 183 one-GiB pages. A server that has been up for a
+while usually cannot provide them (memory is fragmented), so the first start in `cutover`
+fails and says so. By then Agave is stopped and disabled and Firedancer is enabled:
+reboot the host, Firedancer starts by itself and takes its pages first thing, then run
+`cutover` once more to finish. On a mainnet validator that went this way, it was voting
+again about eleven minutes after Agave stopped.
 
 `--dry-run` on any mode prints the plan, the full `config.toml` and the unit without
 changing the host or asking for sudo.
@@ -466,9 +501,17 @@ Things that change on Firedancer:
     `--no-snapshot-prefetch` turns it off.
 
   Firedancer starts from the local file when a trusted peer still serves incrementals
-  built on that full slot; if anything above fails, it downloads as before. `cutover` stops the jag-snap container and closes 18899/tcp; `rollback` starts
-  it and reopens the port. Stake that depends on serving snapshots (JagPool) does not
-  carry over to a Firedancer host.
+  built on that full slot; if anything above fails, it downloads as before. The full
+  snapshot rolls over about every six hours, so a cutover that straddles a rollover
+  (with a reboot in between, say) can still end in the download.
+
+  `cutover` stops the jag-snap container and closes 18899/tcp; `rollback` starts it and
+  reopens the port. Stake that depends on serving snapshots (JagPool) does not carry
+  over to a Firedancer host.
+- **The Block Engine connection sleeps.** Firedancer connects to the Jito Block Engine
+  only around its leader slots; `bundle_conn_state` 3 (sleeping) between them is normal.
+- **No BAM.** The Hexis Agave build has `--bam-url`; this Firedancer build has no
+  equivalent.
 - **RPC is off** in the Concorde build (its core goes to the arb tiles), so
   `solana catchup --our-localhost` stops working on that host. `--enable-rpc` turns it
   back on.
@@ -519,6 +562,41 @@ ls -la ~/identity.json
 
 To go live with your staked identity, follow the Jito hot-swap procedure. Do not just `ln -sf` the staked identity without understanding tower file handling.
 
+**With Firedancer on either side** the steps are the same three (step down, carry the
+vote history, step up) but the commands differ. Nothing here automates them.
+
+```bash
+# Host giving up the staked identity
+#   Agave:
+agave-validator -l /mnt/ledger wait-for-restart-window --min-idle-time 2 --skip-new-snapshot-check
+agave-validator -l /mnt/ledger set-identity ~/unstaked_identity.json && ln -sf unstaked_identity.json ~/identity.json
+#   Firedancer (wait needs root; set-identity runs as the validator user):
+sudo ~/firedancer/firedancer wait --config ~/firedancer/config.toml --min-idle-seconds 120
+~/firedancer/firedancer set-identity ~/unstaked_identity.json --config ~/firedancer/config.toml \
+  && ln -sf unstaked_identity.json ~/identity.json
+
+# Carry vote_history-<staked pubkey>.bin to the other host, into the directory its
+# client reads: /mnt/ledger for Agave, /mnt/ledger/firedancer for Firedancer.
+#   From Agave the file is     /mnt/ledger/vote_history-<pubkey>.bin
+#   From Firedancer it is      /mnt/ledger/firedancer/vote_history-<pubkey>.bin.bak
+#   (Firedancer renames the outgoing identity's file when it steps down; copy it to
+#   the plain .bin name on the other side.)
+
+# Host taking the staked identity, on Firedancer
+~/firedancer/firedancer set-identity ~/staked_identity.json \
+  --vote-history-file /mnt/ledger/firedancer/vote_history-<pubkey>.bin \
+  --config ~/firedancer/config.toml \
+  && ln -sf staked_identity.json ~/identity.json
+```
+
+- `--config` is required on every `firedancer` command; without it the command builds a
+  default setup, finds no arb signer and refuses.
+- `set-identity` changes the running validator only. The config points at
+  `identity.json`, so the `ln -sf` is what makes it hold across a restart, on both hosts.
+- Firedancer reads a vote history written by Agave, both at boot and through
+  `set-identity`.
+- Check that the two hosts' unstaked identities are different keys before you start.
+
 ---
 
 ## Troubleshooting
@@ -533,6 +611,14 @@ To go live with your staked identity, follow the Jito hot-swap procedure. Do not
 
 **Arb never trades** — it boots disabled. Check `arb get`, then `/home/sol/hexis/arb-enable.sh`. If the validator refuses to boot at all, the config had a bad key: `agave-validator run` aborts on a typo in `arb-config.toml`.
 
+**`cutover` fails with "ENOMEM … reserve gigantic pages"** — expected on a server that has been up for a while. Reboot it and run `cutover` again; see [the reboot](#moving-to-firedancer-reawakensh).
+
+**A `firedancer` command says `[arb.signer_key_path] is empty`** — it was run without `--config /home/sol/firedancer/config.toml`.
+
+**`firedancer wait` says "insufficient permissions"** — it needs `sudo`.
+
+**Firedancer downloads the full snapshot at start anyway** — no trusted peer still builds incrementals on the full snapshot that was on disk. It takes about an hour; nothing is wrong.
+
 **Build fails** — the Jito build needs `--github-ssh-key` and the key must be authorized on the `TheChimpions/jito-solana` fork.
 
 ---
@@ -541,8 +627,9 @@ To go live with your staked identity, follow the Jito hot-swap procedure. Do not
 
 - Vote account creation (do this yourself with `solana create-vote-account`)
 - Stake delegation
-- Identity hot-swap procedure
-- Monitoring / alerting (Prometheus, Grafana)
+- Identity hot-swap (documented under [Swapping to staked identity](#swapping-to-staked-identity), not automated)
+- Monitoring / alerting (Prometheus, Grafana). On a host that runs perch, the scripts tell it about restarts; they do not install it
+- DoubleZero: `reawaken.sh` carries the shred receiver over and sets the queue mode a GRE tunnel needs, but installing and connecting DoubleZero is yours
 - Backup of tower files and identity keys
 - Disaster recovery
 
@@ -551,15 +638,21 @@ To go live with your staked identity, follow the Jito hot-swap procedure. Do not
 ## Development
 
 ```
-arise.sh          provision a fresh server into a validator
-ascend.sh         upgrade / migrate / promote on a server that already exists
-lib/hexis.sh      shared Hexis defaults, logging, config rendering, checksum verification
-test/run.sh       test suite — no dependencies
+system.sh          report what a host runs and route a goal to the script that owns it
+arise.sh           provision a fresh server into a validator
+ascend.sh          upgrade / migrate / promote the Hexis Agave client on an existing server
+reawaken.sh        stage / cutover / rollback / upgrade / status for Firedancer
+lib/hexis.sh       shared Hexis defaults, logging, config rendering, checksum verification,
+                   release discovery, perch hand-off
+lib/firedancer.sh  validator.sh parsing, Firedancer config and unit rendering, snapshot
+                   hand-over and pre-download
+test/run.sh        test suite — no dependencies
 ```
 
-Both scripts source `lib/hexis.sh`, so they must be run from a checkout rather than
-copied somewhere on their own. Hexis config values (program id, profit pool, marginfi
-account and banks, token ledgers, lookup tables) live in that one file.
+The scripts source `lib/`, so they must be run from a checkout rather than copied
+somewhere on their own. Hexis config values (program id, profit pool, marginfi account
+and banks, token ledgers, lookup tables) live in `lib/hexis.sh`. Script names follow
+Solo Leveling; a new script gets a name whose meaning matches what it does.
 
 ```bash
 ./test/run.sh              # everything
@@ -569,8 +662,10 @@ account and banks, token ledgers, lookup tables) live in that one file.
 `ssh`, `scp` and `gh` are stubbed (`test/stubs/`) and host responses come from glob→output
 fixtures (`test/fixtures/`), so the suite runs offline and touches no server. It covers the
 `validator.sh` rewriter (including the shapes it must refuse rather than mangle), config
-rendering, checksum verification, the flash-loan matrix, release staging and promotion, and
-CLI validation. CI runs it alongside `shellcheck`.
+rendering, checksum verification, the flash-loan matrix, release staging and promotion,
+CLI validation, the Firedancer config and every `reawaken.sh` mode, `system.sh` routing,
+and the generated host-side steps (snapshot hand-over and pre-download, log rotation,
+perch) run against scratch directories. CI runs it alongside `shellcheck`.
 
 ## License
 
