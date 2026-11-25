@@ -488,8 +488,12 @@ installs the binary and `hexis-setup`, generates the keypairs, writes `arb-confi
 opens the Control port, and patches the existing `validator.sh` after showing you the
 diff. It refuses rather than guesses if the startup script isn't a shape it recognises.
 
-On a host that runs [perch](https://github.com/TheChimpions/perch-watchtower)
-(`/home/sol/perch/maint` exists), every restart these scripts make is declared to it first
+On a host that runs [perch](https://github.com/TheChimpions/perch-watchtower), every
+restart these scripts make is declared to it first. perch is found in either place it
+can live: system-wide as `arise.sh` installs it (`perch` on the PATH, config in
+`/etc/perch`), or in the validator user's home on an older host (`/home/sol/perch/maint`).
+A system-wide perch can only be told through root, so `ascend.sh --restart` asks for
+sudo on such a host. The declaration is made
 with `maint restart`, so the watchtower does not page: `ascend.sh --restart` with a 1h
 deadline, once the restart window is open; `reawaken.sh cutover`, `upgrade` and `rollback`
 with 2h, which covers a reboot for huge pages and a full snapshot download. If perch cannot
@@ -518,7 +522,20 @@ goal it only reports, and changes nothing:
 
 It shows the client and release the host runs, whether Firedancer is installed, staged
 or running, the newest Hexis Agave and Firedancer releases, and the command for each
-move that is possible from there. With a goal it runs that command through the script
+move that is possible from there.
+
+**Admin user.** The other scripts do their root work through an admin user, `monarch` by
+default. On a host where that login does not take your key (one set up before the admin
+user existed, say), `system.sh` tries the host's other login accounts with the same key
+and uses the first that gets in and holds sudo. It says which one it found, and every
+command it prints or runs carries `--admin-user <name>`. An `--admin-user` you pass is
+used as given.
+
+**Host checks.** The report also looks at a few things that are wrong whatever client
+runs, each with the command that fixes it: a `/` not owned by root, the validator user
+in the `docker` group or holding sudo, a firewall that is off, and keypair files other
+users can read. It reads them as the validator user and changes nothing.
+ With a goal it runs that command through the script
 that owns it, which still asks before it stops or starts a validator:
 
 | Goal | On a Jito / plain Agave host | On a Hexis Agave host | On a Firedancer host |

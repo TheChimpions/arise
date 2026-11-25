@@ -339,16 +339,39 @@ hexis_latest_tag() {
 PERCH_DEADLINE_AGAVE="1h"
 PERCH_DEADLINE_FIREDANCER="2h"
 
+# perch lives in one of two places. An older host has it in the validator user's
+# home: /home/<user>/perch, with a maint wrapper that user runs. A host set up by
+# the current arise.sh has it installed system-wide: the perch binary on PATH,
+# its config in /etc/perch (root:perch), so declaring work there takes root.
+PERCH_SYSTEM_CFG="/etc/perch/config.toml"
+
+# perch_kind_cmd <user> — shell text that prints home, system or nothing. Safe
+# to run as the validator user, who cannot read /etc/perch but can see it.
+perch_kind_cmd() {
+  printf 'if [ -x /home/%s/perch/maint ]; then echo home; elif command -v perch >/dev/null 2>&1 && [ -d /etc/perch ]; then echo system; fi' "$1"
+}
+
+# perch_cfg_line <user> — the first line of the config helpers below: the home
+# config when there is one, else the system-wide one.
+perch_cfg_line() {
+  printf 'perch_cfg="/home/%s/perch/config.toml"; [ -f "$perch_cfg" ] || perch_cfg="%s"\n' "$1" "$PERCH_SYSTEM_CFG"
+}
+
 # perch_maint_cmd <user> <deadline> [root] — shell text that declares the
 # restart to perch when the host has it, and says nothing when it does not.
 # Never fails the caller: a restart goes ahead even if perch cannot be told.
-# With "root" the text is for a root shell and drops to the user, who owns
-# perch's config.
+# With "root" the text is for a root shell: it drops to the user for a perch in
+# their home, and runs the system-wide one as root. Without it the text is for
+# the validator user and covers only the perch in their home; a system-wide
+# perch has to be declared through root.
 perch_maint_cmd() {
-  local maint="/home/$1/perch/maint" run=""
-  [[ "${3:-}" == "root" ]] && run="runuser -u $1 -- "
-  printf 'if [ -x %s ]; then %s%s restart %s || echo "perch: could not declare the restart — it may page"; fi' \
-    "$maint" "$run" "$maint" "$2"
+  local maint="/home/$1/perch/maint" warn='echo "perch: could not declare the restart — it may page"'
+  if [[ "${3:-}" == "root" ]]; then
+    printf 'if [ -x %s ]; then runuser -u %s -- %s restart %s || %s; elif command -v perch >/dev/null 2>&1 && [ -f %s ]; then perch --config %s maint restart %s || %s; fi' \
+      "$maint" "$1" "$maint" "$2" "$warn" "$PERCH_SYSTEM_CFG" "$PERCH_SYSTEM_CFG" "$2" "$warn"
+  else
+    printf 'if [ -x %s ]; then %s restart %s || %s; fi' "$maint" "$maint" "$2" "$warn"
+  fi
 }
 
 # perch_local_rpc_off_cmd <user> — root shell text for a host that has just
@@ -359,9 +382,7 @@ perch_maint_cmd() {
 # removed, the old config is kept beside it as config.toml.bak-pre-firedancer,
 # and perch is restarted. Left alone when no other endpoint would remain.
 perch_local_rpc_off_cmd() {
-  cat <<EOF
-perch_cfg="/home/$1/perch/config.toml"
-EOF
+  perch_cfg_line "$1"
   cat <<'EOF'
 if [ -f "$perch_cfg" ]; then
   awk 'BEGIN { RS = ""; ORS = "\n\n" }
@@ -386,10 +407,12 @@ EOF
 
 # perch_local_rpc_on_cmd <user> — the way back, for a host returning to Agave.
 perch_local_rpc_on_cmd() {
-  cat <<EOF
-perch_cfg="/home/$1/perch/config.toml"
-if [ -f "\$perch_cfg.bak-pre-firedancer" ]; then
-  mv -f "\$perch_cfg.bak-pre-firedancer" "\$perch_cfg"
+  perch_cfg_line "$1"
+  cat <<'EOF'
+if [ -f "$perch_cfg.bak-pre-firedancer" ]; then
+  # cat keeps the live file's owner and mode (root:perch 0640 when system-wide)
+  cat "$perch_cfg.bak-pre-firedancer" > "$perch_cfg"
+  rm -f "$perch_cfg.bak-pre-firedancer"
   systemctl try-restart perch 2>/dev/null || true
   echo "perch: config from before Firedancer put back"
 fi
@@ -402,11 +425,11 @@ MAINNET_GENESIS_HASH="5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 # perch_local_rpc_dead_cmd <user> — shell text that prints yes when perch has an
 # RPC endpoint on this machine that nothing listens on, no otherwise. Only the
 # [[endpoints]] blocks count: perch also reads node_exporter and its peers on
-# local addresses, and those are not the validator's RPC.
+# local addresses, and those are not the validator's RPC. Run as the validator
+# user it sees a perch in their home; a system-wide config is not readable to
+# them and reads as no.
 perch_local_rpc_dead_cmd() {
-  cat <<EOF
-perch_cfg="/home/$1/perch/config.toml"
-EOF
+  perch_cfg_line "$1"
   cat <<'EOF'
 if [ -f "$perch_cfg" ] && awk 'BEGIN { RS = "" }
     /\[\[endpoints\]\]/ && match($0, /:\/\/(127\.0\.0\.1|localhost):[0-9]+/) {

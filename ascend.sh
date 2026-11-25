@@ -279,6 +279,18 @@ $SKIP_SNAPSHOT_CHECK && EXIT_ARGS+=" --skip-new-snapshot-check"
 # The window comes first because perch's hold has a deadline and the wait for a
 # window can outlast it; the exit that follows finds the window already open.
 perch_before_exit() {
+  local kind
+  kind=$(ssh "${SSH_OPTS[@]}" "$SOL_HOST" "$(perch_kind_cmd "$SOL_USER")" </dev/null 2>/dev/null || true)
+  if [[ "$kind" == "system" ]]; then
+    # Installed system-wide: only root can declare the restart. Ask for sudo
+    # before the wait, which can be long, not after it.
+    if ! $DRY_RUN; then ask_sudo_pass || exit 1; fi
+    remote "$1 --ledger ${LEDGER_PATH} wait-for-restart-window ${EXIT_ARGS#exit }"
+    root_script <<SCRIPT
+$(perch_maint_cmd "$SOL_USER" "$PERCH_DEADLINE_AGAVE" root)
+SCRIPT
+    return 0
+  fi
   remote "if [ -x /home/${SOL_USER}/perch/maint ]; then $1 --ledger ${LEDGER_PATH} wait-for-restart-window ${EXIT_ARGS#exit } && $(perch_maint_cmd "$SOL_USER" "$PERCH_DEADLINE_AGAVE"); fi"
 }
 

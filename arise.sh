@@ -2827,14 +2827,14 @@ elif $LIVE_AGAVE; then
     log_info "Waiting for a restart window (min-idle-time ${MIN_IDLE_TIME}m, max-delinquent-stake ${MAX_DELINQUENT_STAKE}%) — this can take a while"
     remote "${EXIT_BIN} --ledger ${LEDGER_PATH} wait-for-restart-window ${EXIT_ARGS}" \
       || die "No restart window was found — nothing was restarted. Try again, or restart by hand."
-    if $PERCH_INSTALLED; then
-      # Tell the watchtower the restart is planned, so it does not page for it
-      root_script <<'SCRIPT'
+    # Tell the watchtower the restart is planned, so it does not page for it.
+    # Whichever perch the host runs: the one this script installs, or an older
+    # one in the validator user's home. Says nothing on a host without perch.
+    root_script <<SCRIPT
 if systemctl is-active --quiet perch 2>/dev/null; then
-  perch maint restart || echo "ARISE-WARN: could not declare the restart to perch — it may alert"
+  $(perch_maint_cmd "$SOL_USER" "$PERCH_DEADLINE_AGAVE" root)
 fi
 SCRIPT
-    fi
     log_info "Exiting the validator — systemd starts it again on the new setup"
     remote "$RESTART_CMD" || die "The validator did not exit cleanly — check it: ${SSH_CMD} $SOL_HOST 'tail -50 ${VALIDATOR_LOG}'"
     RESTARTED=false

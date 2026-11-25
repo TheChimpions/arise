@@ -739,6 +739,49 @@ group "XDP / PoH flag rename"
   it "perch's only endpoint is not taken away, and the script says so"
   assert_contains "$(SS_PORTS="" pc_run perch_local_rpc_off_cmd)" "its only endpoint is this host's own RPC"
   assert_contains "$(cat "$pc_dir/config.toml")" "127.0.0.1:8899"
+
+  # --- perch installed system-wide, as the current arise.sh does it ---
+  it "from root, the restart is declared to a perch in the user's home or a system-wide one"
+  assert_contains "$(perch_maint_cmd sol 2h root)" 'elif command -v perch >/dev/null 2>&1 && [ -f /etc/perch/config.toml ]; then perch --config /etc/perch/config.toml maint restart 2h'
+
+  printf '#!/bin/sh\necho "$@" >> "%s/perch.calls"\n' "$pc_dir" > "$pc_dir/bin/perch"; chmod +x "$pc_dir/bin/perch"
+  ( PERCH_SYSTEM_CFG="$pc_dir/system.toml"; touch "$PERCH_SYSTEM_CFG"; PATH="$pc_dir/bin:$PATH"; eval "$(perch_maint_cmd nobody-here 2h root)" )
+  it "a system-wide perch is told through its own command"
+  assert_eq "$(cat "$pc_dir/perch.calls" 2>/dev/null)" "--config $pc_dir/system.toml maint restart 2h"
+
+  rm -f "$pc_dir/perch.calls"
+  ( PERCH_SYSTEM_CFG="$pc_dir/none.toml"; PATH="$pc_dir/bin:$PATH"; eval "$(perch_maint_cmd nobody-here 2h root)" )
+  it "a host with no perch config is left alone"
+  assert_file_missing "$pc_dir/perch.calls"
+
+  it "the validator user's own text never reaches for the system-wide perch"
+  assert_not_contains "$(perch_maint_cmd sol 1h)" "/etc/perch"
+
+  it "the config helpers fall back to the system-wide config when the home has none"
+  # shellcheck disable=SC2154  # perch_cfg is set by the line being evaluated
+  assert_eq "$(PERCH_SYSTEM_CFG="$pc_dir/system.toml"; eval "$(perch_cfg_line nobody-here)"; echo "$perch_cfg")" "$pc_dir/system.toml"
+
+  # the whole way there and back on a system-wide config: sc_run leaves line 1 alone
+  sc_run() { ( PERCH_SYSTEM_CFG="$pc_dir/config.toml"; PATH="$pc_dir/bin:$PATH"; eval "$("$1" nobody-here)" ); }
+  pc_write; chmod 640 "$pc_dir/config.toml"; rm -f "$pc_dir/config.toml.bak-pre-firedancer"
+  SS_PORTS="" sc_run perch_local_rpc_off_cmd >/dev/null
+  it "a system-wide perch loses the dead local endpoint too"
+  assert_not_contains "$(cat "$pc_dir/config.toml")" "127.0.0.1:8899"
+  assert_contains "$(cat "$pc_dir/config.toml.bak-pre-firedancer")" "127.0.0.1:8899"
+
+  sc_run perch_local_rpc_on_cmd >/dev/null
+  it "and gets it back on a rollback, with the file's mode unchanged"
+  assert_contains "$(cat "$pc_dir/config.toml")" "127.0.0.1:8899"
+  assert_eq "$(stat -f '%Lp' "$pc_dir/config.toml" 2>/dev/null || stat -c '%a' "$pc_dir/config.toml")" "640"
+  assert_file_missing "$pc_dir/config.toml.bak-pre-firedancer"
+
+  { printf '%s\n' '*command -v perch*|system'; cat "$WORK/xdp-new.responses"; } > "$WORK/perch-system.responses"
+  out="$(STUB_RESPONSES=$WORK/perch-system.responses ascend promote --host 1.2.3.4 --ssh-key "$WORK/key" \
+        --release 'v4.2.2+concorde.1' --yes --restart --dry-run)"
+  it "ascend declares a restart to a system-wide perch through root, after the window"
+  assert_order "$out" "wait-for-restart-window --min-idle-time 20" "perch --config /etc/perch/config.toml maint restart 1h"
+  assert_contains "$out" "[DRY RUN] root script via monarch@1.2.3.4"
+
   rm -rf "$pc_dir"
 
   it "perch not hearing about it never stops a restart"
@@ -1751,6 +1794,80 @@ else
   it "a cutover that Firedancer finished by itself after a reboot is still offered, to retire jag-snap"
   assert_contains "$(STUB_RESPONSES=$WORK/st-fd-jag.responses system firedancer "${st[@]}" --print)" "Would run: ./reawaken.sh cutover --host 1.2.3.4 --ssh-key $WORK/key"
 
+  # --- who holds sudo, and the host checks ---
+  HX="agave_active=active\nfd_active=inactive\nfd_enabled=disabled\nfd_config=no\njag_snap=down\nperch_local=no\nagave_release=v5.0.0+concorde.1"
+  # adm_host <file> <extra facts> <responses that go first, \n separated>
+  adm_host() {
+    st_host "$WORK/adm.base" "$HX${2:+\\n}$2" "$S_JITO$S_HEXIS"
+    { [[ -n "$3" ]] && printf '%b\n' "$3"; cat "$WORK/adm.base"; } > "$1"
+  }
+  NO_MONARCH='*monarch@1.2.3.4 true|@fail'
+
+  adm_host "$WORK/adm-ok.responses" "" ""
+  out="$(STUB_RESPONSES=$WORK/adm-ok.responses system "${st[@]}")"
+  it "a host whose default admin user takes the key is left as it is"
+  assert_not_contains "$out" "Admin user:"
+  assert_not_contains "$out" "--admin-user"
+
+  adm_host "$WORK/adm-ubuntu.responses" "" "$NO_MONARCH\n*admin-candidates*|ubuntu\\\\nops\n*ubuntu@1.2.3.4*admin-sudo*|nopass"
+  out="$(STUB_RESPONSES=$WORK/adm-ubuntu.responses system "${st[@]}")"
+  it "a host without the default admin user gets the one that does hold sudo"
+  assert_contains "$out" "Admin user:      ubuntu, with passwordless sudo — there is no 'monarch' login for this key"
+
+  it "and every command printed for it carries that user"
+  assert_contains "$out" "./reawaken.sh stage --host 1.2.3.4 --ssh-key $WORK/key --admin-user ubuntu"
+  assert_contains "$out" "./arise.sh --host 1.2.3.4 --ssh-key $WORK/key --admin-user ubuntu"
+
+  it "the goal that is run carries it too"
+  assert_contains "$(STUB_RESPONSES=$WORK/adm-ubuntu.responses system firedancer "${st[@]}" --print)" "--admin-user ubuntu"
+
+  adm_host "$WORK/adm-second.responses" "" "$NO_MONARCH\n*admin-candidates*|deploy\\\\nops\n*deploy@1.2.3.4*admin-sudo*|\n*ops@1.2.3.4*admin-sudo*|pass"
+  out="$(STUB_RESPONSES=$WORK/adm-second.responses system "${st[@]}")"
+  it "a login that holds no sudo is passed over for one that does"
+  assert_contains "$out" "Admin user:      ops, with sudo by password"
+
+  adm_host "$WORK/adm-none.responses" "" "$NO_MONARCH\n*admin-candidates*|deploy\n*deploy@1.2.3.4*admin-sudo*|"
+  out="$(STUB_RESPONSES=$WORK/adm-none.responses system "${st[@]}")"
+  it "a host with no admin login at all is said to have none"
+  assert_contains "$out" "Admin user:      none found"
+  assert_contains "$out" "--root-user"
+
+  adm_host "$WORK/adm-given.responses" "" "$NO_MONARCH\n*admin-candidates*|ubuntu\n*ubuntu@1.2.3.4*admin-sudo*|nopass"
+  out="$(STUB_RESPONSES=$WORK/adm-given.responses system "${st[@]}" --admin-user ops)"
+  it "an --admin-user that was given is not second-guessed"
+  assert_contains "$out" "--admin-user ops"
+  assert_not_contains "$out" "ubuntu"
+
+  adm_host "$WORK/chk-clean.responses" "chk_root_owner=root\nchk_groups=sol users\nchk_sudo=no\nchk_ufw=active\nchk_keys=" ""
+  it "a clean host is said to be clean, with what was looked at"
+  assert_contains "$(STUB_RESPONSES=$WORK/chk-clean.responses system "${st[@]}")" "Host checks:     nothing found (owner of /, sol's privileges, firewall, key file modes)"
+
+  adm_host "$WORK/chk-bad.responses" "chk_root_owner=sol\nchk_groups=sol users docker\nchk_sudo=nopass\nchk_ufw=inactive\nchk_keys=/home/sol/staked_identity.json " ""
+  out="$(STUB_RESPONSES=$WORK/chk-bad.responses system "${st[@]}")"
+  it "a root directory that is not root's is reported with its fix"
+  assert_contains "$out" "/ is owned by sol, not root"
+  assert_contains "$out" "monarch@1.2.3.4 'sudo chown root:root /'"
+
+  it "the validator user being in the docker group is reported"
+  assert_contains "$out" "sol is in the docker group, which is root in all but name"
+
+  it "the validator user holding sudo is reported"
+  assert_contains "$out" "sol, the user the validator runs as, holds sudo"
+
+  it "a firewall that is off is reported"
+  assert_contains "$out" "the firewall (ufw) is not enabled"
+
+  it "a key file others can read is reported with its fix"
+  assert_contains "$out" "readable by other users: /home/sol/staked_identity.json"
+  assert_contains "$out" "'chmod 600 /home/sol/staked_identity.json'"
+
+  it "the report still lists what can be done from here"
+  assert_contains "$out" "From here:"
+
+  adm_host "$WORK/chk-unknown.responses" "" ""
+  it "a host the checks could not read is not called clean"
+  assert_not_contains "$(STUB_RESPONSES=$WORK/chk-unknown.responses system "${st[@]}")" "Host checks:"
+
   it "says there is nothing to upgrade on the newest release"
   assert_contains "$out" "upgrade     nothing to do: already on v5.0.0+concorde.1"
 
@@ -1901,6 +2018,10 @@ group "client switch (arise.sh on a live host)"
   it "the window comes before the exit, and both after validator.sh is written"
   order="$(grep -n -e 'validator.sh.arise-tmp' -e 'wait-for-restart-window' -e ' exit --min-idle-time' "$WORK/j2a-r.ssh" | sed -e 's/^[0-9]*://' -e 's/.*validator\.sh.*/vsh/' -e 's/.*wait-for.*/window/' -e 's/.* exit .*/exit/' | tr '\n' ' ')"
   assert_eq "$order" "vsh window exit "
+
+  it "--restart tells perch, wherever it is installed, between the window and the exit"
+  assert_contains "$(cat "$WORK/j2a-r.scripts")" "runuser -u sol -- /home/sol/perch/maint restart 1h"
+  assert_contains "$(cat "$WORK/j2a-r.scripts")" "perch --config /etc/perch/config.toml maint restart 1h"
 
   it "--restart reports the validator back up"
   assert_contains "$out" "sol.service is active again, now running: /home/sol/new/agave-validator"
