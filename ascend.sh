@@ -247,6 +247,14 @@ SSH_CMD="ssh -o IdentitiesOnly=yes -i ${SSH_KEY}"
 EXIT_ARGS="exit --min-idle-time ${MIN_IDLE_TIME} --max-delinquent-stake ${MAX_DELINQUENT_STAKE}"
 $SKIP_SNAPSHOT_CHECK && EXIT_ARGS+=" --skip-new-snapshot-check"
 
+# perch_before_exit <binary> — on a host that runs perch, wait for the restart
+# window and then declare the restart, so the watchtower does not page for it.
+# The window comes first because perch's hold has a deadline and the wait for a
+# window can outlast it; the exit that follows finds the window already open.
+perch_before_exit() {
+  remote "if [ -x /home/${SOL_USER}/perch/maint ]; then $1 --ledger ${LEDGER_PATH} wait-for-restart-window ${EXIT_ARGS#exit } && $(perch_maint_cmd "$SOL_USER" "$PERCH_DEADLINE_AGAVE"); fi"
+}
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -508,6 +516,7 @@ SCRIPT
 
   if $RESTART; then
     log_info "Exiting the validator gracefully — systemd restarts it on ${PROMOTE_RELEASE}"
+    perch_before_exit "$PROMOTE_RESTART_BIN"
     remote "${PROMOTE_RESTART_BIN} --ledger ${LEDGER_PATH} ${EXIT_ARGS}"
   else
     log_info "Takes effect on the next restart:"
@@ -935,6 +944,7 @@ if $RESTART; then
   log_info "Exiting the validator gracefully — systemd restarts it on the new binary"
   log_info "This blocks until a safe restart window (min-idle-time ${MIN_IDLE_TIME}m, max-delinquent-stake ${MAX_DELINQUENT_STAKE}%)"
   log_info "Issuing exit via ${RESTART_BIN}"
+  perch_before_exit "$RESTART_BIN"
   remote "${RESTART_BIN} --ledger ${LEDGER_PATH} ${EXIT_ARGS}"
   log_info "Validator exited — systemd should be bringing it back up"
 fi

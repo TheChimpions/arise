@@ -4,6 +4,10 @@
 [[ -n "${STUB_LOG:-}" ]] && printf 'gh %s\n' "$*" >> "$STUB_LOG"
 case "$1" in
   auth) exit 0 ;;
+  api)
+    # The release listing, as "<tag>|<assets>" lines the way the --jq filter gives them
+    if [[ "$*" == *"/releases"* && -n "${STUB_RELEASES:-}" ]]; then printf '%b\n' "$STUB_RELEASES"; fi
+    exit 0 ;;
   release)
     dir=""; patterns=()
     while [[ $# -gt 0 ]]; do

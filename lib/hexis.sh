@@ -251,3 +251,92 @@ hexis_warn_flash_loans() {
     log_warn "  with the keypair Hexis issued, or --no-hexis-flash-loans to run without them."
   fi
 }
+
+# ---------------------------------------------------------------------------
+# Releases
+# ---------------------------------------------------------------------------
+
+# One line per published release, newest first: "<tag>|<asset>,<asset>,..."
+hexis_release_lines() {
+  gh api "repos/${HEXIS_REPO}/releases?per_page=40" \
+    --jq '.[] | select(.draft | not) | .tag_name + "|" + ([.assets[].name] | join(","))'
+}
+
+# hexis_latest_tag <release lines> <asset name> — newest release that ships it.
+# The Agave client and Firedancer are released from the same repository, so the
+# asset is what tells them apart.
+hexis_latest_tag() {
+  local line
+  while IFS= read -r line; do
+    if [[ ",${line#*|}," == *",$2,"* ]]; then
+      echo "${line%%|*}"
+      return 0
+    fi
+  done <<<"$1"
+  return 1
+}
+
+# perch (github.com/TheChimpions/perch-watchtower) pages when a validator stops
+# voting. Its maint command declares planned work so a restart does not page:
+# "restart <deadline>" holds until the validator is back or the deadline passes.
+# A Firedancer start can need a reboot for its huge pages and, at worst, an
+# hour of snapshot download, so it gets the longer deadline.
+PERCH_DEADLINE_AGAVE="1h"
+PERCH_DEADLINE_FIREDANCER="2h"
+
+# perch_maint_cmd <user> <deadline> [root] — shell text that declares the
+# restart to perch when the host has it, and says nothing when it does not.
+# Never fails the caller: a restart goes ahead even if perch cannot be told.
+# With "root" the text is for a root shell and drops to the user, who owns
+# perch's config.
+perch_maint_cmd() {
+  local maint="/home/$1/perch/maint" run=""
+  [[ "${3:-}" == "root" ]] && run="runuser -u $1 -- "
+  printf 'if [ -x %s ]; then %s%s restart %s || echo "perch: could not declare the restart — it may page"; fi' \
+    "$maint" "$run" "$maint" "$2"
+}
+
+# perch_local_rpc_off_cmd <user> — root shell text for a host that has just
+# moved to Firedancer. perch usually watches the validator's own RPC port as one
+# of its endpoints; Firedancer runs without RPC, so that endpoint is dead from
+# then on and keeps perch from seeing the validator recover. Every [[endpoints]]
+# block that points at this machine and has nothing listening on its port is
+# removed, the old config is kept beside it as config.toml.bak-pre-firedancer,
+# and perch is restarted. Left alone when no other endpoint would remain.
+perch_local_rpc_off_cmd() {
+  cat <<EOF
+perch_cfg="/home/$1/perch/config.toml"
+EOF
+  cat <<'EOF'
+if [ -f "$perch_cfg" ]; then
+  awk 'BEGIN { RS = ""; ORS = "\n\n" }
+    /\[\[endpoints\]\]/ && match($0, /:\/\/(127\.0\.0\.1|localhost):[0-9]+/) {
+      port = substr($0, RSTART, RLENGTH); sub(/.*:/, "", port)
+      if (system("ss -lnt 2>/dev/null | grep -q \":" port " \"") != 0) { dropped++; next }
+    }
+    { print }
+    END { exit dropped ? 0 : 3 }' "$perch_cfg" > "$perch_cfg.new" && perch_drop=yes || perch_drop=no
+  if [ "$perch_drop" = yes ] && grep -q '\[\[endpoints\]\]' "$perch_cfg.new"; then
+    cp -a "$perch_cfg" "$perch_cfg.bak-pre-firedancer"
+    cat "$perch_cfg.new" > "$perch_cfg"
+    systemctl try-restart perch 2>/dev/null || true
+    echo "perch: removed the endpoint for this host's own RPC, which Firedancer does not serve (old config: $perch_cfg.bak-pre-firedancer)"
+  elif [ "$perch_drop" = yes ]; then
+    echo "perch: its only endpoint is this host's own RPC, which Firedancer does not serve — give it another in $perch_cfg"
+  fi
+  rm -f "$perch_cfg.new"
+fi
+EOF
+}
+
+# perch_local_rpc_on_cmd <user> — the way back, for a host returning to Agave.
+perch_local_rpc_on_cmd() {
+  cat <<EOF
+perch_cfg="/home/$1/perch/config.toml"
+if [ -f "\$perch_cfg.bak-pre-firedancer" ]; then
+  mv -f "\$perch_cfg.bak-pre-firedancer" "\$perch_cfg"
+  systemctl try-restart perch 2>/dev/null || true
+  echo "perch: config from before Firedancer put back"
+fi
+EOF
+}

@@ -342,6 +342,17 @@ installs the binary and `hexis-setup`, generates the keypairs, writes `arb-confi
 opens the Control port, and patches the existing `validator.sh` after showing you the
 diff. It refuses rather than guesses if the startup script isn't a shape it recognises.
 
+On a host that runs [perch](https://github.com/TheChimpions/perch-watchtower)
+(`/home/sol/perch/maint` exists), every restart these scripts make is declared to it first
+with `maint restart`, so the watchtower does not page: `ascend.sh --restart` with a 1h
+deadline, once the restart window is open; `reawaken.sh cutover`, `upgrade` and `rollback`
+with 2h, which covers a reboot for huge pages and a full snapshot download. If perch cannot
+be told, the restart goes ahead and the script says it may page.
+
+A cutover to Firedancer also takes this host's own RPC out of perch's `[[endpoints]]`
+(Firedancer runs without RPC, so perch would never see the validator recover), keeps the
+old file as `config.toml.bak-pre-firedancer`, and restarts perch. `rollback` puts it back.
+
 Neither enables the arb, and neither restarts the validator unless you pass `--restart`
 — which runs `exit` (wait for the restart window, then stop; systemd brings it back), and
 accepts `--min-idle-time` (default `20`), `--max-delinquent-stake` (default `5`) and
@@ -349,6 +360,122 @@ accepts `--min-idle-time` (default `20`), `--max-delinquent-stake` (default `5`)
 `exit` is issued by the binary the running process is actually executing, so it never
 crosses a version boundary.
 Full detail and the by-hand equivalent: [HEXIS-UPGRADE.md](HEXIS-UPGRADE.md).
+
+### Which script for which host (`system.sh`)
+
+`system.sh` looks at a host and says which of the other scripts applies to it. Without a
+goal it only reports, and changes nothing:
+
+```bash
+./system.sh --host <ip> --ssh-key ~/.ssh/<key>
+```
+
+It shows the client and release the host runs, whether Firedancer is installed, staged
+or running, the newest Hexis Agave and Firedancer releases, and the command for each
+move that is possible from there. With a goal it runs that command through the script
+that owns it, which still asks before it stops or starts a validator:
+
+| Goal | On a Jito / plain Agave host | On a Hexis Agave host | On a Firedancer host |
+|---|---|---|---|
+| `upgrade` | not available | `ascend.sh upgrade --restart` | `reawaken.sh upgrade` |
+| `hexis` | `ascend.sh migrate --restart` | already there | use `agave` |
+| `firedancer` | `reawaken.sh stage`, then `cutover` on the next call | same | already there |
+| `agave` | already there | already there | `reawaken.sh rollback` |
+
+```bash
+./system.sh upgrade    --host <ip> --ssh-key ~/.ssh/<key>
+./system.sh firedancer --host <ip> --ssh-key ~/.ssh/<key> --print        # show, do not run
+./system.sh upgrade    --host <ip> --ssh-key ~/.ssh/<key> -- --dry-run   # passed through
+```
+
+`--tag` picks a release other than the newest. A server with no validator is pointed at
+`arise.sh`, which needs your keys and is never run from here.
+
+### Moving to Firedancer (`reawaken.sh`)
+
+`reawaken.sh` moves a validator that is already running — Hexis Agave, Jito or plain
+Agave — onto Firedancer with the Hexis Concorde. It reads the existing `validator.sh`
+(and `arb-config.toml` on a Hexis host) for the identity, vote account, entrypoints,
+known validators, Block Engine settings, shred receivers, arb signer and token ledgers,
+so on a Hexis or Jito host there is normally nothing to pass but the release.
+
+```bash
+# 1. Stage. Touches nothing that is running; repeat it to change the config or upgrade.
+./reawaken.sh stage --host <ip> --ssh-key ~/.ssh/<key> --fd-tag 'v26.10.8+concorde.4'
+
+# 2. Cut over at a safe window: stops Agave, starts Firedancer. Asks first.
+./reawaken.sh cutover --host <ip> --ssh-key ~/.ssh/<key>
+
+# Back to Agave, and a read-only report
+./reawaken.sh rollback --host <ip> --ssh-key ~/.ssh/<key>
+./reawaken.sh status   --host <ip> --ssh-key ~/.ssh/<key>
+
+# Later, on a host already running Firedancer: a newer release, or the one before
+./reawaken.sh upgrade --host <ip> --ssh-key ~/.ssh/<key> --fd-tag '<newer tag>'
+./reawaken.sh upgrade --host <ip> --ssh-key ~/.ssh/<key> --previous
+```
+
+`upgrade` stages the release exactly as `stage` does (binary, config refreshed against
+that release's Concorde tables, shown as a diff), checks the config with the new binary,
+waits for a window with no leader slot and restarts Firedancer. Every restart downloads
+a snapshot, so the validator is not voting until that has loaded. `--previous` points
+back at the release that was active before and restarts; it refuses when that older
+binary does not accept the current config.
+
+`--dry-run` on any mode prints the plan, the full `config.toml` and the unit without
+changing the host or asking for sudo.
+
+What `stage` does:
+
+- picks the build for the host's CPU (`-zen5`, `-zen4`, or the generic AVX2 one),
+  downloads it with `gh`, verifies the checksum, and installs it under
+  `/home/sol/firedancer/releases/<tag>/` behind a `firedancer` symlink;
+- installs the arb signer root-owned (Firedancer reads it as root at boot);
+- writes `config.toml`: the migrated settings plus the Concorde's own tables, fetched
+  from the Hexis docs so they match the release, and **checks it with `firedancer mem`
+  against the real binary before putting it in place** — Firedancer refuses to boot on
+  a key it does not know;
+- raises `fs.nr_open` to the unit's open-file limit and installs log rotation for the
+  Firedancer log;
+- installs `firedancer.service`, not enabled, with `Conflicts=sol.service` so the two
+  clients can never run the same identity at once;
+- opens Control (18082) to the two Hexis addresses, metrics (7999) to one, and
+  Firedancer's p2p UDP ports.
+
+A plain Agave host has no Block Engine or arb signer to carry over: pass
+`--block-engine-url` and `--commission-bps` (or `--no-block-engine`), and
+`--hexis-signer`. A Jito host needs only `--hexis-signer`.
+
+Things that change on Firedancer:
+
+- **The arb starts enabled.** There is no `arb-enable.sh` step; Hexis controls it over
+  the Control port.
+- **No snapshots, no jag-snap.** Firedancer loads a snapshot on every start, makes
+  none (`[layout] enable_snapshot_production` is off and marked unsupported in this
+  release), and does not advertise an RPC address in gossip, so the host cannot be a
+  snapshot source. Left alone, every start downloads the full snapshot from
+  the trusted peers (about an hour for 117 GB at 33 MB/s), so `cutover` and `upgrade` put
+  a current one on disk first, while the validator still runs:
+  - `cutover` links Agave's newest full snapshot and incremental into Firedancer's
+    snapshot directory.
+  - `cutover` and `upgrade` fetch the current full snapshot from an HTTP mirror
+    (`--snapshot-mirror`, default `https://snapshots.avorio.network/mainnet-beta`) in
+    eight parallel ranges, when it is newer than what is on disk. The mirror is a third
+    party: its file is taken only when a validator on the snapshot allow list serves a
+    full snapshot with the same slot and hash. That check is on the name, not the bytes.
+    `--no-snapshot-prefetch` turns it off.
+
+  Firedancer starts from the local file when a trusted peer still serves incrementals
+  built on that full slot; if anything above fails, it downloads as before. `cutover` stops the jag-snap container and closes 18899/tcp; `rollback` starts
+  it and reopens the port. Stake that depends on serving snapshots (JagPool) does not
+  carry over to a Firedancer host.
+- **RPC is off** in the Concorde build (its core goes to the arb tiles), so
+  `solana catchup --our-localhost` stops working on that host. `--enable-rpc` turns it
+  back on.
+- **Memory.** About 190 GiB is locked as huge pages while Firedancer runs. `rollback`
+  releases it before starting Agave.
+- **Cluster metrics.** `SOLANA_METRICS_CONFIG` is replaced by Firedancer's telemetry,
+  which the generated config keeps on.
 
 ### Flash loans
 

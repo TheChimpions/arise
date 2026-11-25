@@ -1,0 +1,14 @@
+# Cut-down stand-in for the Hexis config.toml.example
+[arb]
+    enabled = true
+    signer_key_path = "/path/to/arb-signer.json"
+    max_candidates = 32
+    jupiter_token_ledger = ""
+    okx_token_ledger = ""
+
+    [arb.control]
+        listen_address = "0.0.0.0"
+        port = 18082
+
+[arb.concorde]
+    pool_max = 1048576

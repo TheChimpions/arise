@@ -16,7 +16,10 @@ jobs:
         run: |
           bash -n arise.sh
           bash -n ascend.sh
+          bash -n reawaken.sh
+          bash -n system.sh
           bash -n lib/hexis.sh
+          bash -n lib/firedancer.sh
           bash -n test/run.sh
 
       - name: ShellCheck
