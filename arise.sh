@@ -93,6 +93,14 @@ AGAVE_DEFAULT_REPO="https://github.com/anza-xyz/agave.git"
 BUILD_FORCED=false           # --build-client: build from source even with --hexis
 FD_TAG=""                    # Firedancer release tag (private repo, fetched locally with gh)
 FD_BINARY=""                 # pre-downloaded Firedancer binary (instead of --fd-tag)
+FD_CONCORDE_TABLES=""        # local copy of the Concorde config tables (instead of fetching them)
+# Run against a host that already has a validator, a different --client is a
+# client switch. --restart finishes it: wait for a restart window, then move
+# the running validator onto what was just installed.
+RESTART=false
+MIN_IDLE_TIME="20"
+MAX_DELINQUENT_STAKE="5"
+WINDOW_ARGS=()               # the two above, only when given — passed on to reawaken.sh
 
 # Cluster metrics (SFDP). Empty disables the export; default is per-network.
 METRICS_CONFIG="${SOLANA_METRICS_CONFIG:-}"
@@ -182,6 +190,8 @@ Validator client:
   --fd-tag <tag>                Firedancer release to stage, fetched with the local
                                 gh CLI from the private ${HEXIS_REPO}
   --fd-binary <path>            Pre-downloaded Firedancer binary (instead of --fd-tag)
+  --concorde-tables <path>      Local copy of the Concorde config tables, instead of
+                                fetching them with gh (passed on to reawaken.sh)
   --client-version <tag>        Release tag to build (e.g. v4.4.1-jito, v4.4.1).
                                 If omitted, recent tags are listed to choose from.
                                 A different tag on a later run is built and
@@ -192,6 +202,21 @@ Validator client:
                                 default: the Hexis release ships the validator
                                 binary, so the source build is skipped and the
                                 prebuilt Solana CLI is installed instead
+
+Changing client or version on a host that already runs a validator:
+  Run this script again with the same flags and the new --client (and
+  --client-version, --hexis, --fd-tag ...). The new client is installed next to
+  the running one and validator.sh is rewritten for it. Nothing is restarted
+  unless you ask:
+  --restart                     Once everything is in place, wait for a restart
+                                window and move the running validator onto the
+                                new client. From or to Firedancer this hands over
+                                to reawaken.sh (rollback / cutover), which asks
+                                before it stops anything
+  --min-idle-time <min>         Minutes without a leader slot the restart waits
+                                for (default: ${MIN_IDLE_TIME})
+  --max-delinquent-stake <pct>  Do not restart while more than this much stake
+                                is delinquent (default: ${MAX_DELINQUENT_STAKE})
 
 Optional:
   --network <testnet|mainnet>   Network to join (default: testnet)
@@ -306,9 +331,13 @@ while [[ $# -gt 0 ]]; do
     --client)         need_arg "$@"; CLIENT="$2";         shift 2 ;;
     --fd-tag)         need_arg "$@"; FD_TAG="$2";         shift 2 ;;
     --fd-binary)      need_arg "$@"; FD_BINARY="$2";      shift 2 ;;
+    --concorde-tables) need_arg "$@"; FD_CONCORDE_TABLES="$2"; shift 2 ;;
     --client-version|--jito-version) need_arg "$@"; CLIENT_VERSION="$2"; shift 2 ;;
     --client-repo|--jito-repo)       need_arg "$@"; CLIENT_REPO="$2";    shift 2 ;;
     --build-client|--build-jito)     BUILD_FORCED=true; shift ;;
+    --restart)        RESTART=true;                 shift ;;
+    --min-idle-time)  need_arg "$@"; MIN_IDLE_TIME="$2"; WINDOW_ARGS+=(--min-idle-time "$2"); shift 2 ;;
+    --max-delinquent-stake) need_arg "$@"; MAX_DELINQUENT_STAKE="$2"; WINDOW_ARGS+=(--max-delinquent-stake "$2"); shift 2 ;;
     --github-ssh-key) need_arg "$@"; log_warn "--github-ssh-key is no longer used and was ignored: clients are built from public repos over HTTPS"; shift 2 ;;
     --metrics-config) need_arg "$@"; METRICS_CONFIG="$2"; METRICS_CONFIG_SET=true; shift 2 ;;
     --enable-xdp)     ENABLE_XDP=true;              shift ;;
@@ -421,6 +450,7 @@ if [[ "$CLIENT" == "firedancer" ]]; then
     [[ "$FD_TAG" =~ $RE_REF ]] || die "--fd-tag is not a valid tag: $FD_TAG"
   fi
   [[ -n "$FD_BINARY" && ! -f "$FD_BINARY" ]] && die "File not found: $FD_BINARY"
+  [[ -n "$FD_CONCORDE_TABLES" && ! -f "$FD_CONCORDE_TABLES" ]] && die "File not found: $FD_CONCORDE_TABLES"
   [[ -n "$HEXIS_SIGNER" && ! -f "$HEXIS_SIGNER" ]] && die "File not found: $HEXIS_SIGNER"
   if $ENABLE_HEXIS; then
     log_info "--client firedancer is the Hexis Concorde build, so the arb client comes with it — --hexis adds nothing here"
@@ -430,8 +460,8 @@ if [[ "$CLIENT" == "firedancer" ]]; then
     # The Agave XDP flags and capabilities do not apply; Firedancer drives the NIC itself
     ENABLE_XDP=false
   fi
-elif [[ -n "$FD_TAG" || -n "$FD_BINARY" ]]; then
-  die "--fd-tag and --fd-binary only go with --client firedancer"
+elif [[ -n "$FD_TAG" || -n "$FD_BINARY" || -n "$FD_CONCORDE_TABLES" ]]; then
+  die "--fd-tag, --fd-binary and --concorde-tables only go with --client firedancer"
 fi
 
 if [[ -n "$ROOT_USER" ]]; then
@@ -446,6 +476,8 @@ fi
 if [[ -n "$JITO_REGION" ]]; then
   [[ "$JITO_REGION" =~ $RE_REGION ]]  || die "--jito-region is not a valid region name: $JITO_REGION"
 fi
+[[ "$MIN_IDLE_TIME" =~ ^[0-9]{1,4}$ ]]        || die "--min-idle-time must be a number of minutes: $MIN_IDLE_TIME"
+[[ "$MAX_DELINQUENT_STAKE" =~ ^[0-9]{1,3}$ ]] || die "--max-delinquent-stake must be a percentage: $MAX_DELINQUENT_STAKE"
 if [[ -n "$LEDGER_DISK" ]]; then
   [[ "$LEDGER_DISK" =~ $RE_DEVICE ]]  || die "--ledger-disk must be a /dev path: $LEDGER_DISK"
 fi
@@ -737,6 +769,82 @@ if ! $DRY_RUN; then
   can_ssh "$SOL_HOST" || die "Cannot SSH as ${SOL_HOST} — check authorized_keys"
   log_info "Verified SSH access as ${SOL_USER}"
 fi
+
+# ---------------------------------------------------------------------------
+# What does this host run today?
+#
+# On a new server the answer is "nothing" and the rest of this script is a plain
+# install. On a host with a live validator this run is an upgrade or a client
+# switch, and three things change: the unit of a validator that is running is
+# not swapped out from under it, sol.service is not enabled next to a
+# Firedancer that owns the identity, and --restart knows what it has to stop.
+# ---------------------------------------------------------------------------
+LIVE_AGAVE=false      # sol.service is running
+LIVE_FD=false         # firedancer.service is running
+FD_OWNS_HOST=false    # firedancer.service is running or enabled
+HOST_CLIENT="none"    # hexis | jito | agave | none — the running process, else validator.sh
+HOST_LABEL="nothing"
+LIVE_EXE=""           # binary the running sol.service executes
+if ! $DRY_RUN; then
+  HOST_STATE=$(sol_script <<'SCRIPT'
+echo "STATE|agave_active|$(systemctl is-active sol 2>/dev/null || true)"
+echo "STATE|fd_active|$(systemctl is-active firedancer 2>/dev/null || true)"
+echo "STATE|fd_enabled|$(systemctl is-enabled firedancer 2>/dev/null || true)"
+PID=$(systemctl show -p MainPID --value sol 2>/dev/null || true)
+EXE=""
+FLAGS=""
+if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+  EXE=$(readlink "/proc/$PID/exe" 2>/dev/null || true)
+  FLAGS=$(tr '\0' ' ' < "/proc/$PID/cmdline" 2>/dev/null || true)
+fi
+# The client is read off the flags of the process that is running. validator.sh
+# only says what the next start will be, and an earlier run of this script may
+# already have rewritten it.
+if [ -z "$FLAGS" ] && [ -f "$HOME/validator.sh" ]; then FLAGS=$(cat "$HOME/validator.sh"); fi
+if [ -z "$FLAGS" ]; then echo "STATE|client|none"
+elif grep -q -- '--arb-config' <<< "$FLAGS"; then echo "STATE|client|hexis"
+elif grep -q -e '--block-engine-url' -e '--tip-payment-program-pubkey' <<< "$FLAGS"; then echo "STATE|client|jito"
+else echo "STATE|client|agave"; fi
+echo "STATE|exe|$EXE"
+SCRIPT
+  )
+  host_state() { grep "^STATE|$1|" <<< "$HOST_STATE" | head -1 | cut -d'|' -f3; }
+  [[ "$(host_state agave_active)" == "active" ]] && LIVE_AGAVE=true
+  [[ "$(host_state fd_active)" == "active" ]] && LIVE_FD=true
+  if $LIVE_FD || [[ "$(host_state fd_enabled)" == "enabled" ]]; then FD_OWNS_HOST=true; fi
+  HOST_CLIENT=$(host_state client)
+  [[ "$HOST_CLIENT" =~ ^(hexis|jito|agave|none)$ ]] || die "Could not read what ${SOL_HOST} runs today"
+  LIVE_EXE=$(host_state exe)
+  # A binary that was replaced on disk reads back as "<path> (deleted)"
+  [[ "$LIVE_EXE" =~ ^/[A-Za-z0-9._/+-]+$ ]] || LIVE_EXE=""
+
+  case "$HOST_CLIENT" in
+    hexis) HOST_LABEL="Jito with the Hexis arb client" ;;
+    jito)  HOST_LABEL="Jito" ;;
+    agave) HOST_LABEL="Agave" ;;
+    *)     HOST_LABEL="nothing" ;;
+  esac
+  if $FD_OWNS_HOST; then
+    log_info "This host runs Firedancer today (firedancer.service $(host_state fd_active)/$(host_state fd_enabled))"
+  elif $LIVE_AGAVE; then
+    log_info "This host runs ${HOST_LABEL} today (sol.service is active) — it keeps running until it is restarted"
+  elif [[ "$HOST_CLIENT" != "none" ]]; then
+    log_info "This host is set up for ${HOST_LABEL}, and no validator is running"
+  else
+    log_info "No validator on this host yet — installing from scratch"
+  fi
+fi
+
+# A host that runs a validator and asked for Firedancer: the validator.sh and
+# unit there belong to the process that is running, and reawaken.sh stages
+# Firedancer from them as they are. Rewriting them for a client that is not
+# installed would break the next unplanned restart.
+KEEP_RUNNING_SETUP=false
+if $IS_FIREDANCER && $LIVE_AGAVE; then KEEP_RUNNING_SETUP=true; fi
+# Firedancer holds the identity: an Agave client installed next to it must not
+# be enabled, or both would start at the next boot.
+HOLD_SOL=false
+if $FD_OWNS_HOST && ! $IS_FIREDANCER; then HOLD_SOL=true; fi
 
 # ---------------------------------------------------------------------------
 # Jito region detection & interactive prompts
@@ -1531,26 +1639,45 @@ if ! $BUILD_FROM_SOURCE; then
 elif $DRY_RUN; then
   CLIENT_VERSION="${CLIENT_VERSION:-<CLIENT_VERSION>}"
 else
-  # What is installed now? Prints the recorded tag, LEGACY (built by an older
-  # version of this script, tag unknown) or NONE.
+  # What is installed now? Prints the recorded tag and the repo it was built
+  # from, LEGACY (built by an older version of this script, which only built
+  # Jito; tag unknown), or NONE. The prebuilt Solana CLI that a --hexis or
+  # Firedancer host carries counts as NONE: it is Anza's stock release and was
+  # never the validator this host ran.
   INSTALLED_BUILD=$(sol_script <<'SCRIPT'
-ACTIVE="$HOME/.local/share/solana/install/releases/active_release"
-if [ -x "$ACTIVE/bin/agave-validator" ]; then
+INSTALL_ROOT="$HOME/.local/share/solana/install"
+ACTIVE="$INSTALL_ROOT/releases/active_release"
+if [ -L "$ACTIVE" ] && [ "$(readlink "$ACTIVE")" = "$INSTALL_ROOT/active_release" ]; then
+  echo "BUILD|NONE|"
+elif [ -x "$ACTIVE/bin/agave-validator" ]; then
   if [ -f "$ACTIVE/.arise-build" ]; then
-    echo "BUILD|$(cut -d' ' -f1 "$ACTIVE/.arise-build")"
+    echo "BUILD|$(cut -d' ' -f1 "$ACTIVE/.arise-build")|$(cut -d' ' -f3 "$ACTIVE/.arise-build")"
   else
-    echo "BUILD|LEGACY"
+    echo "BUILD|LEGACY|"
   fi
 else
-  echo "BUILD|NONE"
+  echo "BUILD|NONE|"
 fi
 SCRIPT
   )
+  INSTALLED_REPO=$(grep '^BUILD|' <<< "$INSTALLED_BUILD" | head -1 | cut -d'|' -f3)
   INSTALLED_BUILD=$(grep '^BUILD|' <<< "$INSTALLED_BUILD" | head -1 | cut -d'|' -f2)
   [[ -n "$INSTALLED_BUILD" ]] || die "Could not determine the installed validator build"
 
+  # Is what is installed the client that was asked for?
+  OTHER_CLIENT=false
+  if [[ "$INSTALLED_BUILD" == "LEGACY" ]]; then
+    [[ "$CLIENT" == "jito" ]] || OTHER_CLIENT=true
+  elif [[ "$INSTALLED_BUILD" != "NONE" && "$INSTALLED_REPO" != "$CLIENT_REPO" ]]; then
+    OTHER_CLIENT=true
+  fi
+
   if [[ "$INSTALLED_BUILD" == "NONE" ]]; then
     if [[ -z "$CLIENT_VERSION" ]]; then select_client_version; fi
+  elif $OTHER_CLIENT; then
+    log_warn "Installed build is ${INSTALLED_BUILD} from ${INSTALLED_REPO:-an older version of this script}, not ${CLIENT} from ${CLIENT_REPO} — building that beside it."
+    if [[ -z "$CLIENT_VERSION" ]]; then select_client_version; fi
+    log_warn "A running validator keeps its current binary until it is restarted."
   elif [[ -z "$CLIENT_VERSION" ]]; then
     NEED_BUILD=false
     log_info "Validator already installed (${INSTALLED_BUILD}) — skipping build. Pass --client-version to change it."
@@ -1754,6 +1881,8 @@ echo "XDP_DRIVER=$(ethtool -i "$IFACE" 2>/dev/null | awk -F': ' '/^driver:/{prin
 echo "XDP_KERNEL=$(uname -r)"
 echo "XDP_RX_MAX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Pre-set maximums:/{f=1} f&&/^RX:/{print $2; exit}' || true)"
 echo "XDP_TX_MAX=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Pre-set maximums:/{f=1} f&&/^TX:/{print $2; exit}' || true)"
+echo "XDP_RX_CUR=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Current hardware settings:/{f=1} f&&/^RX:/{print $2; exit}' || true)"
+echo "XDP_TX_CUR=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Current hardware settings:/{f=1} f&&/^TX:/{print $2; exit}' || true)"
 SCRIPT
     } | root_script)
 
@@ -1763,6 +1892,8 @@ SCRIPT
     XDP_KERNEL=$(echo "$XDP_INFO" | sed -n 's/^XDP_KERNEL=//p' | tr -cd 'A-Za-z0-9._+-')
     XDP_RX_MAX=$(echo "$XDP_INFO" | sed -n 's/^XDP_RX_MAX=//p')
     XDP_TX_MAX=$(echo "$XDP_INFO" | sed -n 's/^XDP_TX_MAX=//p')
+    XDP_RX_CUR=$(echo "$XDP_INFO" | sed -n 's/^XDP_RX_CUR=//p')
+    XDP_TX_CUR=$(echo "$XDP_INFO" | sed -n 's/^XDP_TX_CUR=//p')
 
     if [[ -z "$XDP_IFACE" || "$XDP_INFO" == *"XDP_ERROR=no_interface"* ]]; then
       die "Could not detect a network interface for XDP — pass --xdp-interface <iface>"
@@ -1791,10 +1922,22 @@ SCRIPT
     XDP_RXP=$(pow2_floor "$XDP_RX_MAX" 2>/dev/null || true)
     XDP_TXP=$(pow2_floor "$XDP_TX_MAX" 2>/dev/null || true)
     if [[ -n "$XDP_RXP" && -n "$XDP_TXP" ]]; then
-      log_info "Setting $XDP_IFACE ring sizes to rx=$XDP_RXP tx=$XDP_TXP (max rx=$XDP_RX_MAX tx=$XDP_TX_MAX)"
-      { emit_vars XDP_IFACE XDP_RXP XDP_TXP; cat <<'SCRIPT'
-# Apply now (tolerate "no change" errors when already set)
-ethtool -G "$XDP_IFACE" rx "$XDP_RXP" tx "$XDP_TXP" 2>/dev/null || true
+      # Resizing the rings resets the link for a moment, so a NIC that already
+      # has the right sizes is left alone.
+      XDP_RINGS_OK=false
+      if [[ "$XDP_RX_CUR" == "$XDP_RXP" && "$XDP_TX_CUR" == "$XDP_TXP" ]]; then
+        XDP_RINGS_OK=true
+        log_info "$XDP_IFACE ring sizes are already rx=$XDP_RXP tx=$XDP_TXP"
+      else
+        log_info "Setting $XDP_IFACE ring sizes to rx=$XDP_RXP tx=$XDP_TXP (max rx=$XDP_RX_MAX tx=$XDP_TX_MAX)"
+        if $LIVE_AGAVE || $LIVE_FD; then
+          log_warn "A validator is running on this host: resizing the rings drops the link on $XDP_IFACE for a moment"
+        fi
+      fi
+      { emit_vars XDP_IFACE XDP_RXP XDP_TXP XDP_RINGS_OK; cat <<'SCRIPT'
+if [ "$XDP_RINGS_OK" != true ]; then
+  ethtool -G "$XDP_IFACE" rx "$XDP_RXP" tx "$XDP_TXP" 2>/dev/null || true
+fi
 
 # Persist across reboots — re-applied once the interface is up
 cat > /etc/systemd/system/xdp-nic-tuning.service <<UNIT
@@ -2166,8 +2309,13 @@ else
 "
 fi
 
-printf '%s' "$VALIDATOR_SCRIPT" | sol_put "${SOL_HOME}/validator.sh" 755
-$DRY_RUN || log_info "validator.sh created"
+if $KEEP_RUNNING_SETUP; then
+  log_info "validator.sh left as it is: it belongs to the ${HOST_LABEL} validator that is running,"
+  log_info "and reawaken.sh stages Firedancer from it"
+else
+  printf '%s' "$VALIDATOR_SCRIPT" | sol_put "${SOL_HOME}/validator.sh" 755
+  $DRY_RUN || log_info "validator.sh created"
+fi
 
 # Post-start arb commands. The pipeline always boots disabled, so this has to be
 # run against a running validator after every (re)start.
@@ -2181,7 +2329,7 @@ fi
 # ---------------------------------------------------------------------------
 log_info "Step 9: Creating systemd service"
 
-{ emit_vars SOL_USER SOL_HOME LEDGER_PATH ACCOUNTS_PATH SNAPSHOTS_PATH XDP_CAPS IS_FIREDANCER; cat <<'SCRIPT'
+{ emit_vars SOL_USER SOL_HOME LEDGER_PATH ACCOUNTS_PATH SNAPSHOTS_PATH XDP_CAPS IS_FIREDANCER KEEP_RUNNING_SETUP HOLD_SOL; cat <<'SCRIPT'
 # Fix mount ownership service — runs before sol.service on every boot.
 # If a data directory is missing (e.g. a disk failed to mount) this fails and
 # the validator does not start, rather than filling the root disk.
@@ -2205,6 +2353,9 @@ EOF
 # privileges or modifying the OS.
 # XDP gets its capabilities from AmbientCapabilities below, which works with
 # NoNewPrivileges; 'setcap' on the validator binary would not.
+# KEEP_RUNNING_SETUP: the unit belongs to a validator that is running and is
+# on its way to Firedancer — it is left exactly as it is.
+if [ "$KEEP_RUNNING_SETUP" != true ]; then
 cat > /etc/systemd/system/sol.service <<EOF
 [Unit]
 Description=Solana Validator
@@ -2238,6 +2389,7 @@ LockPersonality=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 if command -v systemd-analyze >/dev/null 2>&1; then
   systemd-analyze verify /etc/systemd/system/sol.service /etc/systemd/system/sol-fix-mounts.service \
@@ -2245,11 +2397,17 @@ if command -v systemd-analyze >/dev/null 2>&1; then
 fi
 systemctl daemon-reload
 systemctl enable sol-fix-mounts.service
-if [ "$IS_FIREDANCER" = true ]; then
-  # This host runs Firedancer. sol.service is written for reference but must
-  # never start: there is no Agave binary behind validator.sh.
+if [ "$KEEP_RUNNING_SETUP" = true ]; then
+  echo "sol-fix-mounts.service enabled; sol.service left as it is — it is the validator running now, and reawaken.sh cutover retires it"
+elif [ "$IS_FIREDANCER" = true ]; then
+  # This host is for Firedancer. sol.service is written for reference but must
+  # not start: there is no Agave binary behind validator.sh.
   systemctl disable sol.service >/dev/null 2>&1 || true
   echo "sol-fix-mounts.service enabled; sol.service written but left disabled (Firedancer host)"
+elif [ "$HOLD_SOL" = true ]; then
+  # Firedancer is this host's validator. Enabling sol.service too would start
+  # both at the next boot; reawaken.sh rollback enables it when it takes over.
+  echo "sol-fix-mounts.service enabled; sol.service written but NOT enabled — Firedancer is this host's validator until 'reawaken.sh rollback'"
 else
   systemctl enable sol.service
   echo "sol.service and sol-fix-mounts.service created and enabled"
@@ -2322,6 +2480,19 @@ if $ENABLE_HEXIS && $HEXIS_CONTROL; then
   { emit_vars HEXIS_CONTROL_ALLOW HEXIS_CONTROL_PORT; cat <<'SCRIPT'
 ufw allow from "$HEXIS_CONTROL_ALLOW" to any port "$HEXIS_CONTROL_PORT" proto tcp
 echo "Allowed $HEXIS_CONTROL_PORT/tcp from $HEXIS_CONTROL_ALLOW (Hexis Control)"
+SCRIPT
+  } | root_script
+fi
+
+# The Control port is only for the Hexis arb client. On a host that moved to
+# plain Jito or Agave (and has no Firedancer, whose Concorde uses it too), close
+# the rule an earlier --hexis run opened.
+if ! $ENABLE_HEXIS && ! $IS_FIREDANCER && ! $FD_OWNS_HOST && [[ "$HOST_CLIENT" == "hexis" ]]; then
+  HEXIS_CONTROL_PORT="${HEXIS_CONTROL_BIND##*:}"
+  { emit_vars HEXIS_CONTROL_ALLOW HEXIS_CONTROL_PORT; cat <<'SCRIPT'
+if ufw delete allow from "$HEXIS_CONTROL_ALLOW" to any port "$HEXIS_CONTROL_PORT" proto tcp 2>/dev/null | grep -q 'Rule deleted'; then
+  echo "Closed $HEXIS_CONTROL_PORT/tcp (Hexis Control) — this host no longer runs the Hexis arb client"
+fi
 SCRIPT
   } | root_script
 fi
@@ -2560,6 +2731,7 @@ if $IS_FIREDANCER; then
   STAGE_ARGS=("${REAWAKEN_ARGS[@]}")
   [[ -n "$FD_TAG" ]]    && STAGE_ARGS+=(--fd-tag "$FD_TAG")
   [[ -n "$FD_BINARY" ]] && STAGE_ARGS+=(--fd-binary "$FD_BINARY")
+  [[ -n "$FD_CONCORDE_TABLES" ]] && STAGE_ARGS+=(--concorde-tables "$FD_CONCORDE_TABLES")
   if [[ -n "$HEXIS_SIGNER" ]]; then
     STAGE_ARGS+=(--hexis-signer "$HEXIS_SIGNER")
   else
@@ -2582,14 +2754,103 @@ if $IS_FIREDANCER; then
     fi
   fi
   log_info ""
-  log_info "Next steps:"
-  log_info "  1. Review the settings:        ${SSH_CMD} $SOL_HOST 'cat ~/validator.sh'"
-  log_info "  2. Start Firedancer:           $REAWAKEN cutover ${REAWAKEN_ARGS[*]}"
-  log_info "     Nothing is running yet, so there is nothing to stop — cutover checks the"
-  log_info "     config, asks once, and starts firedancer.service."
-  log_info ""
-  log_info "validator.sh on this host is the record of its settings; reawaken.sh reads it."
-  log_info "There is no Agave binary behind it, so 'reawaken.sh rollback' has nothing to go back to."
+  if $LIVE_FD; then
+    log_info "Firedancer is already running on this host. To move it onto the staged release:"
+    log_info "  $REAWAKEN upgrade ${STAGE_ARGS[*]}"
+  elif $KEEP_RUNNING_SETUP && $RESTART; then
+    log_info "--restart: handing over to reawaken.sh cutover, which waits for a restart"
+    log_info "window, stops ${HOST_LABEL} and starts Firedancer. It asks first."
+    echo ""
+    SUDO_PASS="$SUDO_PASS" "$REAWAKEN" cutover "${REAWAKEN_ARGS[@]}" ${WINDOW_ARGS[@]+"${WINDOW_ARGS[@]}"} || {
+      log_error "The cutover did not finish. Run it again with:"
+      log_error "  $REAWAKEN cutover ${REAWAKEN_ARGS[*]}"
+      exit 1
+    }
+  elif $KEEP_RUNNING_SETUP; then
+    log_info "Next steps:"
+    log_info "  ${HOST_LABEL} is still what runs here. Move to Firedancer with:"
+    log_info "    $REAWAKEN cutover ${REAWAKEN_ARGS[*]}"
+    log_info "  and back again with:"
+    log_info "    $REAWAKEN rollback ${REAWAKEN_ARGS[*]}"
+  else
+    log_info "Next steps:"
+    log_info "  1. Review the settings:        ${SSH_CMD} $SOL_HOST 'cat ~/validator.sh'"
+    log_info "  2. Start Firedancer:           $REAWAKEN cutover ${REAWAKEN_ARGS[*]}"
+    log_info "     Nothing is running yet, so there is nothing to stop — cutover checks the"
+    log_info "     config, asks once, and starts firedancer.service."
+    log_info ""
+    log_info "validator.sh on this host is the record of its settings; reawaken.sh reads it."
+    log_info "There is no Agave client behind it. To have one to fall back to, run this"
+    log_info "script again with --client jito or --client agave: it is installed beside"
+    log_info "Firedancer and 'reawaken.sh rollback' then switches to it."
+  fi
+elif $HOLD_SOL; then
+  # Firedancer runs here; an Agave-family client was just installed beside it.
+  REAWAKEN_ARGS=(--host "$SSH_HOST" --ssh-key "$SSH_KEY" --admin-user "$ADMIN_USER")
+  log_info "${CLIENT} is installed beside Firedancer, which is still this host's validator."
+  if $RESTART && ! $DRY_RUN; then
+    [[ -x "$REAWAKEN" ]] || die "Missing $REAWAKEN — run this from a checkout"
+    log_info "--restart: handing over to reawaken.sh rollback, which waits for a restart"
+    log_info "window, stops Firedancer and starts ${CLIENT} from validator.sh. It asks first."
+    echo ""
+    SUDO_PASS="$SUDO_PASS" "$REAWAKEN" rollback "${REAWAKEN_ARGS[@]}" ${WINDOW_ARGS[@]+"${WINDOW_ARGS[@]}"} || {
+      log_error "The switch did not finish. Run it again with:"
+      log_error "  $REAWAKEN rollback ${REAWAKEN_ARGS[*]}"
+      exit 1
+    }
+  else
+    log_info "Switch to it with:"
+    log_info "  $REAWAKEN rollback ${REAWAKEN_ARGS[*]}"
+    log_info "Until then nothing changes: sol.service is not enabled."
+  fi
+elif $LIVE_AGAVE; then
+  # A validator is running on the binary and flags it was started with.
+  # Everything for the new setup is on disk; only a restart is missing.
+  log_info "The validator that is running was not touched. The new setup takes effect when it restarts."
+  NEW_EXEC="PATH=${VALIDATOR_PATH} ${VALIDATOR_EXEC}"
+  # exit is an admin-RPC call and goes through the binary that is running
+  EXIT_BIN="${LIVE_EXE:-PATH=${VALIDATOR_PATH} ${VALIDATOR_EXEC}}"
+  EXIT_ARGS="--min-idle-time ${MIN_IDLE_TIME} --max-delinquent-stake ${MAX_DELINQUENT_STAKE} --skip-new-snapshot-check"
+  RESTART_CMD="${EXIT_BIN} --ledger ${LEDGER_PATH} exit ${EXIT_ARGS}"
+  if $RESTART; then
+    # Do not take a healthy validator down for a binary that cannot even run
+    if ! remote "${NEW_EXEC} --version" >/dev/null 2>&1; then
+      die "The new validator binary does not run (${VALIDATOR_EXEC} --version failed) — not restarting. The running validator is untouched."
+    fi
+    log_info "--restart: new binary is $(remote "${NEW_EXEC} --version" 2>/dev/null | head -1)"
+    log_info "Waiting for a restart window (min-idle-time ${MIN_IDLE_TIME}m, max-delinquent-stake ${MAX_DELINQUENT_STAKE}%) — this can take a while"
+    remote "${EXIT_BIN} --ledger ${LEDGER_PATH} wait-for-restart-window ${EXIT_ARGS}" \
+      || die "No restart window was found — nothing was restarted. Try again, or restart by hand."
+    if $PERCH_INSTALLED; then
+      # Tell the watchtower the restart is planned, so it does not page for it
+      root_script <<'SCRIPT'
+if systemctl is-active --quiet perch 2>/dev/null; then
+  perch maint restart || echo "ARISE-WARN: could not declare the restart to perch — it may alert"
+fi
+SCRIPT
+    fi
+    log_info "Exiting the validator — systemd starts it again on the new setup"
+    remote "$RESTART_CMD" || die "The validator did not exit cleanly — check it: ${SSH_CMD} $SOL_HOST 'tail -50 ${VALIDATOR_LOG}'"
+    RESTARTED=false
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      sleep 2
+      if [[ "$(remote "systemctl is-active sol" 2>/dev/null || true)" == "active" ]]; then RESTARTED=true; break; fi
+    done
+    if $RESTARTED; then
+      # shellcheck disable=SC2016
+      log_info "sol.service is active again, now running: $(remote 'readlink /proc/$(systemctl show -p MainPID --value sol)/exe' 2>/dev/null || echo unknown)"
+    else
+      log_error "sol.service did not come back within 30 seconds. Check it:"
+      log_error "  ${SSH_CMD} -t $ADMIN_HOST 'sudo systemctl status sol'"
+      log_error "  ${SSH_CMD} $SOL_HOST 'tail -50 ${VALIDATOR_LOG}'"
+      exit 1
+    fi
+    log_info "  Monitor catchup:  ${SSH_CMD} $SOL_HOST 'solana catchup --our-localhost'"
+  else
+    log_info "Restart it at a safe moment — run this script again with --restart, or by hand:"
+    log_info "  ${SSH_CMD} $SOL_HOST '${RESTART_CMD}'"
+    log_info "(exit waits for a window with no leader slot; systemd then starts the new setup)"
+  fi
 else
   log_info "Next steps:"
   log_info "  1. Review the startup script:  ${SSH_CMD} $SOL_HOST 'cat ~/validator.sh'"
@@ -2599,6 +2860,12 @@ else
   log_info "  5. Check validator status:     ${SSH_CMD} $SOL_HOST 'agave-validator --ledger ${LEDGER_PATH} monitor'"
   log_info ""
   log_info "The validator service is enabled but NOT started automatically."
+  if $RESTART && $DRY_RUN; then
+    log_info "[DRY RUN] --restart: if a validator is running, would wait for a restart window"
+    log_info "[DRY RUN]   (min-idle-time ${MIN_IDLE_TIME}m, max-delinquent-stake ${MAX_DELINQUENT_STAKE}%) and restart it onto this setup"
+  elif $RESTART; then
+    log_info "--restart: no validator was running on this host, so there was nothing to restart."
+  fi
 fi
 if $PERCH_INSTALLED; then
   log_info ""

@@ -138,7 +138,7 @@ On the **target server**:
 
 Leave `--client-version` off and the script lists recent release tags to pick from.
 
-**Firedancer from scratch.** `arise.sh` provisions the host and writes `validator.sh` as the record of the validator's settings (identity, vote account, entrypoints, Block Engine, shred receivers), leaves `sol.service` disabled, then runs `reawaken.sh stage` for you — the same staging a migrated host gets. Staging starts nothing. Start it with `./reawaken.sh cutover --host <host> --ssh-key <key>`: with nothing running there is nothing to stop, so it checks the config, asks once and starts `firedancer.service`. Pass `--hexis-signer <signing_key.json>` to use the arb signer Hexis issued; otherwise one is generated. There is no Agave binary on such a host, so `reawaken.sh rollback` has nothing to go back to.
+**Firedancer from scratch.** `arise.sh` provisions the host and writes `validator.sh` as the record of the validator's settings (identity, vote account, entrypoints, Block Engine, shred receivers), leaves `sol.service` disabled, then runs `reawaken.sh stage` for you — the same staging a migrated host gets. Staging starts nothing. Start it with `./reawaken.sh cutover --host <host> --ssh-key <key>`: with nothing running there is nothing to stop, so it checks the config, asks once and starts `firedancer.service`. Pass `--hexis-signer <signing_key.json>` to use the arb signer Hexis issued; otherwise one is generated. There is no Agave client on such a host, so `reawaken.sh rollback` has nothing to go back to until you install one beside Firedancer — see [Changing client](#changing-client-on-a-host-that-already-runs-one).
 
 ### Flags
 
@@ -169,6 +169,10 @@ Leave `--client-version` off and the script lists recent release tags to pick fr
 | `--client-repo` | HTTPS git repo to build from (default: the client's public repo) |
 | `--build-client` | Build from source even with `--hexis` (off by default — see below) |
 | `--fd-tag` / `--fd-binary` | Firedancer release to stage with `--client firedancer` |
+| `--concorde-tables` | Local copy of the Concorde config tables, instead of fetching them with `gh` (passed on to `reawaken.sh`) |
+| `--restart` | On a host with a running validator: wait for a restart window and move it onto what was just installed. From or to Firedancer this hands over to `reawaken.sh`, which asks first |
+| `--min-idle-time` | Minutes without a leader slot that `--restart` waits for (default: `20`) |
+| `--max-delinquent-stake` | `--restart` does not go ahead while more than this percentage of stake is delinquent (default: `5`) |
 
 **Monitoring and trade-offs:**
 
@@ -405,6 +409,52 @@ doesn't:
 `migrate` adds the export while patching `validator.sh`, but only when the file has none
 — an existing config is the operator's and is never overwritten. A host already running
 Hexis is skipped by that patcher entirely, which is why `--fix-metrics` exists.
+
+### Changing client on a host that already runs one
+
+`arise.sh` describes what a host should be, so changing client is the same command
+with a different `--client`. Run it with the flags the host was set up with, the new
+client, and `--restart`:
+
+```bash
+# Jito -> Agave
+./arise.sh --host <ip> --ssh-key ~/.ssh/<key> --identity <staked_identity.json> \
+    --vote-account <pubkey> --network mainnet \
+    --client agave --client-version v4.4.1 --restart
+```
+
+It first reports what the host runs today. The new client is built beside the one that
+is running (`releases/<tag>/`), `validator.sh` and the unit are rewritten for it, and
+the running validator is not touched. `--restart` then checks that the new binary runs,
+waits for a restart window (`--min-idle-time`, default 20 minutes;
+`--max-delinquent-stake`, default 5%), declares the restart to perch if it is running,
+and exits the validator through the binary it is executing; systemd brings it back on
+the new setup. Without `--restart` the exact command is printed and nothing restarts.
+
+| From | To | How |
+|---|---|---|
+| Jito | Agave, or back | `arise.sh --client <agave\|jito> --client-version <tag> --restart` |
+| Jito or Agave | a newer version of the same | the same, with the new `--client-version` |
+| Jito or Agave | Jito + Hexis | `ascend.sh migrate` (patches the `validator.sh` you have), or `arise.sh --hexis --hexis-tag <tag> --restart` |
+| Jito + Hexis | plain Jito or Agave | `arise.sh` without `--hexis`, with `--client-version <tag> --restart`. The arb flags go and the Control port is closed; `/home/sol/hexis` is left on disk |
+| Jito, Agave or Jito + Hexis | Firedancer | `reawaken.sh stage`, then `cutover` — or `arise.sh --client firedancer --fd-tag <tag> --restart`, which leaves the running `validator.sh` and unit alone, stages, and hands over to `cutover` |
+| Firedancer | the Agave-family client it ran before | `reawaken.sh rollback` |
+| Firedancer | a different Agave-family client, or one at all on a host set up as Firedancer | `arise.sh --client <jito\|agave> --client-version <tag> --restart`. The client is installed beside Firedancer, `sol.service` is written but not enabled, and `--restart` hands over to `reawaken.sh rollback` |
+
+`reawaken.sh` asks before it stops anything, including when `arise.sh` hands over to it.
+
+Things to know:
+
+- A source build takes the better part of an hour and uses every core. On a host with
+  a live validator, expect it to be slower for that time.
+- `active_release` is repointed when the build finishes, a little before `validator.sh`
+  is rewritten. An unplanned restart in that gap fails to start and is retried by
+  systemd until the rewrite lands, a matter of seconds.
+- If XDP is on and the NIC's ring sizes are not yet powers of two, they are resized,
+  which drops the link for a moment. The script warns when a validator is running. A
+  NIC that is already right is not touched.
+- Jito and Agave at matching versions share the ledger format, so the ledger, accounts
+  and snapshots are reused as they are.
 
 ### Upgrading and migrating
 

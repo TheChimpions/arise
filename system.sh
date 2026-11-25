@@ -40,6 +40,7 @@ GOAL=""
 SSH_HOST=""
 SSH_KEY=""
 SOL_USER="sol"
+ADMIN_USER="monarch"
 AGAVE_SERVICE="sol"
 TAG=""
 PRINT_ONLY=false
@@ -56,11 +57,17 @@ Goals:
   hexis        Onto the Hexis Agave client (from Jito or plain Agave)
   firedancer   Onto Firedancer with the Hexis Concorde: stages it, and on the
                next call, once it is staged, cuts over
-  agave        Back from Firedancer to the Agave client it ran before
+  agave        Back from Firedancer to the Agave client validator.sh describes
+
+Moving between Jito and Agave, leaving Hexis, or upgrading a Jito or Agave build
+is done by arise.sh: run it again with the flags the host was set up with, the
+new --client / --client-version, and --restart. It needs your keys, so it is not
+run from here.
 
 Options:
   --tag <tag>          Release to use instead of the newest
   --user <name>        Validator user (default: ${SOL_USER})
+  --admin-user <name>  Admin user that holds sudo (default: ${ADMIN_USER})
   --agave-service <n>  Agave systemd unit (default: ${AGAVE_SERVICE})
   --print              Show the command for the goal, do not run it
   -h, --help           Show this help
@@ -79,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --host)          SSH_HOST="$2"; shift 2 ;;
     --ssh-key)       SSH_KEY="$2"; shift 2 ;;
     --user)          SOL_USER="$2"; shift 2 ;;
+    --admin-user)    ADMIN_USER="$2"; shift 2 ;;
     --agave-service) AGAVE_SERVICE="$2"; shift 2 ;;
     --tag)           TAG="$2"; shift 2 ;;
     --print)         PRINT_ONLY=true; shift ;;
@@ -99,6 +107,9 @@ FD_DIR="/home/${SOL_USER}/firedancer"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $SSH_KEY"
 HOST_ARGS="--host ${SSH_HOST} --ssh-key ${SSH_KEY}"
 [[ "$SOL_USER" != "sol" ]] && HOST_ARGS+=" --user ${SOL_USER}"
+[[ "$ADMIN_USER" != "monarch" ]] && HOST_ARGS+=" --admin-user ${ADMIN_USER}"
+# What arise.sh needs to change the client or version of a host it set up
+ARISE_HINT="./arise.sh ${HOST_ARGS} --identity <staked_identity.json> --vote-account <pubkey> --network <net> --client <jito|agave> --client-version <tag> --restart"
 
 # shellcheck disable=SC2086
 probe() { ssh -n $SSH_OPTS "$SOL_HOST" "$@" 2>/dev/null || true; }
@@ -206,7 +217,7 @@ route() {
           if [[ -z "$NEW_AGAVE" ]]; then NOTE="could not read the release list — pass --tag"
           elif [[ "$NEW_AGAVE" == "$(fact agave_release)" ]]; then NOTE="already on ${NEW_AGAVE}"
           else CMD="./ascend.sh upgrade ${HOST_ARGS} --hexis-tag '${NEW_AGAVE}' --restart"; fi ;;
-        *) NOTE="these scripts upgrade the Hexis builds only — '${SOURCE_LABEL}' has to move to one first (goal: hexis or firedancer)" ;;
+        *) NOTE="${SOURCE_LABEL} is built on the host, so arise.sh upgrades it: run it again with the flags the host was set up with, plus --client-version <tag> --restart" ;;
       esac ;;
     hexis)
       case "$STATE" in
@@ -323,6 +334,13 @@ if [[ -z "$GOAL" ]]; then
   [[ -z "$CMD" && "$NOTE" == already* ]] && echo "    upgrade     nothing to do: ${NOTE}"
   echo ""
   echo "  Run one of them:  $0 <goal> ${HOST_ARGS}"
+  echo ""
+  echo "  Jito <-> Agave, leaving Hexis, or a new Jito/Agave version — arise.sh, with"
+  echo "  the flags this host was set up with:"
+  echo "    ${ARISE_HINT}"
+  if [[ "$STATE" == "firedancer" ]]; then
+    echo "  Here that installs the client beside Firedancer; 'agave' above then switches to it."
+  fi
   echo ""
   exit 0
 fi

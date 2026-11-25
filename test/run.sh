@@ -48,6 +48,25 @@ arise() { ( cd "$ROOT" && ./arise.sh "$@" ) 2>&1; }
 ascend() { ( cd "$ROOT" && ./ascend.sh "$@" ) 2>&1; }
 system() { ( cd "$ROOT" && ./system.sh "$@" ) 2>&1; }
 
+# fd_host <file> <facts overrides, \n separated> <validator.sh body lines, \n separated>
+# Builds the stub responses for a host: its facts, validator.sh, arb-config.toml.
+fd_host() {
+  local file="$1" facts="$2" body="$3"
+  local base='vendor=AuthenticAMD\nfamily=25\nmodel=AMD EPYC 9254 24-Core Processor\nflags=avx2 avx512f \nglibc=2.39\nmem_gib=377\nip=9.9.9.9\ndoublezero=no\nufw=active\nagave_active=active\nagave_enabled=enabled\nfd_active=inactive\nfd_enabled=disabled\nfd_unit=no\nfd_release=\nfd_version=\nfd_config=no\nfd_signer=no\nvsh=yes'
+  {
+    printf '%s\n' '*echo ok*|ok'
+    printf '%s\n' "*host-facts*|${facts}${facts:+\\n}${base}"
+    printf '%s\n' "*cat /home/sol/validator.sh*|#!/bin/bash\\nexec agave-validator \\\\\\\\\\n    --identity /home/sol/identity.json \\\\\\\\\\n    --authorized-voter /home/sol/staked_identity.json \\\\\\\\\\n    --vote-account VoTe111 \\\\\\\\\\n    --ledger /mnt/ledger \\\\\\\\\\n    --accounts /mnt/accounts \\\\\\\\\\n    --entrypoint entrypoint.mainnet-beta.solana.com:8001 \\\\\\\\\\n    --expected-genesis-hash 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d \\\\\\\\\\n${body}    --limit-ledger-size"
+    printf '%s\n' '*cat /home/sol/hexis/arb-config.toml*|[engine]\nsigner_path    = "/home/sol/hexis/arb_signer_keypair.json"\njupiter_token_ledger = "JUPfromAgave"\nokx_token_ledger = "OKXfromAgave"'
+    printf '%s\n' '*key-info*|/home/sol/identity.json|/home/sol/unstaked_identity.json|UNSTAKEDpk\n/home/sol/staked_identity.json|/home/sol/staked_identity.json|STAKEDpk'
+    printf '%s\n' '*cat /home/sol/firedancer/config.toml*|name = "fd1"\nuser = "sol"\n[paths]\n    base = "/mnt/ledger/firedancer"\n    snapshots = "/mnt/ledger/firedancer/snapshots"'
+  } > "$file"
+}
+L='\\\\\\\\\\n'   # one validator.sh line break, as the stub file needs it
+KV="    --known-validator K1 ${L}    --known-validator K2 ${L}    --known-validator K3 ${L}"
+JITO="    --block-engine-url https://ny.mainnet.block-engine.jito.wtf ${L}    --commission-bps 1000 ${L}    --merkle-root-upload-authority AUTH111 ${L}    --shred-receiver-address 233.84.178.1:7733,1.2.3.4:1002${L}"
+HEXIS="    --arb-config /home/sol/hexis/arb-config.toml ${L}"
+
 # Common argument sets
 arise_base=(--host 1.2.3.4 --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network mainnet --commission-bps 0
             --jito-region frankfurt --no-auto-disks --no-xdp --dry-run)
@@ -1103,24 +1122,6 @@ group "reawaken.sh"
   reawaken() { ( cd "$ROOT" && ./reawaken.sh "$@" ) 2>&1; }
   T="$ROOT/test/fixtures/concorde-tables.toml"
 
-  # fd_host <file> <facts overrides, \n separated> <validator.sh body lines, \n separated>
-  # Builds the stub responses for a host: its facts, validator.sh, arb-config.toml.
-  fd_host() {
-    local file="$1" facts="$2" body="$3"
-    local base='vendor=AuthenticAMD\nfamily=25\nmodel=AMD EPYC 9254 24-Core Processor\nflags=avx2 avx512f \nglibc=2.39\nmem_gib=377\nip=9.9.9.9\ndoublezero=no\nufw=active\nagave_active=active\nagave_enabled=enabled\nfd_active=inactive\nfd_enabled=disabled\nfd_unit=no\nfd_release=\nfd_version=\nfd_config=no\nfd_signer=no\nvsh=yes'
-    {
-      printf '%s\n' '*echo ok*|ok'
-      printf '%s\n' "*host-facts*|${facts}${facts:+\\n}${base}"
-      printf '%s\n' "*cat /home/sol/validator.sh*|#!/bin/bash\\nexec agave-validator \\\\\\\\\\n    --identity /home/sol/identity.json \\\\\\\\\\n    --authorized-voter /home/sol/staked_identity.json \\\\\\\\\\n    --vote-account VoTe111 \\\\\\\\\\n    --ledger /mnt/ledger \\\\\\\\\\n    --accounts /mnt/accounts \\\\\\\\\\n    --entrypoint entrypoint.mainnet-beta.solana.com:8001 \\\\\\\\\\n    --expected-genesis-hash 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d \\\\\\\\\\n${body}    --limit-ledger-size"
-      printf '%s\n' '*cat /home/sol/hexis/arb-config.toml*|[engine]\nsigner_path    = "/home/sol/hexis/arb_signer_keypair.json"\njupiter_token_ledger = "JUPfromAgave"\nokx_token_ledger = "OKXfromAgave"'
-      printf '%s\n' '*key-info*|/home/sol/identity.json|/home/sol/unstaked_identity.json|UNSTAKEDpk\n/home/sol/staked_identity.json|/home/sol/staked_identity.json|STAKEDpk'
-      printf '%s\n' '*cat /home/sol/firedancer/config.toml*|name = "fd1"\nuser = "sol"\n[paths]\n    base = "/mnt/ledger/firedancer"\n    snapshots = "/mnt/ledger/firedancer/snapshots"'
-    } > "$file"
-  }
-  L='\\\\\\\\\\n'   # one validator.sh line break, as the stub file needs it
-  KV="    --known-validator K1 ${L}    --known-validator K2 ${L}    --known-validator K3 ${L}"
-  JITO="    --block-engine-url https://ny.mainnet.block-engine.jito.wtf ${L}    --commission-bps 1000 ${L}    --merkle-root-upload-authority AUTH111 ${L}    --shred-receiver-address 233.84.178.1:7733,1.2.3.4:1002${L}"
-  HEXIS="    --arb-config /home/sol/hexis/arb-config.toml ${L}"
   base_args=(stage --host 1.2.3.4 --ssh-key "$WORK/key" --concorde-tables "$T" --dry-run)
 
   # --- Hexis Agave source ---
@@ -1586,10 +1587,17 @@ else
   it "a Jito host is offered the move to the Hexis Agave client"
   assert_contains "$out" "hexis       ./ascend.sh migrate --host 1.2.3.4 --ssh-key $WORK/key --hexis-tag 'v5.0.0+concorde.1' --restart"
 
-  it "and upgrade is refused there with the reason"
+  it "and is told how to switch between Jito and Agave or change version"
+  assert_contains "$out" "./arise.sh --host 1.2.3.4 --ssh-key $WORK/key --identity <staked_identity.json> --vote-account <pubkey> --network <net> --client <jito|agave> --client-version <tag> --restart"
+
+  it "and upgrade there points at arise.sh, which is not run from here"
   out="$(STUB_RESPONSES=$WORK/st-jito.responses system upgrade "${st[@]}" --print; echo "rc=$?")"
-  assert_contains "$out" "these scripts upgrade the Hexis builds only"
+  assert_contains "$out" "arise.sh upgrades it"
   assert_contains "$out" "rc=1"
+
+  it "a non-default admin user is passed on to the script that is run"
+  assert_contains "$(STUB_RESPONSES=$WORK/st-jito.responses system hexis "${st[@]}" --admin-user ops --print)" \
+    "./ascend.sh migrate --host 1.2.3.4 --ssh-key $WORK/key --admin-user ops --hexis-tag"
 
   printf '%s\n' '*echo ok*|ok' > "$WORK/st-fresh.responses"
   it "a host with no validator is pointed at arise.sh, which is not run from here"
@@ -1603,6 +1611,222 @@ else
   assert_contains "$out" "Cannot SSH to sol@1.2.3.4"
   assert_contains "$out" "rc=1"
   unset STUB_RELEASES
+fi
+
+# === arise.sh on a host that already runs a validator =======================
+# These run arise.sh for real (not --dry-run) against the stub ssh, which
+# answers the host-state probes and records every script and file sent.
+if should_run "switch"; then
+group "client switch (arise.sh on a live host)"
+  PK=7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2
+  JITO_REPO=https://github.com/jito-foundation/jito-solana.git
+  AGAVE_REPO=https://github.com/anza-xyz/agave.git
+  ID_SUM="$(shasum -a 256 "$WORK/id.json" | cut -d' ' -f1)"
+  EXE=/home/sol/.local/share/solana/install/releases/v4.4.1-jito/bin/agave-validator
+  sw_base=(--host 1.2.3.4 --vote-account "$PK" --network mainnet --commission-bps 0
+           --jito-region frankfurt --no-auto-disks --no-xdp --no-perch
+           --ssh-key "$WORK/key" --identity "$WORK/id.json")
+
+  # sw_run <name> <state: agave_active fd_active fd_enabled client exe> <build line> <extra ssh responses> <args...>
+  # Leaves the output in $out, scripts and written files in $WORK/<name>.scripts
+  # and every ssh command line in $WORK/<name>.ssh.
+  sw_run() {
+    local name="$1" state="$2" build="$3" extra="$4"; shift 4
+    local a b c d e
+    read -r a b c d e <<<"$state"
+    {
+      printf '%s\n' "*fd_enabled*|STATE|agave_active|$a\\nSTATE|fd_active|$b\\nSTATE|fd_enabled|$c\\nSTATE|client|$d\\nSTATE|exe|${e:-}"
+      printf '%s\n' "*.arise-build*cut*|$build"
+      printf '%s\n' '*PROBE_DONE*|PROBE_DONE'
+    } > "$WORK/$name.script-responses"
+    {
+      printf '%s\n' "*sha256sum*|$ID_SUM"
+      [[ -n "$extra" ]] && printf '%b\n' "$extra"
+      printf '%s\n' '*echo ok*|ok'
+    } > "$WORK/$name.responses"
+    : > "$WORK/$name.scripts"; : > "$WORK/$name.ssh"
+    out="$(STUB_RESPONSES="$WORK/$name.responses" STUB_SCRIPT_RESPONSES="$WORK/$name.script-responses" \
+           STUB_SCRIPT_LOG="$WORK/$name.scripts" STUB_LOG="$WORK/$name.ssh" SUDO_PASS=pw \
+           arise "${sw_base[@]}" "$@" </dev/null; echo "rc=$?")"
+  }
+  # The validator.sh that was written, from the recorded files
+  sw_vsh() { awk '/^### /{f=0} /^### .*validator\.sh\.arise-tmp/{f=1; next} f' "$WORK/$1.scripts"; }
+
+  # --- a new server ---
+  sw_run fresh "inactive inactive not-found none" "BUILD|NONE|" "" --client-version v4.4.1-jito
+
+  it "a new server is installed from scratch"
+  assert_contains "$out" "No validator on this host yet"
+
+  it "the client is built there"
+  assert_contains "$(cat "$WORK/fresh.scripts")" "CLIENT_REPO=$JITO_REPO"
+
+  it "sol.service is enabled"
+  assert_contains "$(cat "$WORK/fresh.scripts")" "HOLD_SOL=false"
+
+  it "nothing is restarted on a new server, even with --restart"
+  sw_run fresh-r "inactive inactive not-found none" "BUILD|NONE|" "" --client-version v4.4.1-jito --restart
+  assert_contains "$out" "no validator was running on this host"
+  assert_not_contains "$(cat "$WORK/fresh-r.ssh")" " exit "
+
+  # --- Jito -> Agave, no restart ---
+  sw_run j2a "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" "" --client agave --client-version v4.4.1
+
+  it "a live Jito host is recognised"
+  assert_contains "$out" "This host runs Jito today"
+
+  it "asking for Agave builds Agave beside the Jito build"
+  assert_contains "$out" "not agave from $AGAVE_REPO"
+  assert_contains "$(cat "$WORK/j2a.scripts")" "CLIENT_REPO=$AGAVE_REPO"
+
+  it "the new validator.sh has no Jito flags"
+  assert_not_contains "$(sw_vsh j2a)" "--block-engine-url"
+  assert_contains "$(sw_vsh j2a)" "--vote-account $PK"
+
+  it "the running validator is left alone without --restart"
+  assert_contains "$out" "The validator that is running was not touched"
+  assert_not_contains "$(cat "$WORK/j2a.ssh")" " exit "
+
+  it "the restart command is given, through the binary that is running"
+  assert_contains "$out" "$EXE --ledger /home/sol/ledger exit --min-idle-time 20 --max-delinquent-stake 5"
+
+  it "the run succeeds"
+  assert_contains "$out" "rc=0"
+
+  # --- Jito -> Agave with --restart ---
+  sw_run j2a-r "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" \
+    '*--version*|agave-validator 4.4.1\n*systemctl is-active sol*|active\n*readlink /proc*|/home/sol/new/agave-validator' \
+    --client agave --client-version v4.4.1 --restart --min-idle-time 30
+
+  it "--restart waits for a restart window before anything stops"
+  assert_contains "$(cat "$WORK/j2a-r.ssh")" "$EXE --ledger /home/sol/ledger wait-for-restart-window --min-idle-time 30 --max-delinquent-stake 5"
+
+  it "--restart exits through the binary that is running"
+  assert_contains "$(cat "$WORK/j2a-r.ssh")" "$EXE --ledger /home/sol/ledger exit --min-idle-time 30 --max-delinquent-stake 5"
+
+  it "the window comes before the exit, and both after validator.sh is written"
+  order="$(grep -n -e 'validator.sh.arise-tmp' -e 'wait-for-restart-window' -e ' exit --min-idle-time' "$WORK/j2a-r.ssh" | sed -e 's/^[0-9]*://' -e 's/.*validator\.sh.*/vsh/' -e 's/.*wait-for.*/window/' -e 's/.* exit .*/exit/' | tr '\n' ' ')"
+  assert_eq "$order" "vsh window exit "
+
+  it "--restart reports the validator back up"
+  assert_contains "$out" "sol.service is active again, now running: /home/sol/new/agave-validator"
+  assert_contains "$out" "rc=0"
+
+  it "--restart is called off when the new binary does not run"
+  sw_run j2a-bad "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" '*--version*|@fail' \
+    --client agave --client-version v4.4.1 --restart
+  assert_contains "$out" "not restarting"
+  assert_not_contains "$(cat "$WORK/j2a-bad.ssh")" " exit "
+  assert_contains "$out" "rc=1"
+
+  it "--restart is called off when no restart window is found"
+  sw_run j2a-nowin "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" \
+    '*wait-for-restart-window*|@fail\n*--version*|agave-validator 4.4.1' --client agave --client-version v4.4.1 --restart
+  assert_contains "$out" "No restart window was found"
+  assert_not_contains "$(cat "$WORK/j2a-nowin.ssh")" " exit "
+
+  # --- same client ---
+  it "the same client and version is not rebuilt"
+  sw_run same "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" "" --client-version v4.4.1-jito
+  assert_contains "$out" "already installed — skipping build"
+  assert_not_contains "$(cat "$WORK/same.scripts")" "cargo-install-all.sh"
+
+  it "a new version of the same client is built"
+  sw_run up "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" "" --client-version v4.4.2-jito
+  assert_contains "$out" "Installed build is v4.4.1-jito; building v4.4.2-jito"
+  assert_contains "$(cat "$WORK/up.scripts")" "CLIENT_VERSION=v4.4.2-jito"
+
+  it "a build from an older version of this script counts as Jito"
+  sw_run legacy "active inactive not-found jito $EXE" "BUILD|LEGACY|" "" --client agave --client-version v4.4.1
+  assert_contains "$(cat "$WORK/legacy.scripts")" "CLIENT_REPO=$AGAVE_REPO"
+
+  # --- leaving Hexis ---
+  # A --hexis host has only the prebuilt Solana CLI in active_release
+  sw_run unhexis "active inactive not-found hexis /home/sol/hexis/releases/v5/agave-validator" "BUILD|NONE|" "" --client-version v4.4.1-jito
+
+  it "leaving Hexis builds the plain client: the prebuilt CLI is not taken for it"
+  assert_contains "$(cat "$WORK/unhexis.scripts")" "cargo-install-all.sh"
+
+  it "leaving Hexis drops the arb flags from validator.sh"
+  assert_not_contains "$(sw_vsh unhexis)" "--arb-config"
+  assert_contains "$(sw_vsh unhexis)" "--block-engine-url"
+
+  it "leaving Hexis closes the Control port"
+  assert_contains "$(cat "$WORK/unhexis.scripts")" 'ufw delete allow from "$HEXIS_CONTROL_ALLOW"'
+
+  it "the Control port is not touched on a host that never ran Hexis"
+  assert_not_contains "$(cat "$WORK/j2a.scripts")" 'ufw delete allow from "$HEXIS_CONTROL_ALLOW"'
+
+  # --- a host that runs Firedancer ---
+  sw_run fd2j "inactive active enabled jito" "BUILD|NONE|" "" --client-version v4.4.1-jito
+
+  it "a Firedancer host is recognised"
+  assert_contains "$out" "This host runs Firedancer today"
+
+  it "the Agave-family client is installed beside Firedancer"
+  assert_contains "$(cat "$WORK/fd2j.scripts")" "cargo-install-all.sh"
+  assert_contains "$out" "jito is installed beside Firedancer"
+
+  it "sol.service is not enabled next to a Firedancer that holds the identity"
+  assert_contains "$(cat "$WORK/fd2j.scripts")" "HOLD_SOL=true"
+
+  it "the switch itself is reawaken.sh rollback"
+  assert_contains "$out" "reawaken.sh rollback --host 1.2.3.4 --ssh-key $WORK/key --admin-user monarch"
+  assert_contains "$out" "rc=0"
+
+  it "Firedancer staged but not enabled does not hold sol.service back"
+  sw_run fdstaged "active inactive disabled jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" "" --client-version v4.4.1-jito
+  assert_contains "$(cat "$WORK/fdstaged.scripts")" "HOLD_SOL=false"
+
+  # --restart there hands over to reawaken.sh, which reads the host itself and
+  # asks before it stops anything. No answer is given here, so it stops at the question.
+  fd_host "$WORK/fd-live-sw.facts" 'agave_active=inactive\nagave_enabled=disabled\nfd_active=active\nfd_enabled=enabled\nfd_unit=yes\nfd_release=v1.0.0\nfd_version=1.0.0\nfd_config=yes\nfd_signer=yes' "${KV}${JITO}"
+  sw_run fd2j-r "inactive active enabled jito" "BUILD|NONE|" "$(sed 's/\\/\\\\/g' "$WORK/fd-live-sw.facts")" --client-version v4.4.1-jito --restart
+
+  it "--restart on a Firedancer host hands over to reawaken.sh rollback"
+  assert_contains "$out" "handing over to reawaken.sh rollback"
+  assert_contains "$out" "This stops Firedancer on sol@1.2.3.4"
+
+  it "and nothing is stopped without the operator's yes"
+  assert_contains "$out" "Nothing changed"
+  assert_not_contains "$(cat "$WORK/fd2j-r.scripts")" "systemctl stop firedancer"
+
+  # --- a live host asked to become Firedancer ---
+  # reawaken.sh stage runs for real here too, against a host whose validator.sh
+  # is the Jito one. The binary handed over is a fake, so stage stops at its check.
+  fd_host "$WORK/jito-live-sw.facts" '' "${KV}${JITO}"
+  sw_run a2fd "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" "$(sed 's/\\/\\\\/g' "$WORK/jito-live-sw.facts")" \
+    --client firedancer --fd-binary "$WORK/binary" --concorde-tables "$ROOT/test/fixtures/concorde-tables.toml"
+
+  it "validator.sh of the running validator is not rewritten on the way to Firedancer"
+  assert_contains "$out" "validator.sh left as it is"
+  assert_not_contains "$(cat "$WORK/a2fd.ssh")" "validator.sh.arise-tmp"
+
+  it "nor is its unit, and it stays enabled until the cutover"
+  assert_contains "$(cat "$WORK/a2fd.scripts")" "KEEP_RUNNING_SETUP=true"
+  assert_contains "$out" "Staging Firedancer with reawaken.sh"
+
+  it "reawaken.sh stages from the Jito validator.sh that was left in place"
+  assert_contains "$out" "Plan for sol@1.2.3.4 (Jito -> Firedancer with the Concorde)"
+  assert_contains "$out" "Block Engine:   https://ny.mainnet.block-engine.jito.wtf"
+
+  it "a Firedancer binary that does not run stops the staging, and arise.sh says how to resume"
+  assert_contains "$out" "The uploaded binary does not run on this host — nothing has been changed"
+  assert_contains "$out" "Staging Firedancer did not finish"
+  assert_contains "$out" "rc=1"
+
+  it "--concorde-tables is refused without the firedancer client"
+  assert_contains "$(arise "${sw_base[@]}" --dry-run --concorde-tables "$ROOT/test/fixtures/concorde-tables.toml")" "only go with --client firedancer"
+
+  # --- flags ---
+  it "--min-idle-time must be a number"
+  assert_contains "$(arise "${sw_base[@]}" --dry-run --min-idle-time soon)" "--min-idle-time must be a number of minutes"
+
+  it "--max-delinquent-stake must be a number"
+  assert_contains "$(arise "${sw_base[@]}" --dry-run --max-delinquent-stake lots)" "--max-delinquent-stake must be a percentage"
+
+  it "a dry run says what --restart would do"
+  assert_contains "$(arise "${sw_base[@]}" --dry-run --restart)" "[DRY RUN] --restart: if a validator is running, would wait for a restart window"
 fi
 
 # ---------------------------------------------------------------------------
