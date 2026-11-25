@@ -26,6 +26,8 @@ respond() {   # <file> <text to match>
     if [[ "$2" == $pattern ]]; then
       # "@fail" as the output makes this one call fail, with nothing printed
       [[ "$output" == "@fail" ]] && exit 1
+      # "@exit N" makes it end with that status instead
+      [[ "$output" == "@exit "* ]] && exit "${output#@exit }"
       [[ -n "$output" ]] && printf '%b\n' "$output"
       return 0
     fi

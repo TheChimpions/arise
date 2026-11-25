@@ -43,6 +43,17 @@ assert_not_contains() {
 assert_eq() {
   if [[ "$1" == "$2" ]]; then _ok; else _fail "expected [$2], got [$1]"; fi
 }
+# assert_order <text> <first> <second> — both are there, and the first line
+# holding <first> comes before the first line holding <second>
+assert_order() {
+  local a b
+  a=$(grep -nF -- "$2" <<<"$1" | head -1 | cut -d: -f1)
+  b=$(grep -nF -- "$3" <<<"$1" | head -1 | cut -d: -f1)
+  if [[ -z "$a" ]]; then _fail "expected to find: $2"
+  elif [[ -z "$b" ]]; then _fail "expected to find: $3"
+  elif (( a < b )); then _ok
+  else _fail "expected [$2] (line $a) before [$3] (line $b)"; fi
+}
 assert_file_missing() {
   if [[ -e "$1" ]]; then _fail "expected $1 not to exist"; else _ok; fi
 }
@@ -1414,8 +1425,103 @@ group "reawaken.sh"
   it "cutover declares the restart to perch, with room for a reboot and a snapshot download"
   assert_contains "$out" "perch maint restart 2h, if the host runs perch"
 
-  it "cutover ends by taking the dead RPC endpoint out of perch"
+  it "cutover takes the dead RPC endpoint out of perch"
   assert_contains "$out" "drop this host's own RPC from perch's endpoints, if the host runs perch"
+
+  it "and does so before Firedancer starts, so a reboot leaves nothing to come back for"
+  assert_order "$out" "drop this host's own RPC from perch's endpoints" "systemctl start firedancer"
+
+  it "cutover makes room for the 1 GiB pages before the start"
+  assert_order "$out" "drop the page cache and compact memory" "systemctl start firedancer"
+
+  it "the dry run says a reboot may be offered"
+  assert_contains "$out" "offer to reboot, then wait for Firedancer to come up"
+
+  # --- a real cutover against the stub: order of the steps, and the reboot ---
+  # cut_run <name> <facts> <script responses> <stdin> args... -> $WORK/<name>.{out,scripts}, status in $cut_rc
+  cut_run() {
+    local name="$1" facts="$2" scripts="$3" input="$4"; shift 4
+    fd_host "$WORK/$name.host" "fd_unit=yes\nfd_config=yes\nfd_signer=yes\nfd_release=v26.10.8+concorde.4\nhp1g_total=0\nuptime_days=12\nboot_id=boot-old${facts:+\\n}${facts}" "${KV}${JITO}${HEXIS}"
+    {
+      printf '%s\n' '*firedancer mem*|  Total Memory Locked      189 GiB + 644 MiB\n  Required Gigantic Pages  183'
+      printf '%s\n' '*is-active firedancer*|active'
+      cat "$WORK/$name.host"
+    } > "$WORK/$name.responses"
+    printf '%b' "$scripts" > "$WORK/$name.script-responses"
+    : > "$WORK/$name.scripts"
+    printf '%b' "$input" | STUB_RESPONSES="$WORK/$name.responses" STUB_SCRIPT_RESPONSES="$WORK/$name.script-responses" \
+      STUB_SCRIPT_LOG="$WORK/$name.scripts" SUDO_PASS=pw REBOOT_POLL_SECONDS=0 \
+      reawaken cutover --host 1.2.3.4 --ssh-key "$WORK/key" --now --no-snapshot-prefetch "$@" > "$WORK/$name.out"
+    cut_rc=$?
+  }
+
+  cut_run plain "" "" "" --yes
+  it "a cutover that finds its pages completes without a reboot"
+  assert_eq "$cut_rc" "0"
+  assert_contains "$(cat "$WORK/plain.out")" "cutover complete"
+  assert_not_contains "$(cat "$WORK/plain.scripts")" "systemctl reboot"
+
+  it "the script on the host deals with perch before it starts Firedancer"
+  assert_order "$(cat "$WORK/plain.scripts")" 'perch_cfg="/home/sol/perch/config.toml"' "systemctl start firedancer"
+
+  it "and frees and compacts memory before it starts Firedancer"
+  assert_order "$(cat "$WORK/plain.scripts")" "compact_memory" "systemctl start firedancer"
+
+  it "and stops Agave before any of that"
+  assert_order "$(cat "$WORK/plain.scripts")" "systemctl stop sol" 'perch_cfg="/home/sol/perch/config.toml"'
+
+  NEEDS_REBOOT='*systemctl start firedancer*|@exit 42\n'
+  cut_run reboot-yes "" "$NEEDS_REBOOT" "" --yes
+  printf '%s\n' '*cat /proc/sys/kernel/random/boot_id*|boot-new' > "$WORK/boot-new"
+  cat "$WORK/boot-new" "$WORK/reboot-yes.responses" > "$WORK/reboot-back.responses"
+  rb_out="$(STUB_RESPONSES="$WORK/reboot-back.responses" STUB_SCRIPT_RESPONSES="$WORK/reboot-yes.script-responses" \
+        STUB_SCRIPT_LOG="$WORK/reboot-back.scripts" SUDO_PASS=pw REBOOT_POLL_SECONDS=0 \
+        reawaken cutover --host 1.2.3.4 --ssh-key "$WORK/key" --now --no-snapshot-prefetch --yes)"; rc=$?
+  it "when the pages cannot be reserved, cutover reboots the host and waits for Firedancer"
+  assert_eq "$rc" "0"
+  assert_contains "$rb_out" "could not reserve its 1 GiB pages"
+  assert_contains "$(cat "$WORK/reboot-back.scripts")" "systemctl reboot"
+  assert_contains "$rb_out" "firedancer.service started after the reboot"
+  assert_contains "$rb_out" "cutover complete"
+
+  it "a host that does not come back is reported, not waited on forever"
+  assert_eq "$cut_rc" "1"
+  assert_contains "$(cat "$WORK/reboot-yes.out")" "has not come back"
+  assert_not_contains "$(cat "$WORK/reboot-yes.out")" "cutover complete"
+
+  cut_run reboot-no "" "$NEEDS_REBOOT" "yes\nno\n"
+  it "the reboot is asked for, and declining it reboots nothing"
+  assert_eq "$cut_rc" "1"
+  assert_contains "$(cat "$WORK/reboot-no.out")" "Not rebooted"
+  assert_not_contains "$(cat "$WORK/reboot-no.scripts")" "systemctl reboot"
+
+  it "declining says nothing needs to be run after the reboot, and how to go back"
+  assert_contains "$(cat "$WORK/reboot-no.out")" "nothing needs to be run afterwards"
+  assert_contains "$(cat "$WORK/reboot-no.out")" "reawaken.sh rollback --host 1.2.3.4"
+
+  cut_run other-failure "" '*systemctl start firedancer*|@exit 1\n' "" --yes
+  it "any other start failure stops there and offers no reboot"
+  assert_eq "$cut_rc" "1"
+  assert_not_contains "$(cat "$WORK/other-failure.out")" "Reboot"
+  assert_not_contains "$(cat "$WORK/other-failure.scripts")" "systemctl reboot"
+
+  # --- huge-page outlook in status ---
+  hp_status() {   # <facts> -> status output
+    fd_host "$WORK/hp.host" "fd_unit=yes\nfd_config=yes\nfd_signer=yes\n$1" "${KV}${JITO}${HEXIS}"
+    { printf '%s\n' '*firedancer mem*|  Total Memory Locked      189 GiB\n  Required Gigantic Pages  183'; cat "$WORK/hp.host"; } > "$WORK/hp.responses"
+    STUB_RESPONSES="$WORK/hp.responses" reawaken status --host 1.2.3.4 --ssh-key "$WORK/key"
+  }
+  it "status says a long-running host should expect the reboot"
+  assert_contains "$(hp_status "hp1g_total=0\nuptime_days=12")" "183 one-GiB pages needed, 0 reserved. Up 12 day(s): expect cutover to need a reboot"
+
+  it "status says no reboot is needed when the pages are already reserved"
+  assert_contains "$(hp_status "hp1g_total=183\nuptime_days=12")" "183 already reserved — no reboot needed"
+
+  it "status says a host booted today usually finds them"
+  assert_contains "$(hp_status "hp1g_total=0\nuptime_days=0")" "Booted today"
+
+  it "status on a running Firedancer says the pages are in use"
+  assert_contains "$(hp_status "hp1g_total=183\nuptime_days=3\nfd_active=active")" "held by the running Firedancer"
 
   it "cutover hands Agave's newest snapshot to Firedancer"
   assert_contains "$out" "seed /mnt/ledger/firedancer/snapshots with the newest snapshot in /mnt/ledger"

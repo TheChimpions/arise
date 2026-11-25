@@ -318,6 +318,86 @@ need_sudo() {
 
 fact() { sed -n "s/^$1=//p" <<<"$FACTS" | head -1; }
 
+# How long to wait between looks at a host that is rebooting
+REBOOT_POLL_SECONDS="${REBOOT_POLL_SECONDS:-10}"
+
+# huge_page_outlook <required 1 GiB pages> — one line on whether the first
+# Firedancer start is likely to need a reboot. Whether the kernel can find that
+# many contiguous gigabytes is only known when it is asked, after Agave has
+# stopped, so this says what is known and does not guess beyond it.
+huge_page_outlook() {
+  local need="$1" have days
+  have=$(fact hp1g_total); days=$(fact uptime_days)
+  [[ "$need" =~ ^[0-9]+$ && "$have" =~ ^[0-9]+$ ]] || return 0
+  if [[ "$(fact fd_active)" == "active" ]]; then
+    echo "${need} one-GiB pages, held by the running Firedancer"
+  elif (( have >= need )); then
+    echo "${need} one-GiB pages needed, ${have} already reserved — no reboot needed"
+  elif [[ "$days" =~ ^[0-9]+$ ]] && (( days < 1 )); then
+    echo "${need} one-GiB pages needed, ${have} reserved. Booted today, so they are usually found without a reboot"
+  else
+    echo "${need} one-GiB pages needed, ${have} reserved. Up ${days:-?} day(s): expect cutover to need a reboot, which it offers"
+  fi
+}
+
+# The remote cutover script exits with this when Firedancer could not get its
+# 1 GiB pages: everything else is done and only a reboot is missing.
+EXIT_NEEDS_REBOOT=42
+
+# reboot_for_huge_pages — Agave is stopped, Firedancer is enabled and could not
+# reserve its pages. Offers the reboot, waits for the host to come back as a new
+# boot, and for Firedancer to be running on it. Returns 1 when the operator
+# declines or the host does not come back in time; says what is left to do.
+reboot_for_huge_pages() {
+  local old_boot new_boot i state=""
+  echo ""
+  log_warn "Firedancer could not reserve its 1 GiB pages: memory on ${SOL_HOST} is too fragmented."
+  log_warn "${AGAVE_SERVICE}.service is stopped and disabled, firedancer.service is enabled, and"
+  log_warn "jag-snap and perch are already taken care of. A reboot is all that is missing:"
+  log_warn "Firedancer starts by itself and takes its pages first thing. The validator is"
+  log_warn "not voting until then."
+  if ! confirm "Reboot ${SOL_HOST} now?"; then
+    log_warn "Not rebooted. Reboot it yourself; nothing needs to be run afterwards:"
+    log_warn "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo systemctl reboot'"
+    log_warn "Or go back to Agave: $0 rollback --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
+    return 1
+  fi
+  old_boot=$(fact boot_id)
+  log_info "Rebooting ${SOL_HOST}"
+  # The connection drops as the host goes down, so the status says nothing
+  echo "systemctl reboot" | admin_root_exec "bash -s" >/dev/null 2>&1 || true
+
+  log_info "Waiting for it to come back (up to 15 minutes)"
+  new_boot=""
+  for ((i = 0; i < 90; i++)); do
+    sleep "$REBOOT_POLL_SECONDS"
+    new_boot=$(probe "cat /proc/sys/kernel/random/boot_id")
+    [[ -n "$new_boot" && "$new_boot" != "$old_boot" ]] && break
+    new_boot=""
+  done
+  if [[ -z "$new_boot" ]]; then
+    log_error "${SOL_HOST} has not come back. When it does, Firedancer starts by itself. Check with:"
+    log_error "  $0 status --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
+    return 1
+  fi
+  log_info "${SOL_HOST} is back. Waiting for firedancer.service"
+  for ((i = 0; i < 30; i++)); do
+    state=$(probe "systemctl is-active firedancer")
+    [[ "$state" == "active" || "$state" == "failed" ]] && break
+    sleep "$REBOOT_POLL_SECONDS"
+  done
+  if [[ "$state" != "active" ]]; then
+    log_error "firedancer.service is '${state:-unknown}' after the reboot. Look at:"
+    log_error "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo journalctl -u firedancer -n 50'"
+    log_error "Or go back to Agave: $0 rollback --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
+    return 1
+  fi
+  log_info "firedancer.service started after the reboot"
+}
+
+# required_gigantic_pages <firedancer mem output>
+required_gigantic_pages() { sed -n 's/.*Required Gigantic Pages *\([0-9][0-9]*\).*/\1/p' <<<"$1" | head -1; }
+
 # fd_prefetch_snapshot <agave snapshot dir or ""> — before the validator stops,
 # fetch the current full snapshot from the mirror into Firedancer's snapshot
 # directory, so the start that follows loads it from disk instead of spending
@@ -374,6 +454,9 @@ echo "model=\$(awk -F': ' '/^model name/{print \$2; exit}' /proc/cpuinfo)"
 echo "flags=\$(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx2|avx512f' | tr '\n' ' ')"
 echo "glibc=\$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\$')"
 echo "mem_gib=\$(awk '/^MemTotal/{printf "%d", \$2/1048576}' /proc/meminfo)"
+echo "hp1g_total=\$(cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages 2>/dev/null)"
+echo "uptime_days=\$(awk '{printf "%d", \$1/86400}' /proc/uptime)"
+echo "boot_id=\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 echo "ip=\$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="src") print \$(i+1)}' | head -1)"
 echo "doublezero=\$(ip link show doublezero0 >/dev/null 2>&1 && echo yes || echo no)"
 echo "ufw=\$(grep -qs '^ENABLED=yes' /etc/ufw/ufw.conf && echo active || echo inactive)"
@@ -450,6 +533,11 @@ if [[ "$MODE" == "status" ]]; then
   echo "  Firedancer:      firedancer.service $(fact fd_active) / $(fact fd_enabled)"
   echo "  Staged release:  ${FD_DIR}: $(fact fd_release) $(fact fd_version)"
   echo "  Staged config:   $(fact fd_config)   unit: $(fact fd_unit)   arb signer: $(fact fd_signer)"
+  if [[ "$(fact fd_config)" == "yes" ]]; then
+    # Read as the validator user; says nothing when the config is not readable to it
+    OUTLOOK=$(huge_page_outlook "$(required_gigantic_pages "$(probe "${FD_BIN} mem --config ${FD_CONFIG} 2>&1")")")
+    [[ -n "$OUTLOOK" ]] && echo "  Huge pages:      ${OUTLOOK}"
+  fi
   echo ""
   exit 0
 fi
@@ -517,9 +605,11 @@ SCRIPT
     echo "[DRY RUN] systemctl stop ${AGAVE_SERVICE}; systemctl disable ${AGAVE_SERVICE}"
     echo "[DRY RUN] copy vote_history-${IDENTITY_PUBKEY:-<identity>}.bin from ${AGAVE_LEDGER} to ${FD_BASE}; move any other identity's aside"
     [[ -n "$FD_SNAPSHOTS_DIR" ]] && echo "[DRY RUN] seed ${FD_SNAPSHOTS_DIR} with the newest snapshot in ${AGAVE_SNAPSHOTS}"
-    echo "[DRY RUN] systemctl enable firedancer; systemctl start firedancer, identity ${IDENTITY_LABEL}"
     $USES_JAG_SNAP && echo "[DRY RUN] stop the jag-snap container and close ${JAG_SNAP_PORT}/tcp"
     echo "[DRY RUN] drop this host's own RPC from perch's endpoints, if the host runs perch"
+    echo "[DRY RUN] drop the page cache and compact memory, to make room for the 1 GiB pages"
+    echo "[DRY RUN] systemctl enable firedancer; systemctl start firedancer, identity ${IDENTITY_LABEL}"
+    echo "[DRY RUN] if the 1 GiB pages still cannot be reserved: offer to reboot, then wait for Firedancer to come up"
     exit 0
   fi
 
@@ -571,7 +661,8 @@ $(fd_render_snapshot_seed "$AGAVE_SNAPSHOTS" "$FD_SNAPSHOTS_DIR" "$FD_USER")"
   fi
 
   log_info "Stopping ${AGAVE_SERVICE}.service and starting firedancer.service"
-  root_script <<SCRIPT
+  # Not under set -e here: the status of the remote script decides what happens next
+  root_script <<SCRIPT && CUTOVER_RC=0 || CUTOVER_RC=$?
 set -e
 $(perch_maint_cmd "$SOL_USER" "$PERCH_DEADLINE_FIREDANCER" root)
 systemctl stop ${AGAVE_SERVICE}
@@ -608,6 +699,19 @@ done
 
 ${LOGROTATE_STEP}
 $(fd_render_nofile_sysctl)
+
+# Everything that follows Agave is done before Firedancer starts, so that a
+# start which needs a reboot leaves nothing to come back for. rollback undoes both.
+${JAG_SNAP_RETIRE}
+$(perch_local_rpc_off_cmd "$SOL_USER")
+
+# Firedancer needs its 1 GiB pages as contiguous memory. With Agave gone, give
+# the page cache back and let the kernel compact what is free: on a host that
+# has been up for a while this is what can make the reboot unnecessary.
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+
 systemctl daemon-reload
 systemctl reset-failed firedancer 2>/dev/null || true
 systemctl enable firedancer >/dev/null 2>&1
@@ -615,17 +719,18 @@ if ! systemctl start firedancer; then
   echo "firedancer.service failed to start:"
   journalctl -u firedancer --no-pager -n 25
   if journalctl -u firedancer --no-pager -n 25 | grep -q "reserve gigantic pages"; then
-    echo "Memory is too fragmented for the 1 GiB pages. Reboot the host: firedancer.service is"
-    echo "enabled and takes its pages first thing. Then run cutover once more to finish."
+    exit ${EXIT_NEEDS_REBOOT}
   fi
   echo "${AGAVE_SERVICE}.service is stopped and disabled. Fix the cause and run cutover again, or run rollback."
   exit 1
 fi
 echo "firedancer.service started"
-
-${JAG_SNAP_RETIRE}
-$(perch_local_rpc_off_cmd "$SOL_USER")
 SCRIPT
+  if (( CUTOVER_RC == EXIT_NEEDS_REBOOT )); then
+    reboot_for_huge_pages || exit 1
+  elif (( CUTOVER_RC != 0 )); then
+    exit "$CUTOVER_RC"
+  fi
 
   echo ""
   log_info "============================================"
@@ -1163,6 +1268,7 @@ if ! grep -q "Total Memory Locked" <<<"$CHECK"; then
 fi
 while IFS= read -r line; do log_info "  $(sed -E 's/^ +//; s/ +/ /g' <<<"$line")"; done < <(grep -E "Total|Required" <<<"$CHECK")
 
+HUGE_PAGE_OUTLOOK=$(huge_page_outlook "$(required_gigantic_pages "$CHECK")")
 LOCKED_GIB=$(grep -m1 "Total Memory Locked" <<<"$CHECK" | grep -oE '[0-9]+ GiB' | head -1 | grep -oE '[0-9]+' || true)
 MEM_GIB=$(fact mem_gib)
 if [[ -n "$LOCKED_GIB" && -n "$MEM_GIB" ]]; then
@@ -1250,6 +1356,7 @@ log_info "============================================"
 log_info "Staged:  ${FD_BIN} -> $(probe "readlink ${FD_BIN}")"
 log_info "         ${FD_CONFIG}, ${FD_SIGNER_PATH}, ${FD_UNIT}"
 log_info ""
+[[ -n "${HUGE_PAGE_OUTLOOK:-}" ]] && log_info "Huge pages: ${HUGE_PAGE_OUTLOOK}"
 log_info "Nothing was stopped or started. When you are ready:"
 log_info "  $0 cutover --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
 log_info "and to go back to Agave afterwards:"

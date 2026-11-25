@@ -594,12 +594,18 @@ current config.
 for 20; `--min-idle-time` changes either and `--now` skips the wait. The long default is
 for what a move between clients can need at worst: a reboot and a full snapshot download.
 
-**The reboot.** Firedancer needs 183 one-GiB pages. A server that has been up for a
-while usually cannot provide them (memory is fragmented), so the first start in `cutover`
-fails and says so. By then Agave is stopped and disabled and Firedancer is enabled:
-reboot the host, Firedancer starts by itself and takes its pages first thing, then run
-`cutover` once more to finish. On a mainnet validator that went this way, it was voting
-again about eleven minutes after Agave stopped.
+**The reboot.** Firedancer needs 183 one-GiB pages as contiguous memory. A server that
+has been up for a while often cannot provide them (memory is fragmented). `stage` and
+`status` print a "Huge pages" line saying how many are needed, how many are reserved and
+how long the host has been up; whether the kernel can find the rest is only known once
+Agave has stopped. `cutover` therefore does everything else first — Agave stopped and
+disabled, jag-snap retired, perch's dead endpoint removed — then gives the page cache
+back, compacts memory and starts Firedancer. If the pages still cannot be reserved it
+says so and asks to reboot the host (`--yes` answers that too). It then waits for the
+host to come back and for `firedancer.service`, which is enabled and takes its pages
+first thing. Nothing needs to be run after the reboot. Decline, and it prints the reboot
+command and the way back (`rollback`). On a mainnet validator that needed the reboot, it
+was voting again about eleven minutes after Agave stopped.
 
 `--dry-run` on any mode prints the plan, the full `config.toml` and the unit without
 changing the host or asking for sudo.
@@ -759,7 +765,7 @@ sudo ~/firedancer/firedancer wait --config ~/firedancer/config.toml --min-idle-s
 
 **Arb never trades** — it boots disabled. Check `arb get`, then `/home/sol/hexis/arb-enable.sh`. If the validator refuses to boot at all, the config had a bad key: `agave-validator run` aborts on a typo in `arb-config.toml`.
 
-**`cutover` fails with "ENOMEM … reserve gigantic pages"** — expected on a server that has been up for a while. Reboot it and run `cutover` again; see [the reboot](#moving-to-firedancer-reawakensh).
+**`cutover` says Firedancer "could not reserve its 1 GiB pages"** — expected on a server that has been up for a while. Answer yes to the reboot it offers, or reboot the host yourself; Firedancer starts on its own and nothing needs to be run afterwards. See [the reboot](#moving-to-firedancer-reawakensh).
 
 **A `firedancer` command says `[arb.signer_key_path] is empty`** — it was run without `--config /home/sol/firedancer/config.toml`.
 
