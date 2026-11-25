@@ -340,3 +340,24 @@ if [ -f "\$perch_cfg.bak-pre-firedancer" ]; then
 fi
 EOF
 }
+
+# The Hexis builds, Agave and Firedancer alike, exist for mainnet only.
+MAINNET_GENESIS_HASH="5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+
+# perch_local_rpc_dead_cmd <user> — shell text that prints yes when perch has an
+# RPC endpoint on this machine that nothing listens on, no otherwise. Only the
+# [[endpoints]] blocks count: perch also reads node_exporter and its peers on
+# local addresses, and those are not the validator's RPC.
+perch_local_rpc_dead_cmd() {
+  cat <<EOF
+perch_cfg="/home/$1/perch/config.toml"
+EOF
+  cat <<'EOF'
+if [ -f "$perch_cfg" ] && awk 'BEGIN { RS = "" }
+    /\[\[endpoints\]\]/ && match($0, /:\/\/(127\.0\.0\.1|localhost):[0-9]+/) {
+      port = substr($0, RSTART, RLENGTH); sub(/.*:/, "", port)
+      if (system("ss -lnt 2>/dev/null | grep -q \":" port " \"") != 0) dead = 1
+    }
+    END { exit dead ? 0 : 1 }' "$perch_cfg"; then echo yes; else echo no; fi
+EOF
+}

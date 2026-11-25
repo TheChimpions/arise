@@ -408,6 +408,21 @@ that owns it, which still asks before it stops or starts a validator:
 `--tag` picks a release other than the newest. A server with no validator is pointed at
 `arise.sh`, which needs your keys and is never run from here.
 
+What it makes of each kind of host:
+
+| The host runs | Reported as | Moves offered |
+|---|---|---|
+| Plain Agave, mainnet | plain Agave | `hexis`, `firedancer` |
+| Jito, mainnet | Jito | `hexis`, `firedancer` |
+| Hexis Agave | Hexis Agave and its release | `upgrade`, `firedancer` |
+| Firedancer with the Hexis Concorde, installed by `reawaken.sh` | that, plus the Agave client kept behind it | `upgrade`, `agave` |
+| Any Agave client on testnet or devnet | the client | none: the Hexis builds are mainnet only |
+| A Firedancer installed some other way (an upstream build taking Jito bundles, say) | what its config says it is | none: reported and left alone |
+
+These scripts install and upgrade the Hexis builds only. They do not upgrade a plain
+Agave or Jito validator in place, and they do not install or upgrade an upstream
+Firedancer.
+
 A cutover that needed a reboot (see below) leaves its last steps undone, because
 Firedancer comes up by itself after the reboot. `system.sh` sees that jag-snap is still
 listening or that perch still watches the old RPC port, and sends the `firedancer` goal

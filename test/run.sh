@@ -455,6 +455,17 @@ group "XDP / PoH flag rename"
   it "perch keeps the local endpoint when Firedancer does serve RPC there"
   assert_contains "$(cat "$pc_dir/config.toml")" "127.0.0.1:8899"
 
+  pc_write
+  it "a dead local RPC endpoint in perch is noticed"
+  assert_eq "$(SS_PORTS="" pc_run perch_local_rpc_dead_cmd)" "yes"
+
+  it "but not while something listens there"
+  assert_eq "$(SS_PORTS="8899" pc_run perch_local_rpc_dead_cmd)" "no"
+
+  printf '%s\n' '[[endpoints]]' 'name = "public"' 'url = "https://rpc.example"' '' '[[hosts]]' 'url = "http://127.0.0.1:9100/metrics"' > "$pc_dir/config.toml"
+  it "and node_exporter on a local address is not taken for the validator's RPC"
+  assert_eq "$(SS_PORTS="" pc_run perch_local_rpc_dead_cmd)" "no"
+
   printf '%s\n' '[[endpoints]]' 'name = "localhost"' 'url = "http://127.0.0.1:8899"' > "$pc_dir/config.toml"
   it "perch's only endpoint is not taken away, and the script says so"
   assert_contains "$(SS_PORTS="" pc_run perch_local_rpc_off_cmd)" "its only endpoint is this host's own RPC"
@@ -1346,6 +1357,39 @@ else
   assert_contains "$out" "firedancer  ./reawaken.sh cutover --host 1.2.3.4 --ssh-key $WORK/key"
 
   st_host "$WORK/st-fd-jag.responses" "agave_active=inactive\nfd_active=active\nfd_enabled=enabled\nfd_release=v26.1.0+concorde.1\nfd_config=yes\njag_snap=up" "$S_JITO$S_HEXIS"
+  # --- the four clients a host can be running ---------------------------------
+  S_TESTNET="    --expected-genesis-hash 4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY ${SL}"
+  st_host "$WORK/st-testnet.responses" "agave_active=active\nfd_active=inactive\nfd_enabled=disabled" "$S_TESTNET"
+  kinds_out="$(STUB_RESPONSES=$WORK/st-testnet.responses system "${st[@]}")"
+  it "a plain Agave validator on testnet is reported, with no Hexis move offered"
+  assert_contains "$kinds_out" "Runs:            plain Agave"
+  assert_contains "$kinds_out" "From here:       nothing — the Hexis builds are mainnet only"
+  assert_not_contains "$kinds_out" "./reawaken.sh"
+
+  it "and asking for one there fails with the reason"
+  assert_contains "$(STUB_RESPONSES=$WORK/st-testnet.responses system firedancer "${st[@]}" --print || true)" "mainnet only"
+
+  # An upstream Firedancer somebody else installed: no validator.sh, own config path
+  {
+    printf '%s\n' '*echo ok*|ok'
+    printf '%s\n' '*other-firedancer-kind*|jito'
+    printf '%s\n' '*other-firedancer*|/etc/firedancer/config.toml'
+  } > "$WORK/st-other-fd.responses"
+  kinds_out="$(STUB_RESPONSES=$WORK/st-other-fd.responses system "${st[@]}")"
+  it "a Firedancer taking Jito bundles that these scripts did not install is named as that"
+  assert_contains "$kinds_out" "Runs:            Firedancer taking Jito bundles, config /etc/firedancer/config.toml"
+
+  it "and is not mistaken for a server with no validator"
+  assert_not_contains "$kinds_out" "./arise.sh"
+
+  it "and no goal is run against it"
+  assert_contains "$(STUB_RESPONSES=$WORK/st-other-fd.responses system upgrade "${st[@]}" --print || true)" "was not installed by these scripts"
+  assert_not_contains "$(STUB_RESPONSES=$WORK/st-other-fd.responses system upgrade "${st[@]}" --print || true)" "Would run"
+
+  st_host "$WORK/st-fd-done.responses" "agave_active=inactive\nfd_active=active\nfd_enabled=enabled\nfd_release=v26.2.0+concorde.1\nfd_config=yes\njag_snap=down\nperch_local=no" "$S_JITO$S_HEXIS"
+  it "a finished cutover is not offered again"
+  assert_contains "$(STUB_RESPONSES=$WORK/st-fd-done.responses system firedancer "${st[@]}" --print)" "already runs Firedancer"
+
   st_host "$WORK/st-fd-perch.responses" "agave_active=inactive\nfd_active=active\nfd_enabled=enabled\nfd_release=v26.1.0+concorde.1\nfd_config=yes\njag_snap=down\nperch_local=yes" "$S_JITO$S_HEXIS"
   it "and so is one where perch still watches the RPC port Firedancer does not serve"
   assert_contains "$(STUB_RESPONSES=$WORK/st-fd-perch.responses system firedancer "${st[@]}" --print)" "Would run: ./reawaken.sh cutover --host 1.2.3.4 --ssh-key $WORK/key"

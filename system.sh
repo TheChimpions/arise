@@ -118,7 +118,30 @@ else
   [[ -z "$VSH" ]] && STATE="fresh"
 fi
 
+# A Firedancer that is running from somewhere other than ${FD_DIR}: one these
+# scripts did not install, e.g. an upstream build taking Jito bundles. Found by
+# its process, since it has no validator.sh and may have any unit name.
+OTHER_FD=""
+OTHER_FD_KIND=""
+if [[ "$STATE" != "unreachable" ]]; then
+  OTHER_FD=$(probe ": other-firedancer
+ps -eo args 2>/dev/null | awk '\$1 ~ /(^|\\/)(firedancer|fdctl)\$/ && \$2 == \"run\" { for (i = 3; i < NF; i++) if (\$i == \"--config\") { print \$(i + 1); exit } }'")
+  if [[ -n "$OTHER_FD" && "$OTHER_FD" != "${FD_DIR}/config.toml" ]]; then
+    OTHER_FD_KIND=$(probe ": other-firedancer-kind
+if grep -q '^\[arb\]' '${OTHER_FD}' 2>/dev/null; then echo hexis
+elif awk '/^[[:space:]]*\[/ { t = \$0 } t ~ /tiles\.bundle/ && /^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true/ { f = 1 } END { exit !f }' '${OTHER_FD}' 2>/dev/null; then echo jito
+else echo plain; fi")
+    STATE="other-firedancer"
+  else
+    OTHER_FD=""
+  fi
+fi
+
 FACTS=""
+CLUSTER_GENESIS=$(fd_vsh_flag "$VSH" "--expected-genesis-hash")
+NOT_MAINNET=false
+[[ -n "$CLUSTER_GENESIS" && "$CLUSTER_GENESIS" != "$MAINNET_GENESIS_HASH" ]] && NOT_MAINNET=true
+
 if [[ -z "$STATE" ]]; then
   SOURCE=$(fd_detect_source "$VSH")
   [[ "$SOURCE" == "hexis" ]] && HEXIS_DIR=$(dirname "$(fd_vsh_flag "$VSH" "--arb-config")")
@@ -130,7 +153,7 @@ echo \"fd_release=\$(readlink ${FD_DIR}/firedancer 2>/dev/null | sed -e 's|^rele
 echo \"fd_config=\$(test -f ${FD_DIR}/config.toml && echo yes || echo no)\"
 echo \"fd_previous=\$(cat ${FD_DIR}/.previous-release 2>/dev/null)\"
 echo \"jag_snap=\$(ss -lnt 2>/dev/null | grep -q ':18899 ' && echo up || echo down)\"
-echo \"perch_local=\$(grep -qE '://(127\\.0\\.0\\.1|localhost):' /home/${SOL_USER}/perch/config.toml 2>/dev/null && echo yes || echo no)\"
+echo \"perch_local=\$($(perch_local_rpc_dead_cmd "$SOL_USER"))\"
 echo \"agave_release=\$(readlink ${HEXIS_DIR:-/nonexistent}/agave-validator 2>/dev/null | sed -e 's|^releases/||' -e 's|/agave-validator\$||')\"")
   if [[ "$(fact fd_enabled)" == "enabled" ]]; then
     STATE="firedancer"
@@ -166,6 +189,10 @@ fi
 route() {
   CMD=""; NOTE=""
   local fd_staged="no"
+  if $NOT_MAINNET && [[ "$1" != "agave" ]]; then
+    NOTE="the Hexis builds are mainnet only, and this validator is on another cluster (genesis ${CLUSTER_GENESIS:0:8}…)"
+    return 0
+  fi
   [[ -n "$(fact fd_release)" && "$(fact fd_config)" == "yes" ]] && fd_staged="yes"
 
   case "$1" in
@@ -237,6 +264,26 @@ if [[ "$STATE" == "unreachable" || "$STATE" == "fresh" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# A Firedancer from somewhere else: reported, never touched
+# ---------------------------------------------------------------------------
+if [[ "$STATE" == "other-firedancer" ]]; then
+  case "$OTHER_FD_KIND" in
+    hexis) OTHER_LABEL="Firedancer with the Hexis Concorde" ;;
+    jito)  OTHER_LABEL="Firedancer taking Jito bundles" ;;
+    *)     OTHER_LABEL="Firedancer" ;;
+  esac
+  echo ""
+  echo "  Host:            ${SOL_HOST}"
+  echo "  Runs:            ${OTHER_LABEL}, config ${OTHER_FD}"
+  echo ""
+  log_warn "That Firedancer was not installed by these scripts (theirs lives in ${FD_DIR}),"
+  log_warn "so nothing here upgrades, moves or rolls it back. reawaken.sh starts from a"
+  log_warn "validator.sh, which this host ${VSH:+has but is not running from}${VSH:-does not have}."
+  [[ -n "$GOAL" ]] && exit 1
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 describe_fd() {
@@ -256,6 +303,13 @@ fi
 echo "  Firedancer:      $(describe_fd)"
 echo "  Newest releases: Hexis Agave ${NEW_AGAVE:-unknown}   Firedancer ${NEW_FD:-unknown}"
 echo ""
+
+if [[ -z "$GOAL" ]] && $NOT_MAINNET; then
+  route upgrade
+  echo "  From here:       nothing — ${NOTE}"
+  echo ""
+  exit 0
+fi
 
 if [[ -z "$GOAL" ]]; then
   echo "  From here:"

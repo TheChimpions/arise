@@ -442,6 +442,13 @@ if [[ "$MODE" != "migrate" && "$HEXIS_INSTALLED" != "yes" ]]; then
   log_error "Run: $0 migrate --host ${SSH_HOST} --ssh-key ${SSH_KEY} --hexis-tag <tag>"
   exit 1
 fi
+if [[ "$MODE" == "migrate" ]]; then
+  GENESIS=$(probe "grep -oE -- '--expected-genesis-hash[[:space:]]+[A-Za-z0-9]+' ${VALIDATOR_SH} | head -1 | awk '{print \$2}'")
+  if [[ -n "$GENESIS" && "$GENESIS" != "$MAINNET_GENESIS_HASH" ]]; then
+    log_error "The Hexis client is mainnet only, and ${VALIDATOR_SH} is not a mainnet config (genesis ${GENESIS:0:8}…)"
+    exit 1
+  fi
+fi
 if [[ "$MODE" == "migrate" && "$ALREADY_PATCHED" == "yes" ]]; then
   log_info "${VALIDATOR_SH} already carries --arb-config — this host is migrated already"
   log_info "Use '$0 upgrade' for a version bump. Continuing will only refresh the binary and config."
