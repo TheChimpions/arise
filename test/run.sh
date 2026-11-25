@@ -17,6 +17,11 @@ trap 'rm -rf "$WORK"' EXIT
 
 export PATH="${ROOT}/test/stubs:$PATH"
 export STUB_LOG=/dev/null
+# The Hexis credentials are not in the repository. Tests get made-up ones from
+# the environment, and never read a real hexis.env that may sit beside the scripts.
+export HEXIS_ENV_FILE="$WORK/no-hexis.env"
+export HEXIS_JUP_KEY="test-jup-key"
+export SOLANA_METRICS_CONFIG_ARB="host=https://metrics.test,db=d,u=u,p=test-pw"
 
 # Fixed inputs so output is stable
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/key" <<<y >/dev/null 2>&1
@@ -413,15 +418,98 @@ group "clients and security model"
   assert_file_missing "$WORK/pwned"
 
   it "the sudo password is sent on stdin, never on the command line"
-  SSH_KEY="$WORK/key"; SSH_HOST=1.2.3.4; SOL_USER=sol; ADMIN_USER=monarch; DRY_RUN=false; remote_init
-  STUB_LOG="$WORK/ssh.log" SUDO_PASS='s3cret-pass' bash -c "
-    source '${ROOT}/lib/hexis.sh'; source '${ROOT}/lib/remote.sh'
-    SSH_KEY='$WORK/key'; SSH_HOST=1.2.3.4; SOL_USER=sol; ADMIN_USER=monarch; DRY_RUN=false; remote_init
-    echo 'echo hi' | root_script"
+  sudo_run() {   # <log name> <root_script | other shell text>; env comes from the caller
+    bash -c "
+      source '${ROOT}/lib/hexis.sh'; source '${ROOT}/lib/remote.sh'
+      SSH_KEY='$WORK/key'; SSH_HOST=1.2.3.4; SOL_USER=sol; ADMIN_USER=monarch; DRY_RUN=false; remote_init
+      $2" > "$WORK/$1.out" 2>&1
+  }
+  STUB_LOG="$WORK/ssh.log" SUDO_PASS='s3cret-pass' sudo_run pass "ask_sudo_pass && echo 'echo hi' | root_script"
   assert_not_contains "$(cat "$WORK/ssh.log")" "s3cret-pass"
 
   it "root scripts run through the admin user with sudo reading stdin"
   assert_contains "$(cat "$WORK/ssh.log")" "monarch@1.2.3.4 sudo -k -S -p '' bash -s"
+
+  it "with passwordless sudo no password line is put in front of the script"
+  STUB_SUDO_NOPASS=1 STUB_LOG="$WORK/nopass.ssh" STUB_SCRIPT_LOG="$WORK/nopass.scripts" SUDO_PASS='s3cret-pass' \
+    sudo_run nopass "ask_sudo_pass && echo 'echo hi' | root_script"
+  assert_contains "$(cat "$WORK/nopass.ssh")" "monarch@1.2.3.4 sudo -n bash -s"
+  assert_not_contains "$(cat "$WORK/nopass.ssh")" "sudo -k -S"
+  assert_not_contains "$(cat "$WORK/nopass.scripts")" "s3cret-pass"
+  assert_contains "$(cat "$WORK/nopass.out")" "passwordless sudo"
+
+  it "with passwordless sudo nobody is asked for a password"
+  STUB_SUDO_NOPASS=1 STUB_LOG="$WORK/noprompt.ssh" sudo_run noprompt "ask_sudo_pass < /dev/null && echo SETTLED"
+  assert_contains "$(cat "$WORK/noprompt.out")" "SETTLED"
+  assert_not_contains "$(cat "$WORK/noprompt.out")" "Enter sudo password"
+
+  it "a root script refuses to run before sudo has been checked"
+  STUB_LOG="$WORK/unasked.ssh" SUDO_PASS='s3cret-pass' sudo_run unasked "echo 'echo hi' | root_script; echo status=\$?"
+  assert_contains "$(cat "$WORK/unasked.out")" "status=1"
+  assert_file_missing "$WORK/unasked.ssh"
+fi
+
+# === Hexis credentials ======================================================
+if should_run "credentials"; then
+group "Hexis credentials (never in the repository)"
+  hexis_args=("${arise_base[@]}" --ssh-key "$WORK/key" --identity "$WORK/id.json"
+              --hexis --hexis-binary "$WORK/binary" --hexis-signer "$WORK/signer.json")
+  touch "$WORK/key" "$WORK/id.json" "$WORK/binary" "$WORK/signer.json"
+  no_creds() { ( unset HEXIS_JUP_KEY SOLANA_METRICS_CONFIG_ARB; "$@" ); }
+
+  it "no script carries a Jupiter key or a metrics token as a default"
+  leaked="$(cd "$ROOT" && grep -lE 'HEXIS_JUP_KEY:-[^}]|SOLANA_METRICS_CONFIG_ARB:-[^}]|p=apiv[0-9]_[A-Za-z0-9]' ./*.sh lib/*.sh README.md || true)"
+  assert_eq "$leaked" ""
+
+  it "lib/hexis.sh has no default for either credential"
+  assert_eq "$(no_creds bash -c "source '${ROOT}/lib/hexis.sh'; echo \"[\$HEXIS_JUP_KEY][\$HEXIS_METRICS_CONFIG]\"")" "[][]"
+
+  out="$(STUB_RESPONSES=$F/host-fresh.responses no_creds arise "${hexis_args[@]}")"; rc=$?
+  it "arise --hexis stops when the credentials were never given"
+  assert_eq "$rc" "1"
+  assert_contains "$out" "--hexis-jup-key"
+  assert_contains "$out" "--hexis-metrics-config"
+
+  it "it stops before anything is written for the host"
+  assert_not_contains "$out" "arb-config.toml"
+
+  out="$(STUB_RESPONSES=$F/host-fresh.responses no_creds arise "${hexis_args[@]}" \
+        --hexis-jup-key flag-key --hexis-metrics-config 'host=https://flag,p=flag-pw')"
+  it "the flags supply them"
+  assert_contains "$out" 'jup_key        = "flag-key"'
+  assert_contains "$out" 'export SOLANA_METRICS_CONFIG_ARB="host=https://flag,p=flag-pw"'
+
+  printf '%s\n' '# from Hexis' 'HEXIS_JUP_KEY="file-key"' "SOLANA_METRICS_CONFIG_ARB='host=https://file,p=file-pw'" > "$WORK/hexis.env"
+  out="$(STUB_RESPONSES=$F/host-fresh.responses HEXIS_ENV_FILE="$WORK/hexis.env" no_creds arise "${hexis_args[@]}")"
+  it "hexis.env supplies them"
+  assert_contains "$out" 'jup_key        = "file-key"'
+  assert_contains "$out" 'export SOLANA_METRICS_CONFIG_ARB="host=https://file,p=file-pw"'
+
+  printf '%s\n' 'HEXIS_JUP_KEY=x; touch '"$WORK"'/env-ran' > "$WORK/hostile.env"
+  HEXIS_ENV_FILE="$WORK/hostile.env" no_creds bash -c "source '${ROOT}/lib/hexis.sh'" >/dev/null 2>&1
+  it "hexis.env is read, not run"
+  assert_file_missing "$WORK/env-ran"
+
+  out="$(STUB_RESPONSES=$F/host-fresh.responses HEXIS_ENV_FILE="$WORK/hexis.env" arise "${hexis_args[@]}")"
+  it "the environment wins over hexis.env"
+  assert_contains "$out" 'jup_key        = "test-jup-key"'
+
+  out="$(STUB_RESPONSES=$F/host-fresh.responses no_creds arise "${hexis_args[@]}" \
+        --hexis-jup-key "" --hexis-metrics-config "")"; rc=$?
+  it "an empty value is a decision to go without, and is said out loud"
+  assert_eq "$rc" "0"
+  assert_contains "$out" "No Jupiter API key"
+  assert_contains "$out" "No arb metrics config"
+  assert_not_contains "$out" "jup_key        ="
+
+  out="$(no_creds ascend migrate --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary" --dry-run)"; rc=$?
+  it "ascend migrate stops when the credentials were never given"
+  assert_eq "$rc" "1"
+  assert_contains "$out" "Hexis credentials are not kept in this repository"
+
+  out="$(no_creds ascend upgrade --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary" --dry-run)"
+  it "ascend upgrade, which writes neither, does not ask for them"
+  assert_not_contains "$out" "Hexis credentials are not kept"
 fi
 
 # === flash loans ============================================================

@@ -132,8 +132,12 @@ Config (migrate; upgrade only honours --hexis-config):
   --hexis-profit-wallet <pk>    Address the program pays profit into. Defaults to the
                                 Hexis shared rewards pool
   --hexis-program-id <pubkey>
-  --hexis-jup-key <key>
-  --hexis-metrics-config <str>
+  --hexis-jup-key <key>         Jupiter API key Hexis gave you. migrate needs it unless
+                                --hexis-config is used; also read from \$HEXIS_JUP_KEY
+                                or hexis.env
+  --hexis-metrics-config <str>  SOLANA_METRICS_CONFIG_ARB value, from Hexis. migrate
+                                needs it; also read from \$SOLANA_METRICS_CONFIG_ARB
+                                or hexis.env
   --hexis-lookup-tables <list>
   --hexis-jupiter-token-ledger <pubkey>
   --hexis-okx-token-ledger <pubkey>
@@ -179,8 +183,8 @@ while [[ $# -gt 0 ]]; do
     --hexis-signer)    HEXIS_SIGNER="$2"; shift 2 ;;
     --hexis-profit-wallet) HEXIS_PROFIT_WALLET="$2"; shift 2 ;;
     --hexis-program-id) HEXIS_PROGRAM_ID="$2"; shift 2 ;;
-    --hexis-jup-key)   HEXIS_JUP_KEY="$2"; shift 2 ;;
-    --hexis-metrics-config) HEXIS_METRICS_CONFIG="$2"; shift 2 ;;
+    --hexis-jup-key)   HEXIS_JUP_KEY="$2"; HEXIS_JUP_KEY_SET=true; shift 2 ;;
+    --hexis-metrics-config) HEXIS_METRICS_CONFIG="$2"; HEXIS_METRICS_CONFIG_SET=true; shift 2 ;;
     --hexis-lookup-tables) HEXIS_LOOKUP_TABLES="$2"; shift 2 ;;
     --hexis-jupiter-token-ledger) HEXIS_JUPITER_TOKEN_LEDGER="$2"; shift 2 ;;
     --hexis-okx-token-ledger) HEXIS_OKX_TOKEN_LEDGER="$2"; shift 2 ;;
@@ -240,6 +244,15 @@ done
 if [[ "$HEXIS_CONTROL_BIND" == 127.0.0.1:* || "$HEXIS_CONTROL_BIND" == localhost:* ]]; then
   log_error "--hexis-control-bind must not be loopback — Hexis dials the host"
   exit 1
+fi
+# migrate writes arb-config.toml and the arb metrics export; both carry a
+# credential Hexis gives its operators.
+if [[ "$MODE" == "migrate" ]]; then
+  if [[ -n "$HEXIS_CONFIG" ]]; then
+    hexis_require_credentials no || exit 1
+  else
+    hexis_require_credentials yes || exit 1
+  fi
 fi
 
 # SFDP requires cluster metrics. Only defaulted when --metrics-config was not

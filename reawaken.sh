@@ -351,7 +351,7 @@ mem_check() {
     probe "$script"
   else
     # The log directory belongs to the Firedancer user, which sol cannot write
-    printf '%s\n' "$script" | root_exec "$ADMIN_HOST" sudo-pass "$SUDO_PASS" "bash -s" 2>/dev/null || true
+    printf '%s\n' "$script" | admin_root_exec "bash -s" 2>/dev/null || true
   fi
 }
 

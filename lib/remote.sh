@@ -20,6 +20,9 @@
 # Works with the stock macOS bash (3.2) — no bash 4+ features in this file.
 
 SUDO_PASS="${SUDO_PASS:-}"
+# How the admin user reaches root: "sudo-pass" or "sudo-nopass". Set by
+# ask_sudo_pass, which looks at the host rather than assuming.
+SUDO_MODE=""
 
 # remote_init — build the SSH options and destinations from the caller's settings.
 # Password and keyboard-interactive auth are refused client-side, so a failed
@@ -67,8 +70,11 @@ wrap_script() {
 #   mode sudo-nopass — dest has passwordless sudo
 #   mode sudo-pass   — dest needs a sudo password. The password travels as the
 #                      first line of SSH stdin (never argv, never a temp file).
-#                      sudo -k forces sudo to read it, so it can never be left
-#                      in the stream for the command to consume.
+#                      sudo -k makes sudo ignore a cached login and read it.
+#                      Only for a dest whose sudo does ask: with passwordless
+#                      sudo nothing reads that line and the command would get
+#                      the password as its first line of input. ask_sudo_pass
+#                      picks the mode from what the host actually does.
 root_exec() {
   local dest="$1" mode="$2" pass="$3" cmd="$4"
   case "$mode" in
@@ -77,6 +83,11 @@ root_exec() {
     sudo-pass)   { printf '%s\n' "$pass"; cat; } | ssh "${SSH_OPTS[@]}" "$dest" "sudo -k -S -p '' $cmd" ;;
     *)           log_error "root_exec: unknown mode $mode"; return 1 ;;
   esac
+}
+
+# Returns 0 if <dest> has passwordless sudo
+sudo_is_nopass() {
+  ssh "${SSH_OPTS[@]}" "$1" "sudo -k -n true" </dev/null 2>/dev/null
 }
 
 # Returns 0 if <password> is accepted by sudo for <dest>
@@ -108,7 +119,18 @@ root_script() {
     cat
     return
   fi
-  wrap_script | root_exec "$ADMIN_HOST" sudo-pass "$SUDO_PASS" "bash -s"
+  wrap_script | admin_root_exec "bash -s"
+}
+
+# admin_root_exec <remote-command> — run a command as root through the admin
+# user, passing local stdin through. Refuses to run before ask_sudo_pass has
+# settled how sudo behaves on the host.
+admin_root_exec() {
+  if [[ -z "$SUDO_MODE" ]]; then
+    log_error "admin_root_exec: ask_sudo_pass has not run"
+    return 1
+  fi
+  root_exec "$ADMIN_HOST" "$SUDO_MODE" "$SUDO_PASS" "$1"
 }
 
 # Run a script (stdin) as the sol user on the server (no sudo)
@@ -146,14 +168,27 @@ sha256_local() {
   fi
 }
 
-# Asks for the admin's sudo password and checks it. Sets SUDO_PASS.
+# Settles how the admin user reaches root, and sets SUDO_MODE and SUDO_PASS.
+# A host whose admin has passwordless sudo is never asked for a password, and
+# one handed in through the environment is dropped: nothing on the host would
+# read it. Otherwise the password is asked for (or taken from the environment)
+# and checked.
 ask_sudo_pass() {
-  [[ -n "$SUDO_PASS" ]] && return 0
-  IFS= read -rsp "Enter sudo password for ${ADMIN_HOST}: " SUDO_PASS
-  echo ""
+  [[ -n "$SUDO_MODE" ]] && return 0
+  if sudo_is_nopass "$ADMIN_HOST"; then
+    SUDO_MODE="sudo-nopass"
+    SUDO_PASS=""
+    log_info "${ADMIN_HOST} has passwordless sudo — no password needed"
+    return 0
+  fi
+  if [[ -z "$SUDO_PASS" ]]; then
+    IFS= read -rsp "Enter sudo password for ${ADMIN_HOST}: " SUDO_PASS
+    echo ""
+  fi
   if ! check_sudo "$ADMIN_HOST" "$SUDO_PASS"; then
     SUDO_PASS=""
     log_error "Sudo password validation failed for ${ADMIN_HOST}"
     return 1
   fi
+  SUDO_MODE="sudo-pass"
 }

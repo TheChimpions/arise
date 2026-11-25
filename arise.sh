@@ -283,11 +283,12 @@ Hexis arb client (https://github.com/hexishq/hexis-validator-docs):
   --hexis-profit-wallet <pk>    Address the program pays profit into. Defaults to the
                                 Hexis shared rewards pool. Only set this if Hexis
                                 hands you a different pool address
-  --hexis-jup-key <key>         Jupiter API key. Defaults to the Hexis fleet key
-                                (or set \$HEXIS_JUP_KEY)
+  --hexis-jup-key <key>         Jupiter API key Hexis gave you. Required unless
+                                --hexis-config is used; also read from
+                                \$HEXIS_JUP_KEY or hexis.env
   --hexis-metrics-config <str>  SOLANA_METRICS_CONFIG_ARB value exported by
-                                validator.sh. Defaults to the Hexis metrics host
-                                (or set \$SOLANA_METRICS_CONFIG_ARB)
+                                validator.sh, from Hexis. Required; also read from
+                                \$SOLANA_METRICS_CONFIG_ARB or hexis.env
   --hexis-lookup-tables <list>  Comma-separated extra address lookup tables
   --hexis-jupiter-token-ledger <pubkey>
   --hexis-okx-token-ledger <pubkey>
@@ -356,8 +357,8 @@ while [[ $# -gt 0 ]]; do
     --hexis-dir)      need_arg "$@"; HEXIS_DIR="$2";       shift 2 ;;
     --hexis-program-id)    need_arg "$@"; HEXIS_PROGRAM_ID="$2";    shift 2 ;;
     --hexis-profit-wallet) need_arg "$@"; HEXIS_PROFIT_WALLET="$2"; shift 2 ;;
-    --hexis-jup-key)  need_arg "$@"; HEXIS_JUP_KEY="$2";   shift 2 ;;
-    --hexis-metrics-config) need_arg "$@"; HEXIS_METRICS_CONFIG="$2"; shift 2 ;;
+    --hexis-jup-key)  need_arg "$@"; HEXIS_JUP_KEY="$2"; HEXIS_JUP_KEY_SET=true; shift 2 ;;
+    --hexis-metrics-config) need_arg "$@"; HEXIS_METRICS_CONFIG="$2"; HEXIS_METRICS_CONFIG_SET=true; shift 2 ;;
     --hexis-lookup-tables)  need_arg "$@"; HEXIS_LOOKUP_TABLES="$2";  shift 2 ;;
     --hexis-jupiter-token-ledger) need_arg "$@"; HEXIS_JUPITER_TOKEN_LEDGER="$2"; shift 2 ;;
     --hexis-okx-token-ledger)     need_arg "$@"; HEXIS_OKX_TOKEN_LEDGER="$2";     shift 2 ;;
@@ -516,6 +517,11 @@ if $ENABLE_HEXIS; then
   fi
   if [[ "$CLIENT" != "jito" ]]; then
     die "--hexis needs --client jito: the Hexis build is a Jito-Solana validator"
+  fi
+  if [[ -n "$HEXIS_CONFIG" ]]; then
+    hexis_require_credentials no || exit 1
+  else
+    hexis_require_credentials yes || exit 1
   fi
   if [[ -n "$HEXIS_TAG" && -n "$HEXIS_BINARY" ]]; then
     die "Pass either --hexis-tag or --hexis-binary, not both"
@@ -720,7 +726,7 @@ SCRIPT
   unset NEW_PASS BOOT_PASS
 
   can_ssh "$ADMIN_HOST" || die "Cannot SSH as ${ADMIN_HOST} after bootstrap — check authorized_keys"
-  check_sudo "$ADMIN_HOST" "$SUDO_PASS" || die "Sudo check failed for ${ADMIN_HOST} after bootstrap"
+  ask_sudo_pass || die "Sudo check failed for ${ADMIN_HOST} after bootstrap"
   log_info "Verified SSH and sudo access as ${ADMIN_USER}"
 fi
 

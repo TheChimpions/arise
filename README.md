@@ -237,8 +237,8 @@ part of an hour. Pass `--build-client` to compile from source anyway.
 | `--hexis-dir`                  | Install dir (default: `/home/sol/hexis`)                                                                                                                            |
 | `--hexis-program-id`           | On-chain arb program                                                                                                                                                |
 | `--hexis-profit-wallet`        | Address the program pays profit into. Defaults to the Hexis shared rewards pool. Only set it if Hexis hands you a different pool address.                           |
-| `--hexis-jup-key`              | Jupiter API key. Defaults to the Hexis fleet key; also read from `$HEXIS_JUP_KEY`.                                                                                  |
-| `--hexis-metrics-config`       | Value exported as `SOLANA_METRICS_CONFIG_ARB` in `validator.sh`. Defaults to the Hexis metrics host; also read from `$SOLANA_METRICS_CONFIG_ARB`.                   |
+| `--hexis-jup-key`              | Jupiter API key from Hexis. Required unless `--hexis-config` is used; also read from `$HEXIS_JUP_KEY` or `hexis.env`.                                                                                  |
+| `--hexis-metrics-config`       | Value exported as `SOLANA_METRICS_CONFIG_ARB` in `validator.sh`. From Hexis; required. Also read from `$SOLANA_METRICS_CONFIG_ARB` or `hexis.env`.                   |
 | `--hexis-lookup-tables`        | Comma-separated extra address lookup tables (see `lut.md`)                                                                                                          |
 | `--hexis-jupiter-token-ledger` | Jupiter TokenLedger (create with `hexis-setup`)                                                                                                                     |
 | `--hexis-okx-token-ledger`     | OKX TokenLedger PDA (create with `hexis-setup okx-token-ledger`)                                                                                                    |
@@ -271,13 +271,22 @@ the release's `checksums.txt` and a mismatch aborts the run.
 With `--hexis-config`, nothing is generated — that file owns `signer_path` and
 `profit_wallet`.
 
-**Defaults come from the Hexis mainnet sample config**, including the two fleet-wide
-credentials — the Jupiter API key and the `SOLANA_METRICS_CONFIG_ARB` metrics string.
-Both are the values Hexis hands to every operator, both are committed in this (public)
-repo, and both are overridable with `--hexis-jup-key` / `--hexis-metrics-config` or by
-exporting `HEXIS_JUP_KEY` / `SOLANA_METRICS_CONFIG_ARB`. **Check the rest against what
-Hexis gave you** — especially the token ledgers and the lookup tables, which are
-per-operator — before going live.
+**Defaults come from the Hexis mainnet sample config**, and all of them are public
+on-chain addresses. **Check them against what Hexis gave you** — especially the token
+ledgers and the lookup tables, which are per-operator — before going live.
+
+**The two Hexis credentials are not in this repository**: the Jupiter API key and the
+`SOLANA_METRICS_CONFIG_ARB` metrics string. Hexis gives both to its operators. Supply
+them one of three ways, first match wins:
+
+1. `--hexis-jup-key <key>` and `--hexis-metrics-config <str>`
+2. the environment: `HEXIS_JUP_KEY` and `SOLANA_METRICS_CONFIG_ARB`
+3. `hexis.env` beside the scripts — copy `hexis.env.example`, fill it in once; git
+   ignores it, and the scripts read it without running it
+
+`arise.sh --hexis` and `ascend.sh migrate` stop before touching the host when one was
+never given. Passing `""` is a decision to set up without it. With `--hexis-config` the
+Jupiter key is not asked for, since your file carries it.
 
 Example:
 

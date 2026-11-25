@@ -27,9 +27,9 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 # ---------------------------------------------------------------------------
 # Hexis defaults
 #
-# These are the values from the Hexis mainnet config. The two credentials are
-# fleet-wide and can be overridden from the environment; everything else is a
-# public on-chain address overridden by flag.
+# These are the values from the Hexis mainnet config: public on-chain addresses,
+# each overridden by flag. The two credentials Hexis hands to its operators are
+# not kept here — see "Hexis credentials" below.
 # ---------------------------------------------------------------------------
 HEXIS_REPO="hexishq/hexis-validator-docs"
 HEXIS_SETUP_TAG="v1.0-hexis-setup"      # hexis-setup ships as its own release
@@ -44,8 +44,63 @@ HEXIS_PROGRAM_SIZE="45101"
 SFDP_METRICS_MAINNET="host=https://metrics.solana.com:8086,db=mainnet-beta,u=mainnet-beta_write,p=password"
 SFDP_METRICS_TESTNET="host=https://metrics.solana.com:8086,db=tds,u=testnet_write,p=c4fa841aa918bf8274e3e2a44d77568d9861b3ea"
 
-HEXIS_JUP_KEY="${HEXIS_JUP_KEY:-04b47e38-5d95-4bfc-a7d6-6dd15fa4106a}"
-HEXIS_METRICS_CONFIG="${SOLANA_METRICS_CONFIG_ARB:-host=https://188.40.61.182,db=agave_metrics,u=agave,p=apiv3_UrpAb50xr-SC7AgjpP3XVnh5LlpAqIHTkn60VI41wof1hdeUafZwJxdQvrQH9tVz4znCWxhF7wtxznvUvstXzw}"
+# Hexis credentials — the Jupiter API key and the arb metrics string. Hexis gives
+# both to each operator; neither is kept in this repository. Each is taken from
+# the first of: the flag (--hexis-jup-key, --hexis-metrics-config), the
+# environment (HEXIS_JUP_KEY, SOLANA_METRICS_CONFIG_ARB), or hexis.env beside the
+# scripts, which git ignores (hexis.env.example shows the format). A value given
+# as "" is a decision to go without it; one never given at all is an error where
+# it is needed, so a host is not set up without it by accident.
+HEXIS_ENV_FILE="${HEXIS_ENV_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hexis.env}"
+
+# hexis_env_value <NAME> — the value of NAME=... in hexis.env, quotes stripped.
+# The file is read, never sourced. Fails when the file or the name is absent.
+hexis_env_value() {
+  local line value
+  [[ -f "$HEXIS_ENV_FILE" ]] || return 1
+  line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$1=" "$HEXIS_ENV_FILE" | tail -1) || return 1
+  [[ -n "$line" ]] || return 1
+  value="${line#*=}"
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  printf '%s' "$value"
+}
+
+HEXIS_JUP_KEY_SET=false
+if [[ -n "${HEXIS_JUP_KEY+x}" ]]; then
+  HEXIS_JUP_KEY_SET=true
+elif HEXIS_JUP_KEY=$(hexis_env_value HEXIS_JUP_KEY); then
+  HEXIS_JUP_KEY_SET=true
+else
+  HEXIS_JUP_KEY=""
+fi
+
+HEXIS_METRICS_CONFIG_SET=false
+if [[ -n "${SOLANA_METRICS_CONFIG_ARB+x}" ]]; then
+  HEXIS_METRICS_CONFIG="$SOLANA_METRICS_CONFIG_ARB"; HEXIS_METRICS_CONFIG_SET=true
+elif HEXIS_METRICS_CONFIG=$(hexis_env_value SOLANA_METRICS_CONFIG_ARB); then
+  HEXIS_METRICS_CONFIG_SET=true
+else
+  HEXIS_METRICS_CONFIG=""
+fi
+
+# hexis_require_credentials <jup-key: yes|no> — stop when a credential the run
+# is about to write to the host was never given. The Jupiter key is only needed
+# when arb-config.toml is generated, not when one is uploaded.
+hexis_require_credentials() {
+  local missing=()
+  [[ "$1" == "yes" ]] && ! $HEXIS_JUP_KEY_SET && missing+=("the Jupiter API key: --hexis-jup-key <key> or HEXIS_JUP_KEY")
+  $HEXIS_METRICS_CONFIG_SET || missing+=("the arb metrics string: --hexis-metrics-config <str> or SOLANA_METRICS_CONFIG_ARB")
+  [[ ${#missing[@]} -eq 0 ]] && return 0
+  log_error "Hexis credentials are not kept in this repository. Missing:"
+  local m
+  for m in "${missing[@]}"; do log_error "  - $m"; done
+  log_error "Put them in ${HEXIS_ENV_FILE} (see hexis.env.example) to give them once."
+  log_error "Hexis hands both to its operators. Pass \"\" to set up without one."
+  return 1
+}
 
 # [engine]
 HEXIS_PROGRAM_ID="FQXqWuMPdQ7PzPu5y7eJSFBrNQ6WQL5KWzNQ6pLNBfdq"

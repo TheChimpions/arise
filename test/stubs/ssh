@@ -10,6 +10,13 @@
 args="$*"
 [[ -n "${STUB_LOG:-}" ]] && printf '%s\n' "$args" >> "$STUB_LOG"
 
+# The probe for passwordless sudo. A stubbed host asks for a password unless the
+# test says otherwise with STUB_SUDO_NOPASS=1.
+if [[ "$args" == *"sudo -k -n true" ]]; then
+  [[ "${STUB_SUDO_NOPASS:-}" == "1" ]] && exit 0
+  exit 1
+fi
+
 respond() {   # <file> <text to match>
   local pattern output
   [[ -n "$1" && -f "$1" ]] || return 1
