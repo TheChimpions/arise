@@ -14,7 +14,7 @@ Scripts that take a Solana validator from a bare Ubuntu server to a running node
 | Script | What it is | What it does |
 |---|---|---|
 | `system.sh` | The System: status window and quests | **Start here for any server that already runs a validator.** Reports what the host runs and routes each move to the script that owns it |
-| `arise.sh` | Raising a new shadow soldier | Turns a fresh server into a validator: disks, kernel tuning, Jito build or Hexis binary, region detection, systemd, firewall, jag-snap |
+| `arise.sh` | Raising a new shadow soldier | Turns a fresh server into a validator: disks, kernel tuning, Jito build or Hexis binary, region detection, systemd, firewall, perch watchtower |
 | `ascend.sh` | Levelling up | Upgrades the Hexis Agave client, or moves a Jito / plain Agave validator onto it |
 | `reawaken.sh` | A Re-Awakening | Moves a running validator onto Firedancer with the Hexis Concorde, upgrades it there, and takes it back |
 
@@ -85,6 +85,7 @@ A server with no validator yet is the one case `system.sh` does not run for you:
 - **Nothing sensitive is written to disk in transit.** Scripts and the sudo password go to the server over SSH stdin. Nothing lands in `/tmp`, no password appears in a process list, and keypairs are created mode 600 from the first byte. This is `lib/remote.sh`, shared by `arise.sh`, `ascend.sh` and `reawaken.sh`.
 - **Nothing GitHub-related goes on the server.** Public clients are cloned over HTTPS. Private releases (Hexis, Firedancer) are downloaded on your machine with `gh`, checksum-verified, and streamed up.
 - **Security updates stay on.** `unattended-upgrades` is enabled and `sol.service` is excluded from automatic restarts. CPU mitigations stay on. Both can be traded for performance with `--disable-auto-updates` and `--disable-cpu-mitigations`.
+- **Nothing from the network is piped into a shell.** The Rust installer is a pinned release checked against a recorded SHA-256, and perch's installer is checked against its release checksums before it runs. [SECURITY.md](SECURITY.md) lists everything that is downloaded and how each is checked, including the one item that is not.
 - **Every remote step is checked.** If any command on the server fails, the script stops with a non-zero exit instead of carrying on.
 
 ### Upgrading a server set up by an older version
@@ -140,6 +141,19 @@ Leave `--client-version` off and the script lists recent release tags to pick fr
 
 **Firedancer from scratch.** `arise.sh` provisions the host and writes `validator.sh` as the record of the validator's settings (identity, vote account, entrypoints, Block Engine, shred receivers), leaves `sol.service` disabled, then runs `reawaken.sh stage` for you — the same staging a migrated host gets. Staging starts nothing. Start it with `./reawaken.sh cutover --host <host> --ssh-key <key>`: with nothing running there is nothing to stop, so it checks the config, asks once and starts `firedancer.service`. Pass `--hexis-signer <signing_key.json>` to use the arb signer Hexis issued; otherwise one is generated. There is no Agave client on such a host, so `reawaken.sh rollback` has nothing to go back to until you install one beside Firedancer — see [Changing client](#changing-client-on-a-host-that-already-runs-one).
 
+**Jito on either network.** `--client jito` writes the Block Engine URL, shred receiver,
+tip programs and merkle root upload authority for the network you chose: testnet has its
+own set of all of them, and no DoubleZero shred receiver. The values are Jito's, copied
+into `arise.sh` with the date and the page they came from; check them against
+[Jito's on-chain addresses](https://jito-foundation.gitbook.io/mev/mev-payment-and-distribution/on-chain-addresses)
+before a mainnet install. The merkle root upload authority is Jito's, so Jito runs the
+tip airdrop and claim for your stakers.
+
+A validator set up by an older copy of this script carries the previous mainnet
+authority, `GZctHpWX…xDib`, in its `validator.sh`. Jito now publishes `8F4jGUmx…g8Xt`.
+Compare yours with the page above and ask Jito if you are unsure which your stakers'
+claims depend on.
+
 ### Flags
 
 **Required:**
@@ -150,7 +164,7 @@ Leave `--client-version` off and the script lists recent release tags to pick fr
 | `--ssh-key`        | Path to SSH private key                                                                                                                                                                                                  |
 | `--identity`       | Path to `staked_identity.json`                                                                                                                                                                                           |
 | `--vote-account`   | Vote account pubkey                                                                                                                                                                                                      |
-| `--commission-bps` | **Jito** commission in basis points — the cut of Jito MEV tips taken via the tip distribution program (mainnet only, e.g. `0` = 0%, `500` = 5%). This is the Jito tip commission, **not** the validator vote commission. |
+| `--commission-bps` | **Jito** commission in basis points — the cut of Jito MEV tips taken via the tip distribution program (e.g. `0` = 0%, `500` = 5%; asked for on mainnet, 0 on testnet unless given). This is the Jito tip commission, **not** the validator vote commission. |
 
 **Access:**
 
@@ -854,7 +868,7 @@ sudo ~/firedancer/firedancer wait --config ~/firedancer/config.toml --min-idle-s
 system.sh          report what a host runs and route a goal to the script that owns it
 arise.sh           provision a fresh server into a validator
 ascend.sh          upgrade / migrate / promote the Hexis Agave client on an existing server
-reawaken.sh        stage / cutover / rollback / upgrade / status for Firedancer
+reawaken.sh        stage / cutover / rollback / upgrade / unit / status for Firedancer
 lib/remote.sh      how every script reaches a server: admin user for sudo, scripts and
                    passwords over SSH stdin, strict error handling
 lib/hexis.sh       shared Hexis defaults, logging, config rendering, checksum verification,

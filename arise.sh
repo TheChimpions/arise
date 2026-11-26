@@ -132,9 +132,34 @@ PERCH_VERSION="latest"
 PERCH_LABEL=""
 PERCH_REPO="TheChimpions/perch-watchtower"
 
+# The rustup installer, pinned. Checksums as published 2026-11-25 beside each
+# file at https://static.rust-lang.org/rustup/archive/<version>/<target>/rustup-init.sha256
+# To move to a newer rustup, change all three together.
+RUSTUP_VERSION="1.29.3"
+RUSTUP_SHA256_X86_64="b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55"
+RUSTUP_SHA256_AARCH64="9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282"
+
 # ---------------------------------------------------------------------------
-# Jito region configs: REGION|BLOCK_ENGINE_URL|SHRED_RECEIVER|NTP_SERVER
+# Jito values. These are other people's addresses, copied in: check them against
+# the source before trusting a default that is years old.
+#
+# On-chain addresses, as published 2026-11-25 at
+#   https://jito-foundation.gitbook.io/mev/mev-payment-and-distribution/on-chain-addresses
+# The merkle root upload authority is the account allowed to post each epoch's
+# tip distribution for this validator. Set to Jito's, Jito runs the airdrop and
+# claim for your stakers; set to anything else, you run it yourself.
 # ---------------------------------------------------------------------------
+JITO_TIP_PAYMENT_MAINNET="T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt"
+JITO_TIP_DISTRIBUTION_MAINNET="4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7"
+JITO_MERKLE_AUTHORITY_MAINNET="8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt"
+JITO_TIP_PAYMENT_TESTNET="GJHtFqM9agxPmkeKjHny6qiRKrXZALvvFGiKf11QE7hy"
+JITO_TIP_DISTRIBUTION_TESTNET="DzvGET57TAgEDxvm3ERUM4GNcsAJdqjDLCne9sdfY4wf"
+JITO_MERKLE_AUTHORITY_TESTNET="7T4inmPmtNBX3MhLwJ9hFsSMnGJYYkKioVABSNTWVRuS"
+# DoubleZero's edge multicast group, a second shred receiver on mainnet
+DOUBLEZERO_SHRED_RECEIVER="233.84.178.1:7733"
+
+# Region configs: REGION|BLOCK_ENGINE_URL|SHRED_RECEIVER|NTP_SERVER
+# As published 2026-11-25 at https://docs.jito.wtf/lowlatencytxnsend/#api
 MAINNET_REGIONS=(
   "amsterdam|https://amsterdam.mainnet.block-engine.jito.wtf|74.118.140.240:1002|ntp.amsterdam.jito.wtf"
   "dublin|https://dublin.mainnet.block-engine.jito.wtf|64.130.61.8:1002|ntp.dublin.jito.wtf"
@@ -985,7 +1010,7 @@ if [[ -n "$JITO_REGION" ]]; then
   log_info "NTP server:       $JITO_NTP_SERVER"
 fi
 
-# --- Prompt for commission if not provided (mainnet) ---
+# --- Prompt for commission if not provided (mainnet; testnet tips are worth nothing, so 0 unless given) ---
 if $USES_JITO && [[ "$NETWORK" == "mainnet" && -z "$COMMISSION_BPS" ]] && ! $DRY_RUN; then
   echo ""
   read -rp "Jito commission in basis points (cut of Jito MEV tips; e.g., 0 = 0%, 500 = 5%, 1000 = 10%) [0]: " COMMISSION_BPS
@@ -1536,7 +1561,7 @@ SCRIPT
 log_info "Step 6: Setting up sol user profile"
 $BUILD_FROM_SOURCE || log_info "Nothing is built from source — skipping the Rust toolchain"
 
-{ emit_vars BUILD_FROM_SOURCE; cat <<'SCRIPT'
+{ emit_vars BUILD_FROM_SOURCE RUSTUP_VERSION RUSTUP_SHA256_X86_64 RUSTUP_SHA256_AARCH64; cat <<'SCRIPT'
 touch ~/.profile ~/.bashrc
 
 # Solana binaries on PATH for interactive and login shells
@@ -1558,12 +1583,29 @@ if ! grep -q "LIBCLANG_PATH" ~/.profile; then
   echo 'export LIBCLANG_PATH=/usr/lib/llvm-18/lib' >> ~/.profile
 fi
 
-# Install Rust if not present
+# Install Rust if not present. The installer is a pinned rustup release, checked
+# against the checksum recorded in this script before it runs: nothing fetched
+# from the network is piped into a shell.
 if [ -x "$HOME/.cargo/bin/rustup" ]; then
   echo "Rust already installed"
 else
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-  echo "Rust installed"
+  case "$(uname -m)" in
+    x86_64)  RUSTUP_TARGET=x86_64-unknown-linux-gnu;  RUSTUP_SHA256="$RUSTUP_SHA256_X86_64" ;;
+    aarch64) RUSTUP_TARGET=aarch64-unknown-linux-gnu; RUSTUP_SHA256="$RUSTUP_SHA256_AARCH64" ;;
+    *) echo "ERROR: no pinned rustup installer for $(uname -m)" >&2; exit 1 ;;
+  esac
+  RUSTUP_TMP=$(mktemp -d)
+  curl --proto '=https' --tlsv1.2 -sSf -o "$RUSTUP_TMP/rustup-init" \
+    "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${RUSTUP_TARGET}/rustup-init"
+  if ! echo "${RUSTUP_SHA256}  $RUSTUP_TMP/rustup-init" | sha256sum -c - >/dev/null 2>&1; then
+    echo "ERROR: rustup-init ${RUSTUP_VERSION} does not match its recorded checksum — not running it" >&2
+    rm -rf "$RUSTUP_TMP"
+    exit 1
+  fi
+  chmod +x "$RUSTUP_TMP/rustup-init"
+  "$RUSTUP_TMP/rustup-init" -y
+  rm -rf "$RUSTUP_TMP"
+  echo "Rust installed (rustup ${RUSTUP_VERSION}, checksum verified)"
 fi
 
 # Ensure cargo env is sourced in profile
@@ -2256,13 +2298,12 @@ if [[ "$NETWORK" == "mainnet" ]]; then
 "
   done
   if $USES_JITO; then
-    # 233.84.178.1:7733 is the DoubleZero shred receiver
-    VALIDATOR_SCRIPT+="    --tip-payment-program-pubkey T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt \\
-    --tip-distribution-program-pubkey 4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7 \\
-    --merkle-root-upload-authority GZctHpWXmsZC1YHACTGGcHhYxjdRqQvTpYkb9LMvxDib \\
+    VALIDATOR_SCRIPT+="    --tip-payment-program-pubkey ${JITO_TIP_PAYMENT_MAINNET} \\
+    --tip-distribution-program-pubkey ${JITO_TIP_DISTRIBUTION_MAINNET} \\
+    --merkle-root-upload-authority ${JITO_MERKLE_AUTHORITY_MAINNET} \\
     --commission-bps ${COMMISSION_BPS:-0} \\
     --block-engine-url ${JITO_BLOCK_ENGINE:-<FILL_IN_BLOCK_ENGINE_URL>} \\
-    --shred-receiver-address ${JITO_SHRED_RECEIVER:-<FILL_IN_SHRED_RECEIVER_ADDRESS>},233.84.178.1:7733 \\
+    --shred-receiver-address ${JITO_SHRED_RECEIVER:-<FILL_IN_SHRED_RECEIVER_ADDRESS>},${DOUBLEZERO_SHRED_RECEIVER} \\
 "
   fi
   VALIDATOR_SCRIPT+="    --only-known-rpc \\
@@ -2292,6 +2333,16 @@ else
     VALIDATOR_SCRIPT+="    --known-validator $kv \\
 "
   done
+  if $USES_JITO; then
+    # Testnet has its own tip programs and authority, and no DoubleZero receiver
+    VALIDATOR_SCRIPT+="    --tip-payment-program-pubkey ${JITO_TIP_PAYMENT_TESTNET} \\
+    --tip-distribution-program-pubkey ${JITO_TIP_DISTRIBUTION_TESTNET} \\
+    --merkle-root-upload-authority ${JITO_MERKLE_AUTHORITY_TESTNET} \\
+    --commission-bps ${COMMISSION_BPS:-0} \\
+    --block-engine-url ${JITO_BLOCK_ENGINE:-<FILL_IN_BLOCK_ENGINE_URL>} \\
+    --shred-receiver-address ${JITO_SHRED_RECEIVER:-<FILL_IN_SHRED_RECEIVER_ADDRESS>} \\
+"
+  fi
   VALIDATOR_SCRIPT+="    --only-known-rpc \\
 "
   for ep in "${ENTRYPOINTS[@]}"; do
@@ -2626,6 +2677,14 @@ else
   BASE="https://github.com/$PERCH_REPO/releases/download/$PERCH_VERSION"
 fi
 curl --proto '=https' --tlsv1.2 -fsSL "$BASE/install.sh" -o "$WORK/install.sh"
+# The installer runs as root, so it is checked against the release's own
+# checksum list first. That catches a damaged or swapped file; it comes from the
+# same release, so it is not proof of who published it.
+curl --proto '=https' --tlsv1.2 -fsSL "$BASE/SHA256SUMS" -o "$WORK/SHA256SUMS"
+if ! (cd "$WORK" && grep -E '[[:space:]]\*?install\.sh$' SHA256SUMS | sha256sum -c - >/dev/null 2>&1); then
+  echo "ERROR: perch's install.sh does not match the checksum published with the release — not running it" >&2
+  exit 1
+fi
 
 # The admin user is added to the perch group so it can run 'perch maint'.
 # sol is deliberately not: the validator account must not be able to silence

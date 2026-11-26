@@ -314,6 +314,46 @@ group "clients and security model"
   it "the shred receivers are the Jito region and DoubleZero, nothing else"
   assert_contains "$out" "--shred-receiver-address 64.130.50.14:1002,233.84.178.1:7733 \\"
 
+  it "jito on mainnet gets the tip programs and merkle authority Jito publishes"
+  assert_contains "$out" "--tip-payment-program-pubkey T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt \\"
+  assert_contains "$out" "--tip-distribution-program-pubkey 4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7 \\"
+  assert_contains "$out" "--merkle-root-upload-authority 8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt \\"
+
+  it "the Agave and Firedancer paths name the same merkle authority"
+  assert_eq "$(grep -c "JITO_MERKLE_AUTHORITY_MAINNET=\"$(sed -n 's/^FD_TIP_DISTRIBUTION_AUTHORITY="\(.*\)"$/\1/p' "$ROOT/lib/firedancer.sh")\"" "$ROOT/arise.sh")" "1"
+
+  tn_out="$(STUB_RESPONSES=$F/host-fresh.responses arise --host 1.2.3.4 --vote-account "$PK" --network testnet \
+        --jito-region dallas --no-auto-disks --no-xdp --dry-run --ssh-key "$WORK/key" --identity "$WORK/id.json")"
+  it "jito on testnet gets the testnet Block Engine and shred receiver"
+  assert_contains "$tn_out" "--block-engine-url https://dallas.testnet.block-engine.jito.wtf \\"
+  assert_contains "$tn_out" "--shred-receiver-address 141.98.218.12:1002 \\"
+
+  it "and the testnet tip programs and merkle authority, not the mainnet ones"
+  assert_contains "$tn_out" "--tip-payment-program-pubkey GJHtFqM9agxPmkeKjHny6qiRKrXZALvvFGiKf11QE7hy \\"
+  assert_contains "$tn_out" "--tip-distribution-program-pubkey DzvGET57TAgEDxvm3ERUM4GNcsAJdqjDLCne9sdfY4wf \\"
+  assert_contains "$tn_out" "--merkle-root-upload-authority 7T4inmPmtNBX3MhLwJ9hFsSMnGJYYkKioVABSNTWVRuS \\"
+  assert_not_contains "$tn_out" "T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt"
+
+  it "testnet takes no DoubleZero receiver and a commission of 0 unless one is given"
+  assert_not_contains "$tn_out" "233.84.178.1"
+  assert_contains "$tn_out" "--commission-bps 0 \\"
+
+  it "a testnet validator.sh still parses, with the Jito flags inside the one command"
+  tn_vsh="$(printf '%s\n' "$tn_out" | sed -n '/^#!\/bin\/bash$/,/--full-rpc-api$/p')"
+  assert_contains "$tn_vsh" "--full-rpc-api"
+  assert_eq "$(printf '%s\n' "$tn_vsh" | bash -n 2>&1 && echo parses)" "parses"
+  assert_eq "$(printf '%s\n' "$tn_vsh" | grep -c '^exec ')" "1"
+
+  it "agave on testnet gets no Jito flags"
+  assert_not_contains "$(STUB_RESPONSES=$F/host-fresh.responses arise --host 1.2.3.4 --vote-account "$PK" --network testnet --client agave \
+        --no-auto-disks --no-xdp --dry-run --ssh-key "$WORK/key" --identity "$WORK/id.json")" "--block-engine-url"
+
+  it "rustup is a pinned release checked against a recorded checksum, never piped into a shell"
+  assert_eq "$(grep -cE 'curl[^|]*\|[[:space:]]*(sh|bash)([[:space:]]|$)' "$ROOT/arise.sh" "$ROOT/ascend.sh" "$ROOT/reawaken.sh" "$ROOT/system.sh" "$ROOT"/lib/*.sh | awk -F: '{n+=$2} END {print n}')" "0"
+  assert_contains "$out" "static.rust-lang.org/rustup/archive/\${RUSTUP_VERSION}/"
+  assert_contains "$out" "sha256sum -c -"
+  assert_order "$out" "sha256sum -c -" '"$RUSTUP_TMP/rustup-init" -y'
+
   it "RPC stays on localhost and out of gossip"
   assert_contains "$out" "--private-rpc"
 
@@ -413,6 +453,32 @@ group "clients and security model"
   assert_eq "$(grep -c '^\[\[hosts\]\]' "$ne_dir/new.toml")" "1"
   assert_file_missing "$ne_dir/apt.calls"
   rm -rf "$ne_dir"
+
+  # perch's installer runs as root: the lines that check it first, lifted from
+  # the dry run and run against scratch files
+  pi_dir="$(mktemp -d)"; mkdir "$pi_dir/bin"
+  command -v sha256sum >/dev/null 2>&1 || { printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > "$pi_dir/bin/sha256sum"; chmod +x "$pi_dir/bin/sha256sum"; }
+  pi_check="$(printf '%s\n' "$out" | sed -n '/^if ! (cd "\$WORK" && grep -E .*install/,/^fi$/p')"
+  pi_run() { ( PATH="$pi_dir/bin:$PATH"; WORK="$pi_dir"; eval "$pi_check"; echo "ran the installer" ) 2>&1; }
+  printf '#!/bin/sh\necho perch installer\n' > "$pi_dir/install.sh"
+  pi_sum="$(PATH="$pi_dir/bin:$PATH" sha256sum "$pi_dir/install.sh" | cut -d' ' -f1)"
+
+  it "the dry run checks perch's installer against the release checksums before running it"
+  assert_order "$out" 'SHA256SUMS | sha256sum -c -' 'bash "$WORK/install.sh" --version'
+
+  printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "perch-x86_64-unknown-linux-musl.tar.gz" "$pi_sum" "install.sh" > "$pi_dir/SHA256SUMS"
+  it "an installer that matches its published checksum is run"
+  assert_eq "$(pi_run)" "ran the installer"
+
+  echo "echo tampered" >> "$pi_dir/install.sh"
+  it "an installer that does not match is not run"
+  assert_contains "$(pi_run)" "does not match the checksum published with the release"
+  assert_not_contains "$(pi_run)" "ran the installer"
+
+  printf '%s  %s\n' "$pi_sum" "perch-x86_64-unknown-linux-musl.tar.gz" > "$pi_dir/SHA256SUMS"
+  it "nor is one the checksum list does not mention at all"
+  assert_not_contains "$(pi_run)" "ran the installer"
+  rm -rf "$pi_dir"
 
   it "--no-perch skips it"
   assert_contains "$(arise "${cl_base[@]}" --no-xdp --no-perch)" "Skipping perch watchtower"
