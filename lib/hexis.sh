@@ -86,10 +86,75 @@ else
   HEXIS_METRICS_CONFIG=""
 fi
 
-# hexis_require_credentials <jup-key: yes|no> — stop when a credential the run
-# is about to write to the host was never given. The Jupiter key is only needed
-# when arb-config.toml is generated, not when one is uploaded.
+# hexis_can_prompt — true when a person is there to answer: a terminal on both
+# ends and no --yes. HEXIS_ASSUME_TTY=1 stands in for the terminal in tests.
+hexis_can_prompt() {
+  [[ "${ASSUME_YES:-false}" == true ]] && return 1
+  [[ "${HEXIS_ASSUME_TTY:-}" == 1 ]] && return 0
+  [[ -t 0 && -t 2 ]]
+}
+
+# hexis_save_credential <NAME> <value> — put NAME="value" in hexis.env, replacing
+# an earlier line for the same name. The file is only ever readable by its owner.
+hexis_save_credential() {
+  local name="$1" value="$2" tmp
+  tmp=$(mktemp "${HEXIS_ENV_FILE}.XXXXXX") || return 1
+  if [[ -f "$HEXIS_ENV_FILE" ]]; then
+    grep -v -E "^[[:space:]]*(export[[:space:]]+)?${name}=" "$HEXIS_ENV_FILE" > "$tmp" || true
+  fi
+  printf '%s="%s"\n' "$name" "$value" >> "$tmp"
+  chmod 600 "$tmp" && mv "$tmp" "$HEXIS_ENV_FILE"
+}
+
+# hexis_ask_credential <NAME> <what> [pattern] — ask for one credential without
+# echoing it, offer to keep it in hexis.env, and leave it in HEXIS_ASKED. Enter
+# alone is the decision to go without. A value that does not match the pattern
+# is asked for again.
+HEXIS_ASKED=""
+hexis_ask_credential() {
+  local name="$1" what="$2" pattern="${3:-}" value save
+  while :; do
+    printf 'Enter %s (input is hidden; Enter alone to set up without it): ' "$what" >&2
+    IFS= read -rs value || { echo "" >&2; return 1; }
+    echo "" >&2
+    value="${value%$'\r'}"
+    value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
+    [[ -z "$value" || -z "$pattern" || "$value" =~ $pattern ]] && break
+    log_warn "That does not look like ${what} — expected the form ${4:-$pattern}"
+  done
+  [[ -z "$value" ]] && log_warn "Going without ${what}"
+  printf 'Save it to %s for next time? [Y/n] ' "$HEXIS_ENV_FILE" >&2
+  IFS= read -r save || save="n"
+  case "$save" in
+    n|N|no|No|NO) ;;
+    *) if hexis_save_credential "$name" "$value"; then
+         log_info "Saved to ${HEXIS_ENV_FILE} (readable only by you; git ignores it)"
+       else
+         log_warn "Could not write ${HEXIS_ENV_FILE} — using it for this run only"
+       fi ;;
+  esac
+  HEXIS_ASKED="$value"
+}
+
+# hexis_require_credentials <jup-key: yes|no> — make sure every credential the
+# run is about to write to the host was given. At a terminal a missing one is
+# asked for; anywhere else the run stops. The Jupiter key is only needed when
+# arb-config.toml is generated, not when one is uploaded. The metrics string is
+# the same one for every Hexis host, so it is asked for once per laptop.
 hexis_require_credentials() {
+  if hexis_can_prompt; then
+    if [[ "$1" == "yes" ]] && ! $HEXIS_JUP_KEY_SET; then
+      log_info "Hexis credentials are not kept in this repository; Hexis hands them to its operators."
+      hexis_ask_credential HEXIS_JUP_KEY "the Jupiter API key" || return 1
+      HEXIS_JUP_KEY="$HEXIS_ASKED"; HEXIS_JUP_KEY_SET=true
+    fi
+    if ! $HEXIS_METRICS_CONFIG_SET; then
+      hexis_ask_credential SOLANA_METRICS_CONFIG_ARB "the arb metrics string" \
+        '^host=[^,]+,db=[^,]+,u=[^,]+,p=.+$' 'host=...,db=...,u=...,p=...' || return 1
+      HEXIS_METRICS_CONFIG="$HEXIS_ASKED"; HEXIS_METRICS_CONFIG_SET=true
+    fi
+    return 0
+  fi
   local missing=()
   [[ "$1" == "yes" ]] && ! $HEXIS_JUP_KEY_SET && missing+=("the Jupiter API key: --hexis-jup-key <key> or HEXIS_JUP_KEY")
   $HEXIS_METRICS_CONFIG_SET || missing+=("the arb metrics string: --hexis-metrics-config <str> or SOLANA_METRICS_CONFIG_ARB")
@@ -97,7 +162,8 @@ hexis_require_credentials() {
   log_error "Hexis credentials are not kept in this repository. Missing:"
   local m
   for m in "${missing[@]}"; do log_error "  - $m"; done
-  log_error "Put them in ${HEXIS_ENV_FILE} (see hexis.env.example) to give them once."
+  log_error "Put them in ${HEXIS_ENV_FILE} (see hexis.env.example) to give them once,"
+  log_error "or run this at a terminal without --yes and it asks for them and saves them."
   log_error "Hexis hands both to its operators. Pass \"\" to set up without one."
   return 1
 }
@@ -421,6 +487,98 @@ EOF
 
 # The Hexis builds, Agave and Firedancer alike, exist for mainnet only.
 MAINNET_GENESIS_HASH="5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+
+# perch reads what Firedancer says about itself — voting, replay, turbine, tile
+# heartbeats, how full the accounts index is — from Firedancer's metrics port,
+# when the [[hosts]] entry for the machine carries firedancer_url. That key
+# arrived in this perch release; an older perch refuses a config that has it.
+PERCH_FIREDANCER_MIN="1.6.0"
+
+# perch_firedancer_on_cmd <user> <firedancer config> — root shell text that
+# points the perch on this host at its Firedancer's metrics. Says nothing on a
+# host without perch. Leaves the config alone, and says why, when perch is too
+# old, when no [[hosts]] entry is clearly this machine, or when perch itself
+# turns the new config down.
+perch_firedancer_on_cmd() {
+  perch_cfg_line "$1"
+  printf 'perch_bin="/home/%s/bin/perch"; [ -x "$perch_bin" ] || perch_bin=$(command -v perch 2>/dev/null || true)\n' "$1"
+  printf 'perch_fd_config="%s"; perch_fd_min="%s"\n' "$2" "$PERCH_FIREDANCER_MIN"
+  cat <<'PERCH'
+if [ -f "$perch_cfg" ] && [ -n "$perch_bin" ]; then
+  # A perch in the validator user's home is that user's file: run it as them,
+  # never as root. Its config names secrets held in the unit's environment
+  # file, which is read line by line here and never run.
+  perch_owner=$(stat -c %U "$perch_bin" 2>/dev/null || true)
+  perch_env=$(systemctl show -p EnvironmentFiles --value perch 2>/dev/null | awk '{ print $1; exit }')
+  perch_run() {
+    (
+      if [ -n "$perch_env" ] && [ -f "$perch_env" ]; then
+        while IFS='=' read -r perch_k perch_v; do
+          case "$perch_k" in ""|\#*) continue ;; esac
+          perch_v="${perch_v#\"}"; perch_v="${perch_v%\"}"
+          export "$perch_k=$perch_v" 2>/dev/null || true
+        done < "$perch_env"
+      fi
+      case "$perch_owner" in
+        ""|root) "$perch_bin" "$@" ;;
+        *) runuser -u "$perch_owner" -- "$perch_bin" "$@" ;;
+      esac
+    )
+  }
+  perch_ver=$(perch_run --version 2>/dev/null | awk '{ print $2; exit }')
+  perch_fd_addr=$(awk '/^[[:space:]]*\[/ { s = ($1 == "[tiles.metric]") } s && $1 == "prometheus_listen_address" { gsub(/"/, "", $3); print $3; exit }' "$perch_fd_config" 2>/dev/null)
+  perch_fd_port=$(awk '/^[[:space:]]*\[/ { s = ($1 == "[tiles.metric]") } s && $1 == "prometheus_listen_port" { print $3; exit }' "$perch_fd_config" 2>/dev/null)
+  case "$perch_fd_addr" in ""|0.0.0.0) perch_fd_addr="127.0.0.1" ;; esac
+  perch_fd_url="http://${perch_fd_addr}:${perch_fd_port:-7999}/metrics"
+  if grep -q "^[[:space:]]*firedancer_url[[:space:]]*=[[:space:]]*\"${perch_fd_url}\"" "$perch_cfg"; then
+    echo "perch: already reads Firedancer's metrics at ${perch_fd_url}"
+  elif [ "$(printf '%s\n' "$perch_fd_min" "${perch_ver:-0}" | sort -V | head -1)" != "$perch_fd_min" ]; then
+    echo "perch: ${perch_ver:-this version} cannot read Firedancer's metrics — that needs perch ${perch_fd_min} or newer. Upgrade perch, then run cutover again."
+  else
+    # The entry for this machine: the only one there is, or the only one whose
+    # node_exporter is on loopback. The new line goes right under its url.
+    cp -p "$perch_cfg" "$perch_cfg.new"
+    awk -v fd="$perch_fd_url" '
+      NR == FNR {
+        if ($0 ~ /^[[:space:]]*\[/) { cur = 0; if ($0 ~ /^[[:space:]]*\[\[hosts\]\]/) cur = ++n }
+        else if (cur && $0 ~ /^[[:space:]]*url[[:space:]]*=.*(127\.0\.0\.1|localhost|\[::1\])/) { if (!islocal[cur]++) { nlocal++; pick_local = cur } }
+        next
+      }
+      FNR == 1 { pick = (n == 1) ? 1 : (nlocal == 1 ? pick_local : 0); cur = 0; n = 0 }
+      $0 ~ /^[[:space:]]*\[/ { cur = 0; if ($0 ~ /^[[:space:]]*\[\[hosts\]\]/) cur = ++n }
+      cur && cur == pick && $0 ~ /^[[:space:]]*firedancer_url[[:space:]]*=/ { next }
+      { print }
+      cur && cur == pick && !done && $0 ~ /^[[:space:]]*url[[:space:]]*=/ { print "firedancer_url = \"" fd "\""; done = 1 }
+      END { exit done ? 0 : 3 }' "$perch_cfg" "$perch_cfg" > "$perch_cfg.new" && perch_fd_set=yes || perch_fd_set=no
+    if [ "$perch_fd_set" = no ]; then
+      echo "perch: no [[hosts]] entry in $perch_cfg is clearly this machine — add this line to the right one yourself: firedancer_url = \"${perch_fd_url}\""
+    elif perch_run --config "$perch_cfg" --check-config >/dev/null 2>&1 && ! perch_run --config "$perch_cfg.new" --check-config >/dev/null 2>&1; then
+      echo "perch: it turned down the config with firedancer_url in it — left as it was"
+    else
+      cat "$perch_cfg.new" > "$perch_cfg"
+      systemctl try-restart perch 2>/dev/null || true
+      echo "perch: now reads Firedancer's metrics at ${perch_fd_url}"
+    fi
+    rm -f "$perch_cfg.new"
+  fi
+fi
+PERCH
+}
+
+# perch_firedancer_off_cmd <user> — the way back, for a host returning to Agave,
+# where nothing answers on that port and perch would page for it.
+perch_firedancer_off_cmd() {
+  perch_cfg_line "$1"
+  cat <<'PERCH'
+if [ -f "$perch_cfg" ] && grep -q '^[[:space:]]*firedancer_url[[:space:]]*=' "$perch_cfg"; then
+  grep -v '^[[:space:]]*firedancer_url[[:space:]]*=' "$perch_cfg" > "$perch_cfg.new"
+  cat "$perch_cfg.new" > "$perch_cfg"
+  rm -f "$perch_cfg.new"
+  systemctl try-restart perch 2>/dev/null || true
+  echo "perch: no longer reads Firedancer's metrics"
+fi
+PERCH
+}
 
 # perch_local_rpc_dead_cmd <user> — shell text that prints yes when perch has an
 # RPC endpoint on this machine that nothing listens on, no otherwise. Only the

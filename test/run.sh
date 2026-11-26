@@ -463,6 +463,7 @@ fi
 # === Hexis credentials ======================================================
 if should_run "credentials"; then
 group "Hexis credentials (never in the repository)"
+  F="$ROOT/test/fixtures"
   hexis_args=("${arise_base[@]}" --ssh-key "$WORK/key" --identity "$WORK/id.json"
               --hexis --hexis-binary "$WORK/binary" --hexis-signer "$WORK/signer.json")
   touch "$WORK/key" "$WORK/id.json" "$WORK/binary" "$WORK/signer.json"
@@ -521,6 +522,63 @@ group "Hexis credentials (never in the repository)"
   out="$(no_creds ascend upgrade --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary" --dry-run)"
   it "ascend upgrade, which writes neither, does not ask for them"
   assert_not_contains "$out" "Hexis credentials are not kept"
+
+  # At a terminal the missing ones are asked for. HEXIS_ASSUME_TTY stands in for
+  # the terminal; the answers are: key, save?, metrics string, save?
+  ask_env="$WORK/asked/hexis.env"; mkdir -p "$WORK/asked"
+  asking() { ( unset HEXIS_JUP_KEY SOLANA_METRICS_CONFIG_ARB; HEXIS_ASSUME_TTY=1 HEXIS_ENV_FILE="$ask_env" "$@" ); }
+  ask_metrics='host=https://asked,db=d,u=u,p=asked-pw'
+
+  out="$(printf '%s\n' 'asked-key' 'y' "$ask_metrics" '' | STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" 2>&1)"; rc=$?
+  it "at a terminal arise asks for the missing credentials and uses the answers"
+  assert_eq "$rc" "0"
+  assert_contains "$out" 'jup_key        = "asked-key"'
+  assert_contains "$out" "export SOLANA_METRICS_CONFIG_ARB=\"${ask_metrics}\""
+
+  it "the answers are saved to hexis.env, readable only by the owner"
+  assert_eq "$(cat "$ask_env")" "$(printf '%s\n' 'HEXIS_JUP_KEY="asked-key"' "SOLANA_METRICS_CONFIG_ARB=\"${ask_metrics}\"")"
+  assert_eq "$(find "$ask_env" -perm 600 | wc -l | tr -d ' ')" "1"
+
+  out="$(STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" </dev/null 2>&1)"; rc=$?
+  it "the next run reads the saved file and asks nothing"
+  assert_eq "$rc" "0"
+  assert_not_contains "$out" "Enter the"
+  assert_contains "$out" 'jup_key        = "asked-key"'
+
+  rm -f "$ask_env"
+  out="$(printf '%s\n' 'once-key' 'n' "$ask_metrics" 'n' | STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" 2>&1)"
+  it "answering no to saving uses the value for this run only"
+  assert_contains "$out" 'jup_key        = "once-key"'
+  assert_file_missing "$ask_env"
+
+  printf '%s\n' '# from Hexis' 'HEXIS_JUP_KEY="old-key"' > "$ask_env"; chmod 644 "$ask_env"
+  out="$(printf '%s\n' "$ask_metrics" 'y' | STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" 2>&1)"
+  it "only the missing one is asked for, and the rest of hexis.env is kept"
+  assert_not_contains "$out" "Enter the Jupiter API key"
+  assert_eq "$(cat "$ask_env")" "$(printf '%s\n' '# from Hexis' 'HEXIS_JUP_KEY="old-key"' "SOLANA_METRICS_CONFIG_ARB=\"${ask_metrics}\"")"
+  assert_eq "$(find "$ask_env" -perm 600 | wc -l | tr -d ' ')" "1"
+
+  rm -f "$ask_env"
+  out="$(printf '%s\n' '' 'y' 'not-a-metrics-string' "$ask_metrics" 'y' | STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" 2>&1)"; rc=$?
+  it "Enter alone goes without the key and that choice is saved"
+  assert_eq "$rc" "0"
+  assert_contains "$out" "No Jupiter API key"
+  assert_contains "$(cat "$ask_env")" 'HEXIS_JUP_KEY=""'
+
+  it "a metrics string in the wrong form is asked for again"
+  assert_contains "$out" "does not look like the arb metrics string"
+  assert_contains "$out" "export SOLANA_METRICS_CONFIG_ARB=\"${ask_metrics}\""
+
+  it "what is typed is never printed back"
+  out="$(printf '%s\n' 'secret-key-value' 'n' "$ask_metrics" 'n' | STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" --dry-run 2>&1 | grep -v 'jup_key  \|SOLANA_METRICS_CONFIG_ARB' | grep -c 'secret-key-value\|asked-pw')"
+  assert_eq "$out" "0"
+
+  rm -f "$ask_env"
+  out="$(printf '%s\n' 'k' 'y' | asking ascend migrate --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary" --dry-run --yes 2>&1)"; rc=$?
+  it "--yes never asks: a missing credential still stops the run"
+  assert_eq "$rc" "1"
+  assert_contains "$out" "Hexis credentials are not kept in this repository"
+  assert_file_missing "$ask_env"
 fi
 
 # === flash loans ============================================================
@@ -781,6 +839,107 @@ group "XDP / PoH flag rename"
   it "ascend declares a restart to a system-wide perch through root, after the window"
   assert_order "$out" "wait-for-restart-window --min-idle-time 20" "perch --config /etc/perch/config.toml maint restart 1h"
   assert_contains "$out" "[DRY RUN] root script via monarch@1.2.3.4"
+
+  # --- perch reading Firedancer's metrics -----------------------------------
+  # A perch that answers --version with $PERCH_VER and turns down any config
+  # holding the word in $PERCH_REJECT.
+  cat > "$pc_dir/bin/perch" <<'FAKE'
+#!/bin/sh
+case "$*" in
+  *--version*) echo "perch ${PERCH_VER} (abc1234)" ;;
+  *--check-config*) [ -z "${PERCH_REJECT:-}" ] || ! grep -q "$PERCH_REJECT" "$2" ;;
+esac
+FAKE
+  chmod +x "$pc_dir/bin/perch"
+  printf '%s\n' '[layout]' '    net_tile_count = 1' '' '[tiles.metric]' '    prometheus_listen_address = "10.1.2.3"' \
+    '    prometheus_listen_port = 7999' '' '[tiles.gui]' '    prometheus_listen_port = 1' > "$pc_dir/fd.toml"
+  fd_url='firedancer_url = "http://10.1.2.3:7999/metrics"'
+  pf_write() {
+    printf '%s\n' '[[endpoints]]' 'name = "public"' 'url = "https://rpc.example"' '' \
+      '[[hosts]]' 'name = "this-hw"' 'url = "http://127.0.0.1:9100/metrics"' 'mountpoints = ["/"]' '' \
+      '[checks.cluster_stake]' 'enabled = false' > "$pc_dir/config.toml"
+  }
+  pf_on()  { ( PATH="$pc_dir/bin:$PATH"; eval "$(perch_firedancer_on_cmd nobody-here "${1:-$pc_dir/fd.toml}" | sed "1s|.*|perch_cfg=\"$pc_dir/config.toml\"|")" ); }
+  pf_off() { ( PATH="$pc_dir/bin:$PATH"; eval "$(perch_firedancer_off_cmd nobody-here | sed "1s|.*|perch_cfg=\"$pc_dir/config.toml\"|")" ); }
+
+  pf_write; chmod 640 "$pc_dir/config.toml"
+  out="$(PERCH_VER=1.6.0 pf_on)"
+  it "a perch new enough is pointed at the address Firedancer serves its metrics on"
+  assert_contains "$out" "now reads Firedancer's metrics at http://10.1.2.3:7999/metrics"
+  assert_eq "$(grep -c 'firedancer_url' "$pc_dir/config.toml")" "1"
+
+  it "the line goes under the url of this machine's [[hosts]] entry"
+  assert_eq "$(grep -A1 '^url = "http://127.0.0.1:9100/metrics"' "$pc_dir/config.toml" | tail -1)" "$fd_url"
+
+  it "nothing else in the config changes, and it keeps its mode"
+  assert_eq "$(grep -v 'firedancer_url' "$pc_dir/config.toml")" "$(pf_write; cat "$pc_dir/config.toml")"
+  PERCH_VER=1.6.0 pf_on >/dev/null
+  assert_eq "$(stat -f '%Lp' "$pc_dir/config.toml" 2>/dev/null || stat -c '%a' "$pc_dir/config.toml")" "640"
+  assert_file_missing "$pc_dir/config.toml.new"
+
+  out="$(PERCH_VER=1.6.0 pf_on)"
+  it "running it again adds no second line"
+  assert_contains "$out" "already reads Firedancer's metrics"
+  assert_eq "$(grep -c 'firedancer_url' "$pc_dir/config.toml")" "1"
+
+  out="$(pf_off)"
+  it "going back to Agave takes the line out again"
+  assert_contains "$out" "no longer reads Firedancer's metrics"
+  assert_eq "$(cat "$pc_dir/config.toml")" "$(pf_write; cat "$pc_dir/config.toml")"
+
+  it "and says nothing when there was no such line"
+  assert_eq "$(pf_off)" ""
+
+  pf_write
+  out="$(PERCH_VER=1.5.4 pf_on)"
+  it "an older perch, which would refuse the key, is left alone and the reason given"
+  assert_contains "$out" "1.5.4 cannot read Firedancer's metrics"
+  assert_contains "$out" "needs perch 1.6.0 or newer"
+  assert_not_contains "$(cat "$pc_dir/config.toml")" "firedancer_url"
+
+  out="$(PERCH_VER=1.10.2 pf_on)"
+  it "versions are compared as versions: 1.10 is newer than 1.6"
+  assert_contains "$(cat "$pc_dir/config.toml")" "$fd_url"
+
+  pf_write
+  out="$(PERCH_VER=1.6.0 PERCH_REJECT=firedancer_url pf_on)"
+  it "a config perch itself turns down is not put in place"
+  assert_contains "$out" "turned down the config"
+  assert_not_contains "$(cat "$pc_dir/config.toml")" "firedancer_url"
+  assert_file_missing "$pc_dir/config.toml.new"
+
+  printf '%s\n' '[[hosts]]' 'name = "other"' 'url = "http://10.0.0.9:9100/metrics"' '' \
+    '[[hosts]]' 'name = "this-hw"' 'url = "http://127.0.0.1:9100/metrics"' '' '[quorum]' 'url = "x"' > "$pc_dir/config.toml"
+  PERCH_VER=1.6.0 pf_on >/dev/null
+  it "with several hosts, the one on loopback is this machine"
+  assert_eq "$(grep -B1 'firedancer_url' "$pc_dir/config.toml" | head -1)" 'url = "http://127.0.0.1:9100/metrics"'
+  assert_eq "$(grep -c 'firedancer_url' "$pc_dir/config.toml")" "1"
+
+  printf '%s\n' '[[hosts]]' 'url = "http://10.0.0.8:9100/metrics"' '' '[[hosts]]' 'url = "http://10.0.0.9:9100/metrics"' > "$pc_dir/config.toml"
+  out="$(PERCH_VER=1.6.0 pf_on)"
+  it "with several hosts and none on loopback, it does not guess"
+  assert_contains "$out" "no [[hosts]] entry"
+  assert_contains "$out" "$fd_url"
+  assert_not_contains "$(cat "$pc_dir/config.toml")" "firedancer_url"
+
+  printf '%s\n' '[[endpoints]]' 'url = "https://rpc.example"' > "$pc_dir/config.toml"
+  it "a perch that watches no host is left alone"
+  assert_contains "$(PERCH_VER=1.6.0 pf_on)" "no [[hosts]] entry"
+
+  pf_write
+  printf '%s\n' '[tiles.metric]' '    prometheus_listen_address = "0.0.0.0"' > "$pc_dir/fd-any.toml"
+  PERCH_VER=1.6.0 pf_on "$pc_dir/fd-any.toml" >/dev/null
+  it "metrics served on every address are read over loopback, on the default port"
+  assert_contains "$(cat "$pc_dir/config.toml")" 'firedancer_url = "http://127.0.0.1:7999/metrics"'
+
+  PERCH_VER=1.6.0 pf_on >/dev/null
+  it "a metrics address that changed replaces the old line"
+  assert_eq "$(grep 'firedancer_url' "$pc_dir/config.toml")" "$fd_url"
+
+  rm -f "$pc_dir/bin/perch"
+  pf_write
+  it "a host without perch hears nothing about it"
+  assert_eq "$(PATH="$pc_dir/bin:/usr/bin:/bin"; eval "$(perch_firedancer_on_cmd nobody-here "$pc_dir/fd.toml" | sed "1s|.*|perch_cfg=\"$pc_dir/config.toml\"|")")" ""
 
   rm -rf "$pc_dir"
 
@@ -1476,6 +1635,7 @@ group "reawaken.sh"
 
   it "cutover makes room for the 1 GiB pages before the start"
   assert_order "$out" "drop the page cache and compact memory" "systemctl start firedancer"
+  assert_order "$out" "point perch at Firedancer's metrics" "systemctl start firedancer"
 
   it "the dry run says a reboot may be offered"
   assert_contains "$out" "offer to reboot, then wait for Firedancer to come up"
@@ -1509,6 +1669,9 @@ group "reawaken.sh"
 
   it "and frees and compacts memory before it starts Firedancer"
   assert_order "$(cat "$WORK/plain.scripts")" "compact_memory" "systemctl start firedancer"
+
+  it "and points perch at Firedancer's own metrics before it starts"
+  assert_order "$(cat "$WORK/plain.scripts")" 'perch_fd_config="/home/sol/firedancer/config.toml"; perch_fd_min="1.6.0"' "systemctl start firedancer"
 
   it "and stops Agave before any of that"
   assert_order "$(cat "$WORK/plain.scripts")" "systemctl stop sol" 'perch_cfg="/home/sol/perch/config.toml"'
@@ -1624,6 +1787,14 @@ group "reawaken.sh"
 
   it "rollback releases Firedancer's huge pages before Agave starts"
   assert_contains "$out" "firedancer configure fini all"
+
+  live_cut="$(STUB_RESPONSES=$WORK/fd-live.responses reawaken cutover --host 1.2.3.4 --ssh-key "$WORK/key" --dry-run)"
+  it "cutover on a host already on Firedancer still points perch at its metrics"
+  assert_contains "$live_cut" "nothing to cut over"
+  assert_contains "$live_cut" "[DRY RUN] point perch at Firedancer's metrics, if the host runs perch 1.6.0 or newer"
+
+  it "rollback stops perch reading Firedancer's metrics"
+  assert_contains "$out" "[DRY RUN] stop perch reading Firedancer's metrics, if it was"
 
   it "rollback re-enables the Agave unit"
   assert_contains "$out" "systemctl enable sol; systemctl start sol"

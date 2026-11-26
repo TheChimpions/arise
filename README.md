@@ -284,9 +284,15 @@ them one of three ways, first match wins:
 3. `hexis.env` beside the scripts — copy `hexis.env.example`, fill it in once; git
    ignores it, and the scripts read it without running it
 
-`arise.sh --hexis` and `ascend.sh migrate` stop before touching the host when one was
-never given. Passing `""` is a decision to set up without it. With `--hexis-config` the
-Jupiter key is not asked for, since your file carries it.
+Give none of them and `arise.sh --hexis` and `ascend.sh migrate` **ask for what is
+missing** when run at a terminal. What you type is not shown, and each answer can be
+saved to `hexis.env` (mode 600) so you are asked once. The metrics string is the same
+for every Hexis host, so one `hexis.env` on your laptop serves all your servers.
+
+Without a terminal, or with `--yes`, nothing is asked: the run stops before touching the
+host when one was never given. Passing `""` — or pressing Enter alone at the prompt — is
+a decision to set up without it. With `--hexis-config` the Jupiter key is not asked for,
+since your file carries it.
 
 Example:
 
@@ -502,6 +508,17 @@ be told, the restart goes ahead and the script says it may page.
 A cutover to Firedancer also takes this host's own RPC out of perch's `[[endpoints]]`
 (Firedancer runs without RPC, so perch would never see the validator recover), keeps the
 old file as `config.toml.bak-pre-firedancer`, and restarts perch. `rollback` puts it back.
+
+The same cutover points perch at **Firedancer's own metrics**, when the host runs perch
+1.6.0 or newer: it adds `firedancer_url` to the `[[hosts]]` entry for this machine, using
+the address and port under `[tiles.metric]` in Firedancer's config. perch then reports
+what Firedancer says about itself — voting, replay, turbine, a hung tile, how full the
+accounts index is — which is the local view a validator without RPC otherwise lacks. No
+firewall change is needed: perch is on the same machine. An older perch refuses a config
+with that key, so it is left alone and you are told to upgrade it; run `cutover` again
+afterwards (on a host already on Firedancer it only does the leftover steps, this one
+included). The new config is checked with perch itself before it replaces the old one,
+and `rollback` takes the line out again.
 
 Neither enables the arb, and neither restarts the validator unless you pass `--restart`
 — which runs `exit` (wait for the restart window, then stop; systemd brings it back), and

@@ -585,11 +585,13 @@ fi"
     if $DRY_RUN; then
       $USES_JAG_SNAP && echo "[DRY RUN] stop the jag-snap container and close ${JAG_SNAP_PORT}/tcp, if still up"
       echo "[DRY RUN] drop this host's own RPC from perch's endpoints, if the host runs perch"
+      echo "[DRY RUN] point perch at Firedancer's metrics, if the host runs perch ${PERCH_FIREDANCER_MIN} or newer"
     else
       need_sudo
       root_script <<SCRIPT
 ${JAG_SNAP_RETIRE}
 $(perch_local_rpc_off_cmd "$SOL_USER")
+$(perch_firedancer_on_cmd "$SOL_USER" "$FD_CONFIG")
 SCRIPT
     fi
     exit 0
@@ -607,6 +609,7 @@ SCRIPT
     [[ -n "$FD_SNAPSHOTS_DIR" ]] && echo "[DRY RUN] seed ${FD_SNAPSHOTS_DIR} with the newest snapshot in ${AGAVE_SNAPSHOTS}"
     $USES_JAG_SNAP && echo "[DRY RUN] stop the jag-snap container and close ${JAG_SNAP_PORT}/tcp"
     echo "[DRY RUN] drop this host's own RPC from perch's endpoints, if the host runs perch"
+    echo "[DRY RUN] point perch at Firedancer's metrics, if the host runs perch ${PERCH_FIREDANCER_MIN} or newer"
     echo "[DRY RUN] drop the page cache and compact memory, to make room for the 1 GiB pages"
     echo "[DRY RUN] systemctl enable firedancer; systemctl start firedancer, identity ${IDENTITY_LABEL}"
     echo "[DRY RUN] if the 1 GiB pages still cannot be reserved: offer to reboot, then wait for Firedancer to come up"
@@ -704,6 +707,7 @@ $(fd_render_nofile_sysctl)
 # start which needs a reboot leaves nothing to come back for. rollback undoes both.
 ${JAG_SNAP_RETIRE}
 $(perch_local_rpc_off_cmd "$SOL_USER")
+$(perch_firedancer_on_cmd "$SOL_USER" "$FD_CONFIG")
 
 # Firedancer needs its 1 GiB pages as contiguous memory. With Agave gone, give
 # the page cache back and let the kernel compact what is free: on a host that
@@ -765,6 +769,7 @@ if [[ "$MODE" == "rollback" ]]; then
     echo "[DRY RUN] systemctl enable ${AGAVE_SERVICE}; systemctl start ${AGAVE_SERVICE}"
     $USES_JAG_SNAP && echo "[DRY RUN] start the jag-snap container and reopen ${JAG_SNAP_PORT}/tcp"
     echo "[DRY RUN] put perch's config from before Firedancer back, if there is one"
+    echo "[DRY RUN] stop perch reading Firedancer's metrics, if it was"
     exit 0
   fi
 
@@ -802,6 +807,7 @@ systemctl start ${AGAVE_SERVICE}
 echo "${AGAVE_SERVICE}.service started"
 
 $(perch_local_rpc_on_cmd "$SOL_USER")
+$(perch_firedancer_off_cmd "$SOL_USER")
 if ${USES_JAG_SNAP}; then
   if ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow ${JAG_SNAP_PORT}/tcp >/dev/null
