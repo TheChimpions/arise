@@ -43,6 +43,10 @@ assert_not_contains() {
 assert_eq() {
   if [[ "$1" == "$2" ]]; then _ok; else _fail "expected [$2], got [$1]"; fi
 }
+# file_mode <path> — permission bits in octal. GNU stat first: on Linux
+# 'stat -f' is a different command that succeeds and prints something else.
+file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+
 # assert_order <text> <first> <second> — both are there, and the first line
 # holding <first> comes before the first line holding <second>
 assert_order() {
@@ -360,7 +364,8 @@ group "clients and security model"
   ne_dir="$(mktemp -d)"; mkdir "$ne_dir/bin"
   ne_block="$(printf '%s\n' "$out" | sed -n '/^  HOSTS_NOTE="no \[\[hosts\]\]/,/^    HOSTS_NOTE="\[\[hosts\]\] entry in the starter/p' \
     | sed "s|/etc/default/prometheus-node-exporter|$ne_dir/defaults|")"
-  printf '#!/bin/sh\nif [ "$1" = "-i" ]; then shift; exec /usr/bin/sed -i "" "$@"; fi\nexec /usr/bin/sed "$@"\n' > "$ne_dir/bin/sed"
+  # The lifted script is written for GNU sed. BSD sed wants an argument after -i.
+  printf '#!/bin/sh\nif [ "$1" = "-i" ] && ! /usr/bin/sed --version >/dev/null 2>&1; then shift; exec /usr/bin/sed -i "" "$@"; fi\nexec /usr/bin/sed "$@"\n' > "$ne_dir/bin/sed"
   printf '#!/bin/sh\necho "$@" >> "%s/systemctl.calls"\n' "$ne_dir" > "$ne_dir/bin/systemctl"
   printf '#!/bin/sh\necho "$@" >> "%s/apt.calls"\n[ -n "$APT_FAILS" ] && exit 100\nprintf "#!/bin/sh\\n" > "%s/bin/prometheus-node-exporter"; chmod +x "%s/bin/prometheus-node-exporter"\n' \
     "$ne_dir" "$ne_dir" "$ne_dir" > "$ne_dir/bin/apt-get"
@@ -884,7 +889,7 @@ group "XDP / PoH flag rename"
   sc_run perch_local_rpc_on_cmd >/dev/null
   it "and gets it back on a rollback, with the file's mode unchanged"
   assert_contains "$(cat "$pc_dir/config.toml")" "127.0.0.1:8899"
-  assert_eq "$(stat -f '%Lp' "$pc_dir/config.toml" 2>/dev/null || stat -c '%a' "$pc_dir/config.toml")" "640"
+  assert_eq "$(file_mode "$pc_dir/config.toml")" "640"
   assert_file_missing "$pc_dir/config.toml.bak-pre-firedancer"
 
   { printf '%s\n' '*command -v perch*|system'; cat "$WORK/xdp-new.responses"; } > "$WORK/perch-system.responses"
@@ -928,7 +933,7 @@ FAKE
   it "nothing else in the config changes, and it keeps its mode"
   assert_eq "$(grep -v 'firedancer_url' "$pc_dir/config.toml")" "$(pf_write; cat "$pc_dir/config.toml")"
   PERCH_VER=1.6.0 pf_on >/dev/null
-  assert_eq "$(stat -f '%Lp' "$pc_dir/config.toml" 2>/dev/null || stat -c '%a' "$pc_dir/config.toml")" "640"
+  assert_eq "$(file_mode "$pc_dir/config.toml")" "640"
   assert_file_missing "$pc_dir/config.toml.new"
 
   out="$(PERCH_VER=1.6.0 pf_on)"
@@ -1380,44 +1385,67 @@ exec agave-validator \
   rm -rf "$seed_dir"
 
   # Run the generated pre-download lines with curl replaced by a mirror and a
-  # trusted validator that live in scratch files
+  # trusted validator that live in scratch files. The mirror's file is a little
+  # over 3 MiB and is fetched in 1 MiB pieces, so there are four of them.
   pf_dir="$(mktemp -d)"; mkdir "$pf_dir/fd" "$pf_dir/agave"
   pf_key="7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2"
   pf_name="snapshot-300-HD9P3x1tKAqbNvn8PJzNrqmJA9nBxNHCompRkfGT8Edm.tar.zst"
-  { printf '\x28\xb5\x2f\xfd'; head -c 999 /dev/urandom; } > "$pf_dir/mirror-file"
+  { printf '\x28\xb5\x2f\xfd'; head -c 3146727 /dev/urandom; } > "$pf_dir/mirror-file"
+  pf_size=3146731
   printf '[snapshots.sources.gossip]\n    allow_list = [\n        "%s",\n    ]\n' "$pf_key" > "$pf_dir/config.toml"
   printf 'NOTICE snapct: allowed gossip peer added with public key `%s` and RPC address `10.0.0.9:8899`\n' "$pf_key" > "$pf_dir/fd.log"
+  # prefetch <agave dir or ""> [rpc port] — knobs, all optional:
+  #   PEER_NAME    the full snapshot the trusted validator serves
+  #   SHORT_BY     every piece comes up this many bytes short, every time
+  #   FLAKY=1      each piece comes up short the first time it is asked for
+  #   MIRROR_NAME  what the mirror serves (default: $pf_name)
+  #   MOVES_ON=1   the mirror serves another snapshot once the download has begun
   prefetch() {
     (
+      rm -f "$pf_dir"/asked.* "$pf_dir/started"
       curl() {
-        local out="" range="" url="" headers=false s e
+        local out="" range="" url="" headers=false post=false s e short
         while (($#)); do
           case "$1" in
             -o) out="$2"; shift 2 ;;
             -r) range="$2"; shift 2 ;;
             -D) headers=true; shift 2 ;;
-            -m|-A|-X|-H|-d|-w) shift 2 ;;
+            -X) post=true; shift 2 ;;
+            -m|-A|-H|-d|-w|--connect-timeout|--speed-limit|--speed-time) shift 2 ;;
             -*) shift ;;
             *)  url="$1"; shift ;;
           esac
         done
         case "$url" in
           http://10.0.0.9:8899/snapshot.tar.bz2) printf '%s' "http://10.0.0.9:8899/${PEER_NAME}" ;;
-          https://mirror.test/snapshot.tar.bz2)  printf '%s' "https://store.test/${pf_name}?sig=1" ;;
+          https://mirror.test/snapshot.tar.bz2)
+            if [ -n "${MOVES_ON:-}" ] && [ -e "$pf_dir/started" ]; then
+              printf '%s' "https://store.test/snapshot-999-HD9P3x1tKAqbNvn8PJzNrqmJA9nBxNHCompRkfGT8Edm.tar.zst?sig=2"
+            else
+              printf '%s' "https://store.test/${MIRROR_NAME:-$pf_name}?sig=1"
+            fi ;;
+          https://api.mainnet-beta.solana.com)
+            $post && printf '{"result":[{"pubkey":"%s","rpc":"10.0.0.9:8899"},{"pubkey":"SomeoneElse","rpc":"10.9.9.9:8899"}]}' "$pf_key" ;;
           https://store.test/*)
             if $headers; then
-              printf 'HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1003\r\n'
+              printf 'HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/%s\r\n' "$pf_size"
             else
-              s="${range%-*}"; e="${range#*-}"
-              tail -c "+$((s + 1))" "$pf_dir/mirror-file" | head -c "$((e - s + 1 - ${SHORT_BY:-0}))" > "$out"
+              : > "$pf_dir/started"
+              s="${range%-*}"; e="${range#*-}"; short="${SHORT_BY:-0}"
+              if [ -n "${FLAKY:-}" ] && [ ! -e "$pf_dir/asked.$s" ]; then short=7; fi
+              : > "$pf_dir/asked.$s"
+              tail -c "+$((s + 1))" "$pf_dir/mirror-file" 2>/dev/null | head -c "$((e - s + 1 - short))"
             fi ;;
         esac
       }
       # shellcheck disable=SC2034  # read by the eval'd lines
-      PF_PROGRESS_SECONDS=0.1
-      eval "$(fd_render_snapshot_prefetch https://mirror.test "$pf_dir/fd" "$(id -un)" "$pf_dir/config.toml" "$pf_dir/fd.log" "$1" 8899)"
+      PF_PROGRESS_SECONDS=0.1 PF_RETRY_SECONDS=0 PF_CHUNK_MB=1 PF_STREAMS=3
+      eval "$(fd_render_snapshot_prefetch https://mirror.test "$pf_dir/fd" "$(id -un)" "$pf_dir/config.toml" "$pf_dir/fd.log" "$1" "${2:-8899}")"
     )
   }
+  prefetch_down() { ( curl() { return 7; }; eval "$(fd_render_snapshot_prefetch https://mirror.test "$pf_dir/fd" "$(id -un)" "$pf_dir/config.toml" "$pf_dir/fd.log" "" none)" ); }
+  pf_left="agave,config.toml,fd,fd.log,mirror-file"
+  pf_tidy() { rm -f "$pf_dir"/asked.* "$pf_dir/started"; ls -A "$pf_dir" | paste -sd, -; }
 
   it "does not take the mirror's snapshot when no trusted validator serves the same one"
   assert_contains "$(PEER_NAME="snapshot-200-SomeOtherHashSomeOtherHashSomeOtherHash1.tar.zst" prefetch "")" "no trusted validator serves ${pf_name}"
@@ -1425,29 +1453,94 @@ exec agave-validator \
   it "and leaves the snapshot directory empty then"
   assert_eq "$(ls -A "$pf_dir/fd" | wc -l | tr -d ' ')" "0"
 
-  it "discards a download that comes up short"
+  it "discards a download whose pieces keep coming up short"
   assert_contains "$(PEER_NAME="$pf_name" SHORT_BY=1 prefetch "")" "did not complete — discarded"
 
   it "and leaves nothing behind from it"
-  assert_eq "$(ls -A "$pf_dir" | paste -sd, -)" "agave,config.toml,fd,fd.log,mirror-file"
+  assert_eq "$(pf_tidy)" "$pf_left"
+  assert_eq "$(ls -A "$pf_dir/fd" | wc -l | tr -d ' ')" "0"
+
+  it "discards the download when the mirror moves on to another snapshot part way"
+  assert_contains "$(PEER_NAME="$pf_name" FLAKY=1 MOVES_ON=1 prefetch "")" "did not complete — discarded"
+  assert_eq "$(pf_tidy)" "$pf_left"
+
+  it "gives up at the deadline and lets Firedancer start"
+  assert_contains "$(PEER_NAME="$pf_name" PF_DEADLINE=0 prefetch "")" "did not complete — discarded"
+  assert_eq "$(pf_tidy)" "$pf_left"
 
   touch "$pf_dir/agave/snapshot-300-AgaveOwnCopyAgaveOwnCopyAgaveOwnCopy1.tar.zst"
   it "skips the download when Agave holds that full snapshot already"
   assert_contains "$(PEER_NAME="$pf_name" prefetch "$pf_dir/agave")" "Agave already holds the full snapshot at slot 300"
 
-  pf_out="$(PEER_NAME="$pf_name" prefetch "")"
+  # Two older full snapshots and their incrementals are on disk before the fetch
+  for old_slot in 100 200; do
+    : > "$pf_dir/fd/snapshot-${old_slot}-OldFuLLoLdFuLLoLdFuLLoLdFuLLoLdFuLL${old_slot}.tar.zst"
+    : > "$pf_dir/fd/incremental-snapshot-${old_slot}-$((old_slot + 50))-oLdincoLdincoLdincoLdincoLdincoLd${old_slot}.tar.zst"
+  done
+  pf_out="$(PEER_NAME="$pf_name" FLAKY=1 prefetch "")"
   it "fetches the mirror's full snapshot when a trusted validator serves the same slot and hash"
   assert_contains "$pf_out" "1 of 1 trusted validators serve ${pf_name}"
+  assert_contains "$pf_out" "in 4 pieces, 3 at a time"
 
-  it "joins the ranges back into the file the mirror has, byte for byte"
+  it "a piece that comes up short is fetched again, and the file is the mirror's byte for byte"
   assert_eq "$(cmp "$pf_dir/mirror-file" "$pf_dir/fd/$pf_name" && echo same)" "same"
 
+  it "the file is the validator user's, closed to everyone else"
+  assert_eq "$(find "$pf_dir/fd/$pf_name" -perm 600 -user "$(id -un)" | wc -l | tr -d ' ')" "1"
+
   it "cleans up its working directory"
-  assert_eq "$(ls -A "$pf_dir" | paste -sd, -)" "agave,config.toml,fd,fd.log,mirror-file"
+  assert_eq "$(pf_tidy)" "$pf_left"
+
+  it "keeps the full snapshot from before and removes older ones, with their incrementals"
+  assert_eq "$(ls "$pf_dir/fd" | cut -d- -f1-3 | cut -d. -f1 | paste -sd, -)" "incremental-snapshot-200,snapshot-200-OldFuLLoLdFuLLoLdFuLLoLdFuLLoLdFuLL200,snapshot-300-HD9P3x1tKAqbNvn8PJzNrqmJA9nBxNHCompRkfGT8Edm"
+  assert_contains "$pf_out" "removed snapshot-100-"
 
   it "fetches nothing when that full snapshot is on disk already"
   assert_contains "$(PEER_NAME="$pf_name" prefetch "")" "slot 300 is already on disk"
+
+  rm -f "$pf_dir/fd"/*; : > "$pf_dir/fd.log"
+  it "on a host that has run no validator, a public RPC endpoint names the trusted validators"
+  assert_contains "$(PEER_NAME="$pf_name" prefetch "" none)" "1 of 1 trusted validators serve ${pf_name}"
+  assert_eq "$(cmp "$pf_dir/mirror-file" "$pf_dir/fd/$pf_name" && echo same)" "same"
+
+  it "a mirror that names something other than a snapshot is passed over"
+  assert_contains "$(MIRROR_NAME="index.html" PEER_NAME="$pf_name" prefetch "")" "named no snapshot — skipped"
+
+  it "and so is one that does not answer"
+  assert_contains "$(PEER_NAME="$pf_name" prefetch_down)" "did not answer — skipped"
+
+  # The same lines, installed as the script the unit runs before each start
+  pf_script="$pf_dir/prefetch-script"
+  ( FD_PREFETCH_SCRIPT="$pf_script"; chown() { :; }
+    eval "$(fd_render_prefetch_install on https://mirror.test /mnt/ledger/firedancer/snapshots sol /home/sol/firedancer/config.toml /mnt/ledger/firedancer/firedancer.log)" ) >/dev/null
+  it "the pre-start script is a whole bash script that parses"
+  assert_eq "$(head -1 "$pf_script")" "#!/bin/bash"
+  assert_eq "$(bash -n "$pf_script" && echo parses)" "parses"
+
+  it "it carries this host's mirror, directories and user, and asks no local Agave"
+  assert_contains "$(cat "$pf_script")" 'PF_MIRROR="https://mirror.test"'
+  assert_contains "$(cat "$pf_script")" 'PF_TO="/mnt/ledger/firedancer/snapshots"'
+  assert_contains "$(cat "$pf_script")" 'PF_RPC_PORT="none"'
+  assert_contains "$(cat "$pf_script")" 'PF_AGAVE=""'
+
+  it "it can never fail the start: it ends with exit 0 and is executable"
+  assert_eq "$(tail -1 "$pf_script")" "exit 0"
+  assert_eq "$(test -x "$pf_script" && echo yes)" "yes"
+
+  ( FD_PREFETCH_SCRIPT="$pf_script"; eval "$(fd_render_prefetch_install off)" )
+  it "turned off, the script is taken away"
+  assert_file_missing "$pf_script"
   rm -rf "$pf_dir"
+
+  it "the unit runs the pre-download after configure, lets it fail, and waits long enough for it"
+  unit_on="$(fd_render_unit /fd/firedancer /fd/config.toml sol on)"
+  assert_order "$unit_on" "ExecStartPre=/fd/firedancer configure init all" "ExecStartPre=-${FD_PREFETCH_SCRIPT}"
+  assert_order "$unit_on" "ExecStartPre=-${FD_PREFETCH_SCRIPT}" "ExecStart=/fd/firedancer run"
+  assert_contains "$unit_on" "TimeoutStartSec=$((FD_SNAPSHOT_DEADLINE * 2))"
+
+  it "without it the unit has neither line"
+  assert_not_contains "$(fd_render_unit /fd/firedancer /fd/config.toml sol off)" "snapshot-prefetch"
+  assert_not_contains "$(fd_render_unit /fd/firedancer /fd/config.toml sol)" "TimeoutStartSec"
 
   it "the unit asks for the open-file limit the sysctl step provides"
   assert_contains "$out" "LimitNOFILE=${FD_NOFILE}"
@@ -1843,6 +1936,37 @@ group "reawaken.sh"
   fd_host "$WORK/fd-live.responses" "fd_unit=yes\nfd_config=yes\nfd_active=active\nagave_active=inactive" "${KV}${JITO}${HEXIS}"
   out="$(STUB_RESPONSES=$WORK/fd-live.responses reawaken rollback --host 1.2.3.4 --ssh-key "$WORK/key" --dry-run)"
 
+  # --- unit: bring an existing host's unit and pre-start step up to date ---
+  unit_out="$(STUB_RESPONSES=$WORK/fd-live.responses reawaken unit --host 1.2.3.4 --ssh-key "$WORK/key" --dry-run)"
+  it "unit shows the new firedancer.service and the pre-start step, and restarts nothing"
+  assert_contains "$unit_out" "[DRY RUN] install ${FD_PREFETCH_SCRIPT}: before each start, fetch the full snapshot from ${FD_SNAPSHOT_MIRROR} into /mnt/ledger/firedancer/snapshots"
+  assert_contains "$unit_out" "ExecStartPre=-${FD_PREFETCH_SCRIPT}"
+  assert_contains "$unit_out" "Firedancer is not restarted"
+
+  : > "$WORK/unit.scripts"
+  unit_out="$(STUB_RESPONSES=$WORK/fd-live.responses STUB_SCRIPT_LOG="$WORK/unit.scripts" SUDO_PASS=pw \
+      reawaken unit --host 1.2.3.4 --ssh-key "$WORK/key")"; rc=$?
+  it "unit installs the script as root's, then the unit, then reloads systemd"
+  assert_eq "$rc" "0"
+  assert_order "$(cat "$WORK/unit.scripts")" "chown root:root ${FD_PREFETCH_SCRIPT}.new" "cat > /etc/systemd/system/firedancer.service"
+  assert_order "$(cat "$WORK/unit.scripts")" "cat > /etc/systemd/system/firedancer.service" "systemctl daemon-reload"
+  assert_contains "$(cat "$WORK/unit.scripts")" 'PF_TO="/mnt/ledger/firedancer/snapshots"'
+
+  it "and never stops, starts or restarts a validator"
+  assert_eq "$(grep -cE 'systemctl (stop|start|restart|try-restart|enable|disable)' "$WORK/unit.scripts")" "0"
+
+  : > "$WORK/unit.scripts"
+  STUB_RESPONSES=$WORK/fd-live.responses STUB_SCRIPT_LOG="$WORK/unit.scripts" SUDO_PASS=pw \
+      reawaken unit --host 1.2.3.4 --ssh-key "$WORK/key" --no-snapshot-prefetch >/dev/null
+  it "unit --no-snapshot-prefetch takes the pre-start step out again"
+  assert_contains "$(cat "$WORK/unit.scripts")" "rm -f ${FD_PREFETCH_SCRIPT}"
+  assert_not_contains "$(cat "$WORK/unit.scripts")" "ExecStartPre=-"
+
+  unit_out="$(STUB_RESPONSES=$WORK/fd-hexis.responses reawaken unit --host 1.2.3.4 --ssh-key "$WORK/key" --dry-run)"; rc=$?
+  it "unit refuses a host where Firedancer was never staged"
+  assert_eq "$rc" "1"
+  assert_contains "$unit_out" "Firedancer is not staged"
+
   it "rollback releases Firedancer's huge pages before Agave starts"
   assert_contains "$out" "firedancer configure fini all"
 
@@ -1862,6 +1986,13 @@ group "reawaken.sh"
   fd_host "$WORK/fd-up.responses" "fd_unit=yes\nfd_config=yes\nfd_signer=yes\nfd_active=active\nfd_enabled=enabled\nagave_active=inactive\nfd_release=v1+concorde.1\nfd_version=1.0" "${KV}${JITO}${HEXIS}"
   printf '%s\n' '*test -x /home/sol/firedancer/releases/v0+concorde.9/firedancer*|yes' '*cat /home/sol/firedancer/.previous-release*|v0+concorde.9' >> "$WORK/fd-up.responses"
   out="$(STUB_RESPONSES=$WORK/fd-up.responses reawaken "${up[@]}" --fd-tag v2+concorde.1)"
+
+  it "staging a release writes a unit that fetches the snapshot from the mirror before a start"
+  assert_contains "$out" "ExecStartPre=-${FD_PREFETCH_SCRIPT}"
+  assert_contains "$out" "[DRY RUN] ${FD_PREFETCH_SCRIPT}: before each start, fetch the full snapshot from ${FD_SNAPSHOT_MIRROR}"
+
+  it "and with --no-snapshot-prefetch it does not"
+  assert_not_contains "$(STUB_RESPONSES=$WORK/fd-up.responses reawaken "${up[@]}" --fd-tag v2+concorde.1 --no-snapshot-prefetch)" "snapshot-prefetch"
 
   it "upgrade names the release it leaves and the one it moves to"
   assert_contains "$out" "Firedancer v1+concorde.1 -> v2+concorde.1"

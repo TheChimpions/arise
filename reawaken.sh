@@ -18,6 +18,8 @@
 #   reawaken.sh upgrade   On a host already running Firedancer: stage a newer release,
 #                       wait for a safe window and restart onto it. --previous
 #                       goes back to the release that ran before.
+#   reawaken.sh unit      Rewrite firedancer.service and its pre-start snapshot
+#                       download on a host staged earlier. Restarts nothing.
 #   reawaken.sh status    Show which client is installed and running.
 #
 # Only cutover, rollback and upgrade stop or start a validator, and all ask first.
@@ -92,7 +94,7 @@ FD_OKX_LEDGER_SET=false
 
 usage() {
   cat <<EOF
-Usage: $0 <stage|cutover|rollback|upgrade|status> [OPTIONS]
+Usage: $0 <stage|cutover|rollback|upgrade|unit|status> [OPTIONS]
 
 Modes:
   stage      Install Firedancer next to the validator that is running, without
@@ -108,6 +110,10 @@ Modes:
              with --fd-tag or --fd-binary exactly as 'stage' does, waits for a
              window with no leader slot, and restarts Firedancer onto it.
              With --previous it switches back to the release that ran before.
+  unit       For a host that already has Firedancer staged or running, set up
+             by an older copy of these scripts. Rewrites firedancer.service and
+             the pre-start snapshot download, and nothing else. Restarts
+             nothing: it takes effect the next time Firedancer starts.
   status     Read-only report.
 
 Required:
@@ -147,9 +153,12 @@ Config (stage):
   --snapshot-allow-any          Take snapshots from any gossip peer (Firedancer's
                                 default). Without it, a validator.sh with three or
                                 more --known-validator keeps to exactly those
-  --snapshot-mirror <url>       Where cutover and upgrade fetch the full snapshot from
-                                before the restart. Default: ${FD_SNAPSHOT_MIRROR}
-  --no-snapshot-prefetch        Do not fetch it; Firedancer downloads from its peers
+  --snapshot-mirror <url>       Where the full snapshot is fetched from when the one on
+                                disk is too old: by cutover and upgrade before the
+                                restart, and by the unit before every start.
+                                Default: ${FD_SNAPSHOT_MIRROR}
+  --no-snapshot-prefetch        Do not fetch it; Firedancer downloads from its peers.
+                                With stage or unit: leave the pre-start step out
   --enable-rpc                  Run the RPC server. Off in the Concorde build: its core
                                 goes to the arb tiles
   --concorde-tables <path>      The Concorde's config tables. Default: fetched from the
@@ -183,9 +192,9 @@ EOF
 
 [[ $# -eq 0 ]] && usage
 case "$1" in
-  stage|cutover|rollback|upgrade|status) MODE="$1"; shift ;;
+  stage|cutover|rollback|upgrade|unit|status) MODE="$1"; shift ;;
   -h|--help) usage ;;
-  *) log_error "First argument must be 'stage', 'cutover', 'rollback', 'upgrade' or 'status'"; usage ;;
+  *) log_error "First argument must be 'stage', 'cutover', 'rollback', 'upgrade', 'unit' or 'status'"; usage ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -539,6 +548,51 @@ if [[ "$MODE" == "status" ]]; then
     [[ -n "$OUTLOOK" ]] && echo "  Huge pages:      ${OUTLOOK}"
   fi
   echo ""
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# unit — bring firedancer.service and its pre-start step up to date
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "unit" ]]; then
+  if [[ "$(fact fd_unit)" != "yes" || "$(fact fd_config)" != "yes" ]]; then
+    log_error "Firedancer is not staged on ${SOL_HOST} — run '$0 stage' first"
+    exit 1
+  fi
+  FD_CONFIG_TEXT=$(probe "cat ${FD_CONFIG}")
+  UNIT_SNAPS=$(fd_toml_get "$FD_CONFIG_TEXT" "snapshots")
+  UNIT_LOG=$(fd_toml_get "$FD_CONFIG_TEXT" "path")
+  UNIT_USER=$(fd_toml_get "$FD_CONFIG_TEXT" "user")
+  UNIT_MIRROR="${SNAPSHOT_MIRROR:-$FD_SNAPSHOT_MIRROR}"
+  UNIT_PREFETCH=on
+  $SNAPSHOT_PREFETCH || UNIT_PREFETCH=off
+  if [[ "$UNIT_PREFETCH" == on && ( -z "$UNIT_SNAPS" || -z "$UNIT_USER" ) ]]; then
+    log_error "Could not read [paths] snapshots and user from ${FD_CONFIG}"
+    exit 1
+  fi
+  UNIT_TEXT="$(fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE" "$UNIT_PREFETCH")"
+  if $DRY_RUN; then
+    if [[ "$UNIT_PREFETCH" == on ]]; then
+      echo "[DRY RUN] install ${FD_PREFETCH_SCRIPT}: before each start, fetch the full snapshot from ${UNIT_MIRROR} into ${UNIT_SNAPS} when the one on disk is too old"
+    else
+      echo "[DRY RUN] remove ${FD_PREFETCH_SCRIPT}"
+    fi
+    echo "[DRY RUN] ${FD_UNIT} would be:"
+    echo "$UNIT_TEXT"
+    echo "[DRY RUN] systemctl daemon-reload — Firedancer is not restarted"
+    exit 0
+  fi
+  need_sudo
+  log_info "Rewriting firedancer.service and its pre-start step on ${SOL_HOST} — nothing is restarted"
+  root_script <<SCRIPT
+set -e
+$(fd_render_prefetch_install "$UNIT_PREFETCH" "$UNIT_MIRROR" "$UNIT_SNAPS" "$UNIT_USER" "$FD_CONFIG" "$UNIT_LOG")
+cat > ${FD_UNIT} <<'UNITEOF'
+${UNIT_TEXT}
+UNITEOF
+systemctl daemon-reload
+echo "firedancer.service rewritten — it is \$(systemctl is-active firedancer 2>/dev/null || true) and was not restarted; the change applies from its next start"
+SCRIPT
   exit 0
 fi
 
@@ -1159,7 +1213,7 @@ if $FD_ENABLE_RPC; then
 else
   log_warn "  RPC:            off — anything reading 127.0.0.1:8899 on this host (solana catchup) stops working"
 fi
-log_warn "  Snapshots:      none made or served. Cutover and upgrade fetch the full one before the restart"
+log_warn "  Snapshots:      none made or served. Cutover, upgrade and every start of the unit fetch the full one from the mirror when the one on disk is too old"
 if $USES_JAG_SNAP; then
   log_warn "  jag-snap:       retired at cutover (container stopped, ${JAG_SNAP_PORT}/tcp closed); rollback brings it back"
 fi
@@ -1170,7 +1224,12 @@ if $DRY_RUN; then
   echo "$CONFIG_TEXT"
   echo ""
   echo "[DRY RUN] ${FD_UNIT} would be:"
-  fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE"
+  if $SNAPSHOT_PREFETCH; then
+    fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE" on
+    echo "[DRY RUN] ${FD_PREFETCH_SCRIPT}: before each start, fetch the full snapshot from ${SNAPSHOT_MIRROR:-$FD_SNAPSHOT_MIRROR} into ${FDC_SNAPSHOTS} when the one on disk is too old"
+  else
+    fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE" off
+  fi
   echo ""
   [[ "$MODE" == "upgrade" ]] && fd_restart_onto "$OLD_RELEASE" "${FD_TAG:-$(basename "$FD_BINARY")}"
   echo "[DRY RUN] nothing was changed on ${SOL_HOST}"
@@ -1309,7 +1368,9 @@ else
 fi
 
 # --- systemd unit and firewall -----------------------------------------------
-UNIT_TEXT="$(fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE")"
+UNIT_PREFETCH=on
+$SNAPSHOT_PREFETCH || UNIT_PREFETCH=off
+UNIT_TEXT="$(fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE" "$UNIT_PREFETCH")"
 UFW_RULES=""
 for src in $FD_CONTROL_ALLOW; do
   UFW_RULES+="ufw allow from ${src} to any port ${FD_CONTROL_PORT} proto tcp >/dev/null
@@ -1325,6 +1386,7 @@ done
 log_info "Installing firedancer.service (not enabled), log rotation and the firewall rules"
 root_script <<SCRIPT
 set -e
+$(fd_render_prefetch_install "$UNIT_PREFETCH" "${SNAPSHOT_MIRROR:-$FD_SNAPSHOT_MIRROR}" "$FDC_SNAPSHOTS" "$FD_USER" "$FD_CONFIG" "$FDC_LOG")
 cat > ${FD_UNIT} <<'UNITEOF'
 ${UNIT_TEXT}
 UNITEOF

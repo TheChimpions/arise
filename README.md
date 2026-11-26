@@ -612,6 +612,10 @@ so on a Hexis or Jito host there is normally nothing to pass but the release.
 ./reawaken.sh rollback --host <ip> --ssh-key ~/.ssh/<key>
 ./reawaken.sh status   --host <ip> --ssh-key ~/.ssh/<key>
 
+# A Firedancer host set up by an older copy of these scripts: rewrite its unit so
+# every start fetches the snapshot from the mirror when needed. Restarts nothing.
+./reawaken.sh unit --host <ip> --ssh-key ~/.ssh/<key>
+
 # Later, on a host already running Firedancer: a newer release, or the one before
 ./reawaken.sh upgrade --host <ip> --ssh-key ~/.ssh/<key> --fd-tag '<newer tag>'
 ./reawaken.sh upgrade --host <ip> --ssh-key ~/.ssh/<key> --previous
@@ -680,16 +684,34 @@ Things that change on Firedancer:
   - `cutover` links Agave's newest full snapshot and incremental into Firedancer's
     snapshot directory.
   - `cutover` and `upgrade` fetch the current full snapshot from an HTTP mirror
-    (`--snapshot-mirror`, default `https://snapshots.avorio.network/mainnet-beta`) in
-    eight parallel ranges, when it is newer than what is on disk. The mirror is a third
-    party: its file is taken only when a validator on the snapshot allow list serves a
-    full snapshot with the same slot and hash. That check is on the name, not the bytes.
-    `--no-snapshot-prefetch` turns it off.
+    (`--snapshot-mirror`, default `https://snapshots.avorio.network/mainnet-beta`), when
+    it is newer than what is on disk. The mirror is a third party: its file is taken
+    only when a validator on the snapshot allow list serves a full snapshot with the
+    same slot and hash. That check is on the name, not the bytes.
+  - **Every start of `firedancer.service` does the same**, as a pre-start step
+    (`/usr/local/sbin/firedancer-snapshot-prefetch`, root's file). That is what covers a
+    crash, a reboot, or a restart nobody planned: without it such a start is the hour's
+    download. It runs after `configure`, so the huge pages are taken first; it fetches
+    nothing when the snapshot on disk is still the one the cluster is on, which takes
+    about a second to find out; and it can never stop a start — on any failure, or
+    after 15 minutes, Firedancer starts and downloads from its peers as before. On a
+    host that has never run a validator it asks a public RPC endpoint where the
+    trusted validators serve their snapshots.
+
+  The file is fetched in 1 GiB pieces, eight at a time, each written straight to its
+  place and retried by itself, so a dropped connection costs one piece, not the whole
+  download. After a fetch, the two newest full snapshots are kept and older ones are
+  removed with their incrementals. `--no-snapshot-prefetch` turns all of it off:
+  given to `stage` or `unit`, it leaves the pre-start step out of the unit.
+
+  `stage` writes the unit with the pre-start step, so a fresh install and a host moving
+  from Agave both get it. A host staged before this existed gets it from
+  `reawaken.sh unit`, which rewrites the unit and the script and restarts nothing.
 
   Firedancer starts from the local file when a trusted peer still serves incrementals
-  built on that full slot; if anything above fails, it downloads as before. The full
-  snapshot rolls over about every six hours, so a cutover that straddles a rollover
-  (with a reboot in between, say) can still end in the download.
+  built on that full slot; if anything above fails, it downloads as before. Measured on
+  one host: about 600 MB/s from the mirror against 33 MB/s from the trusted peer, and
+  under four minutes from the restart to the tip once the file was on disk.
 
   `cutover` stops the jag-snap container and closes 18899/tcp; `rollback` starts it and
   reopens the port. Stake that depends on serving snapshots (JagPool) does not carry
@@ -807,7 +829,7 @@ sudo ~/firedancer/firedancer wait --config ~/firedancer/config.toml --min-idle-s
 
 **`firedancer wait` says "insufficient permissions"** — it needs `sudo`.
 
-**Firedancer downloads the full snapshot at start anyway** — no trusted peer still builds incrementals on the full snapshot that was on disk. It takes about an hour; nothing is wrong.
+**Firedancer downloads the full snapshot at start anyway** — the pre-start step did not put a current one on disk. `journalctl -u firedancer | grep 'snapshot pre-download'` says why: the mirror did not answer, no trusted validator served the same snapshot, or the download ran past its deadline. The download from the peers takes about an hour; nothing is wrong. A host staged by an older copy of these scripts has no pre-start step at all: `./reawaken.sh unit` adds it.
 
 **Build fails** — check that the tag exists in the repo (`git ls-remote --tags https://github.com/jito-foundation/jito-solana.git`) and that the server has enough RAM and disk for a release build.
 

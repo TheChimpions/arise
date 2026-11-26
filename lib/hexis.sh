@@ -519,10 +519,11 @@ if [ -f "$perch_cfg" ] && [ -n "$perch_bin" ]; then
           export "$perch_k=$perch_v" 2>/dev/null || true
         done < "$perch_env"
       fi
-      case "$perch_owner" in
-        ""|root) "$perch_bin" "$@" ;;
-        *) runuser -u "$perch_owner" -- "$perch_bin" "$@" ;;
-      esac
+      if [ "$(id -u)" = 0 ] && [ -n "$perch_owner" ] && [ "$perch_owner" != root ]; then
+        runuser -u "$perch_owner" -- "$perch_bin" "$@"
+      else
+        "$perch_bin" "$@"
+      fi
     )
   }
   perch_ver=$(perch_run --version 2>/dev/null | awk '{ print $2; exit }')
