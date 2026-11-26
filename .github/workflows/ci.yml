@@ -20,6 +20,7 @@ jobs:
           bash -n system.sh
           bash -n lib/hexis.sh
           bash -n lib/firedancer.sh
+          bash -n lib/remote.sh
           bash -n test/run.sh
 
       - name: ShellCheck

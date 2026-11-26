@@ -35,15 +35,17 @@ A server with no validator yet is the one case `system.sh` does not run for you:
 **This is experimental software. Read before running.**
 
 - **Review the script before you run it.** Open `arise.sh` and read what it does. It installs packages, formats disks, reconfigures the kernel, hardens SSH, opens firewall ports, and creates system users. These are destructive and hard to reverse.
-- **This will format drives.** Auto-disk detection picks unformatted NVMe drives and runs `mkfs` on them. If you have important data on any NVMe drive that isn't the boot disk, **pass `--no-auto-disks`** or pass `--ledger-disk` / `--accounts-disk` explicitly.
+- **This will format drives.** Auto-disk detection picks blank NVMe drives and runs `mkfs` on them. It skips any drive with partitions, a filesystem, a RAID/LVM signature or a mount, shows you what it found, and makes you type `format` before erasing anything. If in doubt, **pass `--no-auto-disks`** or pass `--ledger-disk` / `--accounts-disk` explicitly.
+- **It disables root SSH login and SSH passwords.** After the first run you log in as the admin user or as `sol`, with your key. Pass `--keep-root-login` if your provider's rescue path needs key-based root login.
 - **Mainnet validators handle real stake and real money.** A misconfigured validator can miss votes, get delinquent, or lose stake. Do not run this on mainnet without understanding every step it performs.
-- **Region auto-detection is best-effort.** It geolocates the server IP to pick the closest Jito and BloXroute regions. If detection fails, the script will warn you and leave placeholders in `validator.sh` that you **must fill in manually** before starting the validator.
+- **Region auto-detection is best-effort.** It geolocates the server IP to pick the closest Jito region. If detection fails, the script will warn you and leave placeholders in `validator.sh` that you **must fill in manually** before starting the validator.
 - **No warranty.** If this script eats your stake, bricks your server, or summons a shadow army, that's on you.
 
 **Verify after setup**, before starting the validator:
 
 - `cat ~/validator.sh` on the server — confirm every flag is correct
-- Check `--shred-receiver-address`, `--block-engine-url`, `--public-rpc-address`, `--commission-bps`
+- Check `--shred-receiver-address`, `--block-engine-url`, `--commission-bps`
+- Check the flags against the release notes for the version you built — flags change between major versions
 - Confirm `/mnt/ledger` and `/mnt/accounts` are mounted and owned by `sol`
 - Confirm `solana-keygen verify` against your staked identity
 - Run a testnet deploy first before touching mainnet
@@ -52,20 +54,44 @@ A server with no validator yet is the one case `system.sh` does not run for you:
 
 ## What `arise.sh` does
 
-1. **Bootstrap** — creates the `sol` user and copies your SSH key (if run with `--root-user`)
-2. **System packages** — curl, build deps, docker.io, monitoring tools
+1. **Bootstrap** — creates an admin user (`monarch`, sudo with password) and the `sol` service user (no sudo), and installs your SSH key for both
+2. **System packages** — curl, build deps, monitoring tools
 3. **Kernel tuning** — Anza-recommended sysctl settings, CPU governor, network buffers
 4. **Disk setup** — auto-detects unused NVMe drives, formats and mounts them as `/mnt/ledger` and `/mnt/accounts`
 5. **Swap** — creates a swap file (default 128G)
 6. **NTP** — configures chrony with the Jito region's NTP server
-7. **Rust + Solana CLI** — installs via rustup, clones and builds Jito-Solana from source (requires `--github-ssh-key`). With `--hexis`, both are skipped in favour of the prebuilt Solana CLI, since the Hexis release already ships the validator binary.
+7. **The validator client** (`--client`) — `jito` (default) and `agave` are built on the server from their public repos at the release tag you choose. With `--hexis`, or with `--client firedancer`, nothing is compiled: the binary comes from a private release and only the prebuilt Solana CLI is installed beside it
 8. **Identity keypairs** — copies your staked identity, generates an unstaked identity, symlinks `identity.json`
-9. **Validator script** — generates `validator.sh` with region-specific Jito block engine, shred receiver, and BloXroute shred receivers based on server geolocation
+9. **Validator script** — generates `validator.sh` with the region-specific Jito block engine and shred receiver (chosen from server geolocation) plus the DoubleZero shred receiver. RPC is bound to localhost and kept out of gossip
 10. **systemd** — creates `sol.service` and `sol-fix-mounts.service` (enabled but not started)
 11. **Log rotation, firewall, SSH hardening, fail2ban**
-12. **jag-snap** — clones and runs the jag-snap snapshot container
+12. **perch watchtower** — installs [perch](https://github.com/TheChimpions/perch-watchtower) and points it at this validator (on by default, `--no-perch` to skip; installed but not started)
 13. **Hexis arb client** (off by default, `--hexis` to enable, mainnet only) — installs the Hexis `agave-validator` build into `/home/sol/hexis`, writes `arb-config.toml`, creates the revert-dump spool, opens the Control port to the Hexis fleet only, and drops an `arb-enable.sh` helper
 14. **XDP** (on by default, `--no-xdp` to disable) — accelerated retransmit per the [Anza XDP setup guide](https://www.anza.xyz/blog/agave-xdp-setup-guide): detects the NIC/driver/kernel, tunes ring sizes to powers of 2 (persisted across reboots), grants the validator the required capabilities, and adds the experimental retransmit/PoH flags
+
+---
+
+## Security model
+
+| Account | Purpose | sudo | SSH |
+|---|---|---|---|
+| `monarch` (admin, `--admin-user`) | System changes, starting and stopping services | Yes, password required | Key only |
+| `sol` | Runs the validator, holds the keypairs | **None** | Key only |
+| `root` | — | — | Login disabled |
+
+- **The validator account cannot become root.** `sol` has no sudo and is in no privileged group, and `sol.service` runs with `NoNewPrivileges` and a read-only view of `/usr`, `/boot` and `/etc`. XDP gets exactly the four capabilities it needs and no others.
+- **SSH is key-only, and it is checked.** The settings go in `/etc/ssh/sshd_config.d/00-arise.conf` so they win over cloud-init's defaults. The script then reads sshd's effective configuration and rolls back and stops if anything overrides them.
+- **The firewall opens only SSH and the validator's port range** (8000–8026, the minimum width Agave 4 accepts), plus the Hexis Control port to one address with `--hexis`. RPC is bound to `127.0.0.1`, kept out of gossip with `--private-rpc`, and not opened.
+- **Nothing sensitive is written to disk in transit.** Scripts and the sudo password go to the server over SSH stdin. Nothing lands in `/tmp`, no password appears in a process list, and keypairs are created mode 600 from the first byte. This is `lib/remote.sh`, shared by `arise.sh`, `ascend.sh` and `reawaken.sh`.
+- **Nothing GitHub-related goes on the server.** Public clients are cloned over HTTPS. Private releases (Hexis, Firedancer) are downloaded on your machine with `gh`, checksum-verified, and streamed up.
+- **Security updates stay on.** `unattended-upgrades` is enabled and `sol.service` is excluded from automatic restarts. CPU mitigations stay on. Both can be traded for performance with `--disable-auto-updates` and `--disable-cpu-mitigations`.
+- **Every remote step is checked.** If any command on the server fails, the script stops with a non-zero exit instead of carrying on.
+
+### Upgrading a server set up by an older version
+
+Older versions gave `sol` sudo and docker access and left root login on. Run `arise.sh` once with `--root-user sol`: you will be asked for `sol`'s sudo password and for a new admin password. The script creates the admin user, then removes `sol`'s sudo and docker access, replaces the old 8000–10000 firewall rule, and disables root login. After this, use `ssh monarch@<host>` for anything that needs sudo, and `ascend.sh` / `reawaken.sh` ask for the admin user's sudo password (`--admin-user` if you named it something else).
+
+It reports, but does not remove, leftovers such as an old GitHub key in `~sol/.ssh/github_key`, a `jag-snap` container, or `mitigations=off` in GRUB.
 
 ---
 
@@ -75,7 +101,8 @@ On your **local machine**:
 
 - SSH private key with access to the target server
 - A `staked_identity.json` file (validator keypair with a vote account already created)
-- (Optional) A GitHub SSH key authorized to clone `jito-solana` and `jag-snap`
+- `git` (only used to list release tags when `--client-version` is omitted)
+- `gh`, logged in to an account that can see the private release repo — only for `--hexis-tag` and `--client firedancer`
 
 On the **target server**:
 
@@ -95,8 +122,23 @@ On the **target server**:
   --vote-account <VOTE_ACCOUNT_PUBKEY> \
   --network testnet \
   --root-user root \
-  --github-ssh-key ~/.ssh/github_key
+  --client-version v4.4.1-jito
 ```
+
+`--root-user` is only needed the first time. Later runs connect as the admin user and ask for its sudo password.
+
+### Choosing a client
+
+| | Command | Where the binary comes from |
+|---|---|---|
+| **Jito** (default) | `--client jito --client-version v4.4.1-jito` | Built on the server from `jito-foundation/jito-solana` |
+| **Agave** | `--client agave --client-version v4.4.1` | Built on the server from `anza-xyz/agave`. No Block Engine or tip flags |
+| **Jito + Hexis** | `--client jito --hexis --hexis-tag <tag>` | Private Hexis release, fetched locally with `gh` (or `--hexis-binary <path>`). Mainnet only |
+| **Firedancer** (Hexis Concorde) | `--client firedancer --fd-tag <tag>` | Private release, fetched locally with `gh` (or `--fd-binary <path>`). Mainnet only |
+
+Leave `--client-version` off and the script lists recent release tags to pick from.
+
+**Firedancer from scratch.** `arise.sh` provisions the host and writes `validator.sh` as the record of the validator's settings (identity, vote account, entrypoints, Block Engine, shred receivers), leaves `sol.service` disabled, then runs `reawaken.sh stage` for you — the same staging a migrated host gets. Staging starts nothing. Start it with `./reawaken.sh cutover --host <host> --ssh-key <key>`: with nothing running there is nothing to stop, so it checks the config, asks once and starts `firedancer.service`. Pass `--hexis-signer <signing_key.json>` to use the arb signer Hexis issued; otherwise one is generated. There is no Agave client on such a host, so `reawaken.sh rollback` has nothing to go back to until you install one beside Firedancer — see [Changing client](#changing-client-on-a-host-that-already-runs-one).
 
 ### Flags
 
@@ -110,19 +152,43 @@ On the **target server**:
 | `--vote-account`   | Vote account pubkey                                                                                                                                                                                                      |
 | `--commission-bps` | **Jito** commission in basis points — the cut of Jito MEV tips taken via the tip distribution program (mainnet only, e.g. `0` = 0%, `500` = 5%). This is the Jito tip commission, **not** the validator vote commission. |
 
-**Bootstrap (fresh servers):**
+**Access:**
 
-| Flag          | Description                                                                                                                                                                                                                                                                                                                                              |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--root-user` | Initial sudo user (default: `root`). Creates the `sol` user and reconnects as `sol`. The root login does not need your SSH key — if the key is refused, ssh asks for the root password once and reuses that connection for the whole bootstrap. Everything after the bootstrap runs as `sol` with sudo, and SSH hardening then turns password login off. |
+| Flag | Description |
+|---|---|
+| `--root-user` | Existing user with root or sudo access (e.g. `root`). First run only — used to create the admin user, never again. |
+| `--admin-user` | Name of the admin user that holds sudo (default: `monarch`) |
+| `--keep-root-login` | Keep key-based root SSH login enabled (default: disabled) |
+
+**Client:**
+
+| Flag | Description |
+|---|---|
+| `--client` | `jito` (default), `agave` or `firedancer` — see [Choosing a client](#choosing-a-client) |
+| `--client-version` | Release tag to build for `jito` / `agave`. A different tag on a later run is built and `active_release` is switched to it |
+| `--client-repo` | HTTPS git repo to build from (default: the client's public repo) |
+| `--build-client` | Build from source even with `--hexis` (off by default — see below) |
+| `--fd-tag` / `--fd-binary` | Firedancer release to stage with `--client firedancer` |
+| `--concorde-tables` | Local copy of the Concorde config tables, instead of fetching them with `gh` (passed on to `reawaken.sh`) |
+| `--restart` | On a host with a running validator: wait for a restart window and move it onto what was just installed. From or to Firedancer this hands over to `reawaken.sh`, which asks first |
+| `--min-idle-time` | Minutes without a leader slot that `--restart` waits for (default: `20`) |
+| `--max-delinquent-stake` | `--restart` does not go ahead while more than this percentage of stake is delinquent (default: `5`) |
+
+**Monitoring and trade-offs:**
+
+| Flag | Description |
+|---|---|
+| `--no-perch` | Do not install the perch watchtower (installed by default) |
+| `--perch-version` | perch release to install, e.g. `v1.5.4` (default: `latest`) |
+| `--perch-label` | Name used for this validator in alerts (default: the `--host` value) |
+| `--confirm-format` | Skip the typed confirmation before formatting disks (for unattended runs) |
+| `--disable-cpu-mitigations` | Add `mitigations=off` to the kernel command line (faster, less secure) |
+| `--disable-auto-updates` | Turn off unattended security updates |
 
 **Optional:**
 
 | Flag               | Description                                                                                                                                                                     |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--github-ssh-key` | SSH key for GitHub (required to build Jito + run jag-snap)                                                                                                                      |
-| `--jito-repo`      | Jito-Solana git repo URL (default: `git@github.com:jito-foundation/jito-solana.git`)                                                                                            |
-| `--build-jito`     | Build jito-solana from source even with `--hexis` (off by default — see below)                                                                                                  |
 | `--network`        | `testnet` or `mainnet` (default: `testnet`)                                                                                                                                     |
 | `--jito-region`    | Override auto-detection (e.g. `frankfurt`, `new-york`, `singapore`)                                                                                                             |
 | `--metrics-config` | `SOLANA_METRICS_CONFIG` exported by `validator.sh`. Defaults to the cluster metrics endpoint the SFDP requires (`mainnet-beta` or `tds` by network). Pass `""` to publish none. |
@@ -157,8 +223,7 @@ Because the Hexis release _is_ the validator binary, `--hexis` **skips the jito-
 source build and the Rust toolchain** — a compile whose output would never be executed.
 Instead it installs the prebuilt Solana CLI for `solana-keygen` (identity and arb
 keypairs) and `solana` (catchup, monitoring), which takes seconds rather than the better
-part of an hour. `--github-ssh-key` is then only needed for jag-snap. Pass `--build-jito`
-to compile from source anyway.
+part of an hour. Pass `--build-client` to compile from source anyway.
 
 | Flag                           | Description                                                                                                                                                         |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -172,8 +237,8 @@ to compile from source anyway.
 | `--hexis-dir`                  | Install dir (default: `/home/sol/hexis`)                                                                                                                            |
 | `--hexis-program-id`           | On-chain arb program                                                                                                                                                |
 | `--hexis-profit-wallet`        | Address the program pays profit into. Defaults to the Hexis shared rewards pool. Only set it if Hexis hands you a different pool address.                           |
-| `--hexis-jup-key`              | Jupiter API key. Defaults to the Hexis fleet key; also read from `$HEXIS_JUP_KEY`.                                                                                  |
-| `--hexis-metrics-config`       | Value exported as `SOLANA_METRICS_CONFIG_ARB` in `validator.sh`. Defaults to the Hexis metrics host; also read from `$SOLANA_METRICS_CONFIG_ARB`.                   |
+| `--hexis-jup-key`              | Jupiter API key from Hexis. Required unless `--hexis-config` is used; also read from `$HEXIS_JUP_KEY` or `hexis.env`.                                                                                  |
+| `--hexis-metrics-config`       | Value exported as `SOLANA_METRICS_CONFIG_ARB` in `validator.sh`. From Hexis; required. Also read from `$SOLANA_METRICS_CONFIG_ARB` or `hexis.env`.                   |
 | `--hexis-lookup-tables`        | Comma-separated extra address lookup tables (see `lut.md`)                                                                                                          |
 | `--hexis-jupiter-token-ledger` | Jupiter TokenLedger (create with `hexis-setup`)                                                                                                                     |
 | `--hexis-okx-token-ledger`     | OKX TokenLedger PDA (create with `hexis-setup okx-token-ledger`)                                                                                                    |
@@ -187,8 +252,7 @@ to compile from source anyway.
 | `--no-hexis-control`           | Leave the `[control]` table out and don't open the port                                                                                                             |
 
 The release lives in a **private** repo, and the download is a GitHub API call from
-_your_ machine using `gh`'s own token — `--github-ssh-key` is for git-over-SSH on the
-server and has nothing to do with it. Make sure `gh auth status` shows an account with
+_your_ machine using `gh`'s own token — nothing GitHub-related is put on the server. Make sure `gh auth status` shows an account with
 access; the script checks this before it touches the server. Assets are verified against
 the release's `checksums.txt` and a mismatch aborts the run.
 
@@ -207,13 +271,28 @@ the release's `checksums.txt` and a mismatch aborts the run.
 With `--hexis-config`, nothing is generated — that file owns `signer_path` and
 `profit_wallet`.
 
-**Defaults come from the Hexis mainnet sample config**, including the two fleet-wide
-credentials — the Jupiter API key and the `SOLANA_METRICS_CONFIG_ARB` metrics string.
-Both are the values Hexis hands to every operator, both are committed in this (public)
-repo, and both are overridable with `--hexis-jup-key` / `--hexis-metrics-config` or by
-exporting `HEXIS_JUP_KEY` / `SOLANA_METRICS_CONFIG_ARB`. **Check the rest against what
-Hexis gave you** — especially the token ledgers and the lookup tables, which are
-per-operator — before going live.
+**Defaults come from the Hexis mainnet sample config**, and all of them are public
+on-chain addresses. **Check them against what Hexis gave you** — especially the token
+ledgers and the lookup tables, which are per-operator — before going live.
+
+**The two Hexis credentials are not in this repository**: the Jupiter API key and the
+`SOLANA_METRICS_CONFIG_ARB` metrics string. Hexis gives both to its operators. Supply
+them one of three ways, first match wins:
+
+1. `--hexis-jup-key <key>` and `--hexis-metrics-config <str>`
+2. the environment: `HEXIS_JUP_KEY` and `SOLANA_METRICS_CONFIG_ARB`
+3. `hexis.env` beside the scripts — copy `hexis.env.example`, fill it in once; git
+   ignores it, and the scripts read it without running it
+
+Give none of them and `arise.sh --hexis` and `ascend.sh migrate` **ask for what is
+missing** when run at a terminal. What you type is not shown, and each answer can be
+saved to `hexis.env` (mode 600) so you are asked once. The metrics string is the same
+for every Hexis host, so one `hexis.env` on your laptop serves all your servers.
+
+Without a terminal, or with `--yes`, nothing is asked: the run stops before touching the
+host when one was never given. Passing `""` — or pressing Enter alone at the prompt — is
+a decision to set up without it. With `--hexis-config` the Jupiter key is not asked for,
+since your file carries it.
 
 Example:
 
@@ -256,25 +335,35 @@ exec agave-validator \
 The validator service is **enabled but not started**. Do not start it until you've verified everything:
 
 ```bash
-# SSH in as sol
+# SSH in as sol to review the generated validator script
 ssh -i ~/.ssh/id_ed25519 sol@<host>
-
-# Review the generated validator script
 cat ~/validator.sh
 
 # Look for any FILL_IN_ placeholders (means region detection failed)
 grep FILL_IN ~/validator.sh
 
-# Start the validator when ready
-sudo systemctl start sol
+# Start the validator when ready — sol has no sudo, so this is done as the admin user
+ssh -t -i ~/.ssh/id_ed25519 monarch@<host> 'sudo systemctl start sol'
 
-# Watch logs
-tail -f ~/logs/solana-validator.log    # testnet
-tail -f ~/logs/agave-validator.log     # mainnet
-
-# Monitor catchup
+# Back as sol: watch logs and monitor catchup
+tail -f ~/logs/agave-validator.log
 solana catchup --our-localhost
 ```
+
+### Turning on perch
+
+perch pages you when the validator stops voting. The script installs it with perch's own installer (which checks the download against the published checksum), fills in this validator's identity, vote account and cluster in `/etc/perch/config.toml`, and adds the admin user to the `perch` group. It is **not started**, because it needs alert secrets only you have. As the admin user:
+
+```bash
+sudo nano /etc/perch/env                                        # Telegram / PagerDuty / heartbeat secrets
+sudo nano /etc/perch/config.toml                                # delete the section of any channel you do not use
+sudo bash -c 'set -a; . /etc/perch/env; perch --check-config'
+sudo systemctl enable --now perch
+
+perch maint restart                                             # before a planned restart, so it does not page
+```
+
+`sol` is deliberately not in the `perch` group: the validator account cannot silence the watchtower. The config uses perch's standalone layout with free public RPC endpoints. The script also installs `node_exporter` (answering on `127.0.0.1:9100` only) and gives perch a `[[hosts]]` entry for this machine, which turns on its disk and kernel-advisory checks. On a Firedancer host, `reawaken.sh cutover` adds Firedancer's own metrics to that same entry (perch 1.6.0 or newer). An existing perch config is never changed.
 
 ### Verifying XDP (unless `--no-xdp` was used)
 
@@ -336,6 +425,52 @@ doesn't:
 — an existing config is the operator's and is never overwritten. A host already running
 Hexis is skipped by that patcher entirely, which is why `--fix-metrics` exists.
 
+### Changing client on a host that already runs one
+
+`arise.sh` describes what a host should be, so changing client is the same command
+with a different `--client`. Run it with the flags the host was set up with, the new
+client, and `--restart`:
+
+```bash
+# Jito -> Agave
+./arise.sh --host <ip> --ssh-key ~/.ssh/<key> --identity <staked_identity.json> \
+    --vote-account <pubkey> --network mainnet \
+    --client agave --client-version v4.4.1 --restart
+```
+
+It first reports what the host runs today. The new client is built beside the one that
+is running (`releases/<tag>/`), `validator.sh` and the unit are rewritten for it, and
+the running validator is not touched. `--restart` then checks that the new binary runs,
+waits for a restart window (`--min-idle-time`, default 20 minutes;
+`--max-delinquent-stake`, default 5%), declares the restart to perch if it is running,
+and exits the validator through the binary it is executing; systemd brings it back on
+the new setup. Without `--restart` the exact command is printed and nothing restarts.
+
+| From | To | How |
+|---|---|---|
+| Jito | Agave, or back | `arise.sh --client <agave\|jito> --client-version <tag> --restart` |
+| Jito or Agave | a newer version of the same | the same, with the new `--client-version` |
+| Jito or Agave | Jito + Hexis | `ascend.sh migrate` (patches the `validator.sh` you have), or `arise.sh --hexis --hexis-tag <tag> --restart` |
+| Jito + Hexis | plain Jito or Agave | `arise.sh` without `--hexis`, with `--client-version <tag> --restart`. The arb flags go and the Control port is closed; `/home/sol/hexis` is left on disk |
+| Jito, Agave or Jito + Hexis | Firedancer | `reawaken.sh stage`, then `cutover` — or `arise.sh --client firedancer --fd-tag <tag> --restart`, which leaves the running `validator.sh` and unit alone, stages, and hands over to `cutover` |
+| Firedancer | the Agave-family client it ran before | `reawaken.sh rollback` |
+| Firedancer | a different Agave-family client, or one at all on a host set up as Firedancer | `arise.sh --client <jito\|agave> --client-version <tag> --restart`. The client is installed beside Firedancer, `sol.service` is written but not enabled, and `--restart` hands over to `reawaken.sh rollback` |
+
+`reawaken.sh` asks before it stops anything, including when `arise.sh` hands over to it.
+
+Things to know:
+
+- A source build takes the better part of an hour and uses every core. On a host with
+  a live validator, expect it to be slower for that time.
+- `active_release` is repointed when the build finishes, a little before `validator.sh`
+  is rewritten. An unplanned restart in that gap fails to start and is retried by
+  systemd until the rewrite lands, a matter of seconds.
+- If XDP is on and the NIC's ring sizes are not yet powers of two, they are resized,
+  which drops the link for a moment. The script warns when a validator is running. A
+  NIC that is already right is not touched.
+- Jito and Agave at matching versions share the ledger format, so the ledger, accounts
+  and snapshots are reused as they are.
+
 ### Upgrading and migrating
 
 `arise.sh` builds a host from scratch. For a host that already exists, use `ascend.sh`:
@@ -359,8 +494,12 @@ installs the binary and `hexis-setup`, generates the keypairs, writes `arb-confi
 opens the Control port, and patches the existing `validator.sh` after showing you the
 diff. It refuses rather than guesses if the startup script isn't a shape it recognises.
 
-On a host that runs [perch](https://github.com/TheChimpions/perch-watchtower)
-(`/home/sol/perch/maint` exists), every restart these scripts make is declared to it first
+On a host that runs [perch](https://github.com/TheChimpions/perch-watchtower), every
+restart these scripts make is declared to it first. perch is found in either place it
+can live: system-wide as `arise.sh` installs it (`perch` on the PATH, config in
+`/etc/perch`), or in the validator user's home on an older host (`/home/sol/perch/maint`).
+A system-wide perch can only be told through root, so `ascend.sh --restart` asks for
+sudo on such a host. The declaration is made
 with `maint restart`, so the watchtower does not page: `ascend.sh --restart` with a 1h
 deadline, once the restart window is open; `reawaken.sh cutover`, `upgrade` and `rollback`
 with 2h, which covers a reboot for huge pages and a full snapshot download. If perch cannot
@@ -369,6 +508,19 @@ be told, the restart goes ahead and the script says it may page.
 A cutover to Firedancer also takes this host's own RPC out of perch's `[[endpoints]]`
 (Firedancer runs without RPC, so perch would never see the validator recover), keeps the
 old file as `config.toml.bak-pre-firedancer`, and restarts perch. `rollback` puts it back.
+
+The same cutover points perch at **Firedancer's own metrics**, when the host runs perch
+1.6.0 or newer: it adds `firedancer_url` to the `[[hosts]]` entry for this machine, using
+the address and port under `[tiles.metric]` in Firedancer's config. perch then reports
+what Firedancer says about itself — voting, replay, turbine, a hung tile, how full the
+accounts index is — which is the local view a validator without RPC otherwise lacks. No
+firewall change is needed: perch is on the same machine. An older perch refuses a config
+with that key, so it is left alone and you are told to upgrade it; run `cutover` again
+afterwards (on a host already on Firedancer it only does the leftover steps, this one
+included). The new config is checked with perch itself before it replaces the old one,
+and `rollback` takes the line out again. A fresh `arise.sh --client firedancer` install
+gets this too: `arise.sh` writes the `[[hosts]]` entry and the cutover that first starts
+Firedancer fills it in.
 
 Neither enables the arb, and neither restarts the validator unless you pass `--restart`
 — which runs `exit` (wait for the restart window, then stop; systemd brings it back), and
@@ -389,7 +541,20 @@ goal it only reports, and changes nothing:
 
 It shows the client and release the host runs, whether Firedancer is installed, staged
 or running, the newest Hexis Agave and Firedancer releases, and the command for each
-move that is possible from there. With a goal it runs that command through the script
+move that is possible from there.
+
+**Admin user.** The other scripts do their root work through an admin user, `monarch` by
+default. On a host where that login does not take your key (one set up before the admin
+user existed, say), `system.sh` tries the host's other login accounts with the same key
+and uses the first that gets in and holds sudo. It says which one it found, and every
+command it prints or runs carries `--admin-user <name>`. An `--admin-user` you pass is
+used as given.
+
+**Host checks.** The report also looks at a few things that are wrong whatever client
+runs, each with the command that fixes it: a `/` not owned by root, the validator user
+in the `docker` group or holding sudo, a firewall that is off, and keypair files other
+users can read. It reads them as the validator user and changes nothing.
+ With a goal it runs that command through the script
 that owns it, which still asks before it stops or starts a validator:
 
 | Goal | On a Jito / plain Agave host | On a Hexis Agave host | On a Firedancer host |
@@ -447,6 +612,10 @@ so on a Hexis or Jito host there is normally nothing to pass but the release.
 ./reawaken.sh rollback --host <ip> --ssh-key ~/.ssh/<key>
 ./reawaken.sh status   --host <ip> --ssh-key ~/.ssh/<key>
 
+# A Firedancer host set up by an older copy of these scripts: rewrite its unit so
+# every start fetches the snapshot from the mirror when needed. Restarts nothing.
+./reawaken.sh unit --host <ip> --ssh-key ~/.ssh/<key>
+
 # Later, on a host already running Firedancer: a newer release, or the one before
 ./reawaken.sh upgrade --host <ip> --ssh-key ~/.ssh/<key> --fd-tag '<newer tag>'
 ./reawaken.sh upgrade --host <ip> --ssh-key ~/.ssh/<key> --previous
@@ -465,12 +634,18 @@ current config.
 for 20; `--min-idle-time` changes either and `--now` skips the wait. The long default is
 for what a move between clients can need at worst: a reboot and a full snapshot download.
 
-**The reboot.** Firedancer needs 183 one-GiB pages. A server that has been up for a
-while usually cannot provide them (memory is fragmented), so the first start in `cutover`
-fails and says so. By then Agave is stopped and disabled and Firedancer is enabled:
-reboot the host, Firedancer starts by itself and takes its pages first thing, then run
-`cutover` once more to finish. On a mainnet validator that went this way, it was voting
-again about eleven minutes after Agave stopped.
+**The reboot.** Firedancer needs 183 one-GiB pages as contiguous memory. A server that
+has been up for a while often cannot provide them (memory is fragmented). `stage` and
+`status` print a "Huge pages" line saying how many are needed, how many are reserved and
+how long the host has been up; whether the kernel can find the rest is only known once
+Agave has stopped. `cutover` therefore does everything else first — Agave stopped and
+disabled, jag-snap retired, perch's dead endpoint removed — then gives the page cache
+back, compacts memory and starts Firedancer. If the pages still cannot be reserved it
+says so and asks to reboot the host (`--yes` answers that too). It then waits for the
+host to come back and for `firedancer.service`, which is enabled and takes its pages
+first thing. Nothing needs to be run after the reboot. Decline, and it prints the reboot
+command and the way back (`rollback`). On a mainnet validator that needed the reboot, it
+was voting again about eleven minutes after Agave stopped.
 
 `--dry-run` on any mode prints the plan, the full `config.toml` and the unit without
 changing the host or asking for sudo.
@@ -509,16 +684,34 @@ Things that change on Firedancer:
   - `cutover` links Agave's newest full snapshot and incremental into Firedancer's
     snapshot directory.
   - `cutover` and `upgrade` fetch the current full snapshot from an HTTP mirror
-    (`--snapshot-mirror`, default `https://snapshots.avorio.network/mainnet-beta`) in
-    eight parallel ranges, when it is newer than what is on disk. The mirror is a third
-    party: its file is taken only when a validator on the snapshot allow list serves a
-    full snapshot with the same slot and hash. That check is on the name, not the bytes.
-    `--no-snapshot-prefetch` turns it off.
+    (`--snapshot-mirror`, default `https://snapshots.avorio.network/mainnet-beta`), when
+    it is newer than what is on disk. The mirror is a third party: its file is taken
+    only when a validator on the snapshot allow list serves a full snapshot with the
+    same slot and hash. That check is on the name, not the bytes.
+  - **Every start of `firedancer.service` does the same**, as a pre-start step
+    (`/usr/local/sbin/firedancer-snapshot-prefetch`, root's file). That is what covers a
+    crash, a reboot, or a restart nobody planned: without it such a start is the hour's
+    download. It runs after `configure`, so the huge pages are taken first; it fetches
+    nothing when the snapshot on disk is still the one the cluster is on, which takes
+    about a second to find out; and it can never stop a start — on any failure, or
+    after 15 minutes, Firedancer starts and downloads from its peers as before. On a
+    host that has never run a validator it asks a public RPC endpoint where the
+    trusted validators serve their snapshots.
+
+  The file is fetched in 1 GiB pieces, eight at a time, each written straight to its
+  place and retried by itself, so a dropped connection costs one piece, not the whole
+  download. After a fetch, the two newest full snapshots are kept and older ones are
+  removed with their incrementals. `--no-snapshot-prefetch` turns all of it off:
+  given to `stage` or `unit`, it leaves the pre-start step out of the unit.
+
+  `stage` writes the unit with the pre-start step, so a fresh install and a host moving
+  from Agave both get it. A host staged before this existed gets it from
+  `reawaken.sh unit`, which rewrites the unit and the script and restarts nothing.
 
   Firedancer starts from the local file when a trusted peer still serves incrementals
-  built on that full slot; if anything above fails, it downloads as before. The full
-  snapshot rolls over about every six hours, so a cutover that straddles a rollover
-  (with a reboot in between, say) can still end in the download.
+  built on that full slot; if anything above fails, it downloads as before. Measured on
+  one host: about 600 MB/s from the mirror against 33 MB/s from the trusted peer, and
+  under four minutes from the restart to the tip once the file was on disk.
 
   `cutover` stops the jag-snap container and closes 18899/tcp; `rollback` starts it and
   reopens the port. Stake that depends on serving snapshots (JagPool) does not carry
@@ -618,23 +811,27 @@ sudo ~/firedancer/firedancer wait --config ~/firedancer/config.toml --min-idle-s
 
 **"Could not auto-detect Jito region"** — the script will warn and continue. Open `~/validator.sh` on the server and replace the `<FILL_IN_...>` placeholders with values from https://jito.network/docs or pass `--jito-region` on the next run.
 
-**Docker build fails with "permission denied"** — the script runs docker as root. If you're running commands manually as `sol`, either use `sudo docker` or log out and back in after being added to the docker group.
+**"Cannot SSH to monarch@..."** — the admin user does not exist yet. Pass `--root-user root` on a fresh server, or `--root-user sol` on a server set up by an older version.
 
-**Disks not detected** — check `lsblk` on the server. Auto-detection skips any drive that has mounted partitions or an existing filesystem. Use `--ledger-disk` / `--accounts-disk` to override.
+**"effective sshd config is missing ..."** — another file in `/etc/ssh/sshd_config.d/` that sorts before `00-arise.conf`, or a `Match` block, overrides the hardening. The change was rolled back; remove the conflicting setting and rerun.
+
+**"Refusing to touch /dev/..."** — the disk has partitions, a mount, or is part of RAID/LVM. If it really is safe to erase, wipe it yourself with `wipefs -a` and rerun.
+
+**Disks not detected** — check `lsblk` on the server. Auto-detection skips any drive that has partitions, a mount, or any existing filesystem or RAID signature. Use `--ledger-disk` / `--accounts-disk` to override.
 
 **`--hexis-tag` fails** — the release download runs `gh` on **your** machine, not the server. Make sure `gh auth status` works and your account can see `hexishq/hexis-validator-docs`, or download the asset yourself and pass `--hexis-binary`.
 
 **Arb never trades** — it boots disabled. Check `arb get`, then `/home/sol/hexis/arb-enable.sh`. If the validator refuses to boot at all, the config had a bad key: `agave-validator run` aborts on a typo in `arb-config.toml`.
 
-**`cutover` fails with "ENOMEM … reserve gigantic pages"** — expected on a server that has been up for a while. Reboot it and run `cutover` again; see [the reboot](#moving-to-firedancer-reawakensh).
+**`cutover` says Firedancer "could not reserve its 1 GiB pages"** — expected on a server that has been up for a while. Answer yes to the reboot it offers, or reboot the host yourself; Firedancer starts on its own and nothing needs to be run afterwards. See [the reboot](#moving-to-firedancer-reawakensh).
 
 **A `firedancer` command says `[arb.signer_key_path] is empty`** — it was run without `--config /home/sol/firedancer/config.toml`.
 
 **`firedancer wait` says "insufficient permissions"** — it needs `sudo`.
 
-**Firedancer downloads the full snapshot at start anyway** — no trusted peer still builds incrementals on the full snapshot that was on disk. It takes about an hour; nothing is wrong.
+**Firedancer downloads the full snapshot at start anyway** — the pre-start step did not put a current one on disk. `journalctl -u firedancer | grep 'snapshot pre-download'` says why: the mirror did not answer, no trusted validator served the same snapshot, or the download ran past its deadline. The download from the peers takes about an hour; nothing is wrong. A host staged by an older copy of these scripts has no pre-start step at all: `./reawaken.sh unit` adds it.
 
-**Build fails** — the Jito build needs `--github-ssh-key` and the key must be authorized on the `TheChimpions/jito-solana` fork.
+**Build fails** — check that the tag exists in the repo (`git ls-remote --tags https://github.com/jito-foundation/jito-solana.git`) and that the server has enough RAM and disk for a release build.
 
 ---
 
@@ -643,7 +840,8 @@ sudo ~/firedancer/firedancer wait --config ~/firedancer/config.toml --min-idle-s
 - Vote account creation (do this yourself with `solana create-vote-account`)
 - Stake delegation
 - Identity hot-swap (documented under [Swapping to staked identity](#swapping-to-staked-identity), not automated)
-- Monitoring / alerting (Prometheus, Grafana). On a host that runs perch, the scripts tell it about restarts; they do not install it
+- Prometheus / Grafana, and perch's alert secrets (perch itself and the node_exporter it reads are installed by `arise.sh`)
+- Snapshot serving — jag-snap is no longer set up; `reawaken.sh` still retires it on hosts that have it
 - DoubleZero: `reawaken.sh` carries the shred receiver over and sets the queue mode a GRE tunnel needs, but installing and connecting DoubleZero is yours
 - Backup of tower files and identity keys
 - Disaster recovery
@@ -657,6 +855,8 @@ system.sh          report what a host runs and route a goal to the script that o
 arise.sh           provision a fresh server into a validator
 ascend.sh          upgrade / migrate / promote the Hexis Agave client on an existing server
 reawaken.sh        stage / cutover / rollback / upgrade / status for Firedancer
+lib/remote.sh      how every script reaches a server: admin user for sudo, scripts and
+                   passwords over SSH stdin, strict error handling
 lib/hexis.sh       shared Hexis defaults, logging, config rendering, checksum verification,
                    release discovery, perch hand-off
 lib/firedancer.sh  validator.sh parsing, Firedancer config and unit rendering, snapshot

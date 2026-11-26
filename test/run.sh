@@ -17,6 +17,11 @@ trap 'rm -rf "$WORK"' EXIT
 
 export PATH="${ROOT}/test/stubs:$PATH"
 export STUB_LOG=/dev/null
+# The Hexis credentials are not in the repository. Tests get made-up ones from
+# the environment, and never read a real hexis.env that may sit beside the scripts.
+export HEXIS_ENV_FILE="$WORK/no-hexis.env"
+export HEXIS_JUP_KEY="test-jup-key"
+export SOLANA_METRICS_CONFIG_ARB="host=https://metrics.test,db=d,u=u,p=test-pw"
 
 # Fixed inputs so output is stable
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/key" <<<y >/dev/null 2>&1
@@ -38,6 +43,21 @@ assert_not_contains() {
 assert_eq() {
   if [[ "$1" == "$2" ]]; then _ok; else _fail "expected [$2], got [$1]"; fi
 }
+# file_mode <path> — permission bits in octal. GNU stat first: on Linux
+# 'stat -f' is a different command that succeeds and prints something else.
+file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+
+# assert_order <text> <first> <second> — both are there, and the first line
+# holding <first> comes before the first line holding <second>
+assert_order() {
+  local a b
+  a=$(grep -nF -- "$2" <<<"$1" | head -1 | cut -d: -f1)
+  b=$(grep -nF -- "$3" <<<"$1" | head -1 | cut -d: -f1)
+  if [[ -z "$a" ]]; then _fail "expected to find: $2"
+  elif [[ -z "$b" ]]; then _fail "expected to find: $3"
+  elif (( a < b )); then _ok
+  else _fail "expected [$2] (line $a) before [$3] (line $b)"; fi
+}
 assert_file_missing() {
   if [[ -e "$1" ]]; then _fail "expected $1 not to exist"; else _ok; fi
 }
@@ -48,8 +68,27 @@ arise() { ( cd "$ROOT" && ./arise.sh "$@" ) 2>&1; }
 ascend() { ( cd "$ROOT" && ./ascend.sh "$@" ) 2>&1; }
 system() { ( cd "$ROOT" && ./system.sh "$@" ) 2>&1; }
 
+# fd_host <file> <facts overrides, \n separated> <validator.sh body lines, \n separated>
+# Builds the stub responses for a host: its facts, validator.sh, arb-config.toml.
+fd_host() {
+  local file="$1" facts="$2" body="$3"
+  local base='vendor=AuthenticAMD\nfamily=25\nmodel=AMD EPYC 9254 24-Core Processor\nflags=avx2 avx512f \nglibc=2.39\nmem_gib=377\nip=9.9.9.9\ndoublezero=no\nufw=active\nagave_active=active\nagave_enabled=enabled\nfd_active=inactive\nfd_enabled=disabled\nfd_unit=no\nfd_release=\nfd_version=\nfd_config=no\nfd_signer=no\nvsh=yes'
+  {
+    printf '%s\n' '*echo ok*|ok'
+    printf '%s\n' "*host-facts*|${facts}${facts:+\\n}${base}"
+    printf '%s\n' "*cat /home/sol/validator.sh*|#!/bin/bash\\nexec agave-validator \\\\\\\\\\n    --identity /home/sol/identity.json \\\\\\\\\\n    --authorized-voter /home/sol/staked_identity.json \\\\\\\\\\n    --vote-account VoTe111 \\\\\\\\\\n    --ledger /mnt/ledger \\\\\\\\\\n    --accounts /mnt/accounts \\\\\\\\\\n    --entrypoint entrypoint.mainnet-beta.solana.com:8001 \\\\\\\\\\n    --expected-genesis-hash 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d \\\\\\\\\\n${body}    --limit-ledger-size"
+    printf '%s\n' '*cat /home/sol/hexis/arb-config.toml*|[engine]\nsigner_path    = "/home/sol/hexis/arb_signer_keypair.json"\njupiter_token_ledger = "JUPfromAgave"\nokx_token_ledger = "OKXfromAgave"'
+    printf '%s\n' '*key-info*|/home/sol/identity.json|/home/sol/unstaked_identity.json|UNSTAKEDpk\n/home/sol/staked_identity.json|/home/sol/staked_identity.json|STAKEDpk'
+    printf '%s\n' '*cat /home/sol/firedancer/config.toml*|name = "fd1"\nuser = "sol"\n[paths]\n    base = "/mnt/ledger/firedancer"\n    snapshots = "/mnt/ledger/firedancer/snapshots"'
+  } > "$file"
+}
+L='\\\\\\\\\\n'   # one validator.sh line break, as the stub file needs it
+KV="    --known-validator K1 ${L}    --known-validator K2 ${L}    --known-validator K3 ${L}"
+JITO="    --block-engine-url https://ny.mainnet.block-engine.jito.wtf ${L}    --commission-bps 1000 ${L}    --merkle-root-upload-authority AUTH111 ${L}    --shred-receiver-address 233.84.178.1:7733,1.2.3.4:1002${L}"
+HEXIS="    --arb-config /home/sol/hexis/arb-config.toml ${L}"
+
 # Common argument sets
-arise_base=(--host 1.2.3.4 --vote-account V1 --network mainnet --commission-bps 0
+arise_base=(--host 1.2.3.4 --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network mainnet --commission-bps 0
             --jito-region frankfurt --no-auto-disks --no-xdp --dry-run)
 
 # ---------------------------------------------------------------------------
@@ -255,6 +294,352 @@ EOF
   fi
 fi
 
+# === clients and the security model ========================================
+if should_run "client"; then
+group "clients and security model"
+  F="$ROOT/test/fixtures"
+  PK=7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2
+  cl_base=(--host 1.2.3.4 --vote-account "$PK" --network mainnet --commission-bps 0
+           --jito-region frankfurt --no-auto-disks --dry-run
+           --ssh-key "$WORK/key" --identity "$WORK/id.json")
+
+  out="$(arise "${cl_base[@]}" --no-xdp)"
+
+  it "jito is the default client and builds from the public repo over https"
+  assert_contains "$out" "CLIENT_REPO=https://github.com/jito-foundation/jito-solana.git"
+
+  it "jito gets the Block Engine flags"
+  assert_contains "$out" "--block-engine-url https://frankfurt.mainnet.block-engine.jito.wtf"
+
+  it "the shred receivers are the Jito region and DoubleZero, nothing else"
+  assert_contains "$out" "--shred-receiver-address 64.130.50.14:1002,233.84.178.1:7733 \\"
+
+  it "RPC stays on localhost and out of gossip"
+  assert_contains "$out" "--private-rpc"
+
+  it "no public RPC address is advertised"
+  assert_not_contains "$out" "--public-rpc-address"
+
+  it "the port range is the 26 ports Agave 4 needs"
+  assert_contains "$out" "--dynamic-port-range 8000-8026"
+
+  it "the firewall opens that range and not 8000-10000"
+  assert_contains "$out" "FIREWALL_PORT_RANGE=8000:8026"
+
+  it "the old wide firewall rule is removed"
+  assert_contains "$out" "ufw delete allow 8000:10000/tcp"
+
+  it "no GitHub key is copied to the server"
+  assert_not_contains "$out" "IdentityFile ~/.ssh/github_key"
+
+  it "a GitHub key left by an older run is reported"
+  assert_contains "$out" "delete it and revoke it on GitHub"
+
+  it "jag-snap is not set up"
+  assert_not_contains "$out" "docker run"
+
+  it "sol's old sudo access is revoked"
+  assert_contains "$out" 'rm -f "/etc/sudoers.d/$SOL_USER"'
+
+  it "sshd is hardened through a drop-in that is checked before reload"
+  assert_contains "$out" 'DROPIN="$DROPIN_DIR/00-arise.conf"'
+
+  it "root login is turned off by default"
+  assert_contains "$out" "PERMIT_ROOT_LOGIN=no"
+
+  it "--keep-root-login keeps key-only root login"
+  assert_contains "$(arise "${cl_base[@]}" --no-xdp --keep-root-login)" "PERMIT_ROOT_LOGIN=prohibit-password"
+
+  it "CPU mitigations stay on unless asked"
+  assert_contains "$out" "DISABLE_CPU_MITIGATIONS=false"
+
+  it "no script is written to /tmp on the server"
+  assert_not_contains "$out" "/tmp/_setup_script"
+
+  it "perch is installed by default"
+  assert_contains "$out" "Installing perch watchtower"
+
+  # The part of the perch step that gives it this machine's [[hosts]] entry,
+  # lifted from the script a dry run prints and run against scratch files.
+  ne_dir="$(mktemp -d)"; mkdir "$ne_dir/bin"
+  ne_block="$(printf '%s\n' "$out" | sed -n '/^  HOSTS_NOTE="no \[\[hosts\]\]/,/^    HOSTS_NOTE="\[\[hosts\]\] entry in the starter/p' \
+    | sed "s|/etc/default/prometheus-node-exporter|$ne_dir/defaults|")"
+  # The lifted script is written for GNU sed. BSD sed wants an argument after -i.
+  printf '#!/bin/sh\nif [ "$1" = "-i" ] && ! /usr/bin/sed --version >/dev/null 2>&1; then shift; exec /usr/bin/sed -i "" "$@"; fi\nexec /usr/bin/sed "$@"\n' > "$ne_dir/bin/sed"
+  printf '#!/bin/sh\necho "$@" >> "%s/systemctl.calls"\n' "$ne_dir" > "$ne_dir/bin/systemctl"
+  printf '#!/bin/sh\necho "$@" >> "%s/apt.calls"\n[ -n "$APT_FAILS" ] && exit 100\nprintf "#!/bin/sh\\n" > "%s/bin/prometheus-node-exporter"; chmod +x "%s/bin/prometheus-node-exporter"\n' \
+    "$ne_dir" "$ne_dir" "$ne_dir" > "$ne_dir/bin/apt-get"
+  chmod +x "$ne_dir/bin/sed" "$ne_dir/bin/systemctl" "$ne_dir/bin/apt-get"
+  ne_starter() { printf '%s\n' '[[validators]]' 'label = "val-1"' '' '[digest]' 'enabled = false' > "$ne_dir/new.toml"; }
+  # shellcheck disable=SC2034  # NEW and PERCH_LABEL are read by the lifted script
+  ne_run() { ( PATH="$ne_dir/bin:$PATH"; NEW="$ne_dir/new.toml"; PERCH_LABEL="val-1"; eval "$ne_block
+  fi"; echo "$HOSTS_NOTE" ); }
+
+  it "the dry run shows the step that gives perch this machine's [[hosts]] entry"
+  assert_contains "$ne_block" "prometheus-node-exporter"
+
+  ne_starter; printf '%s\n' '# defaults' 'ARGS=""' > "$ne_dir/defaults"
+  ne_out="$(ne_run)"
+  it "a fresh install gets node_exporter, answering on loopback only"
+  assert_contains "$(cat "$ne_dir/apt.calls")" "install -y --no-install-recommends prometheus-node-exporter"
+  assert_eq "$(grep '^ARGS=' "$ne_dir/defaults")" 'ARGS="--web.listen-address=127.0.0.1:9100"'
+  assert_contains "$(cat "$ne_dir/systemctl.calls")" "restart prometheus-node-exporter"
+
+  it "and perch gets a [[hosts]] entry for this machine, tied to its validator"
+  assert_eq "$(sed -n '/^\[\[hosts\]\]/,$p' "$ne_dir/new.toml")" "$(printf '%s\n' '[[hosts]]' 'name = "val-1-hw"' 'url = "http://127.0.0.1:9100/metrics"' 'validator = "val-1"')"
+  assert_contains "$ne_out" "disks read from node_exporter on 127.0.0.1:9100"
+
+  it "that entry is the one a later cutover adds Firedancer's metrics to"
+  printf '%s\n' '[tiles.metric]' '    prometheus_listen_address = "10.1.2.3"' > "$ne_dir/fd.toml"
+  printf '#!/bin/sh\ncase "$*" in *--version*) echo "perch 1.6.0 (abc)" ;; esac\n' > "$ne_dir/bin/perch"; chmod +x "$ne_dir/bin/perch"
+  ( PATH="$ne_dir/bin:$PATH"; eval "$(perch_firedancer_on_cmd nobody-here "$ne_dir/fd.toml" | sed "1s|.*|perch_cfg=\"$ne_dir/new.toml\"|")" ) >/dev/null
+  assert_eq "$(grep -A1 '^url = "http://127.0.0.1:9100/metrics"' "$ne_dir/new.toml" | tail -1)" 'firedancer_url = "http://10.1.2.3:7999/metrics"'
+
+  ne_starter; rm -f "$ne_dir/apt.calls" "$ne_dir/systemctl.calls"
+  ne_run >/dev/null
+  it "node_exporter already there and already on loopback is not reinstalled or restarted"
+  assert_file_missing "$ne_dir/apt.calls"
+  assert_not_contains "$(cat "$ne_dir/systemctl.calls")" "restart"
+
+  ne_starter; rm -f "$ne_dir/bin/prometheus-node-exporter"
+  ne_out="$(APT_FAILS=1 ne_run)"
+  it "node_exporter that cannot be installed costs the entry, not the install"
+  assert_contains "$ne_out" "node_exporter could not be installed"
+  assert_not_contains "$(cat "$ne_dir/new.toml")" "[[hosts]]"
+
+  printf '%s\n' '[[hosts]]' 'name = "theirs"' 'url = "http://10.0.0.5:9100/metrics"' > "$ne_dir/new.toml"; rm -f "$ne_dir/apt.calls"
+  ne_out="$(ne_run)"
+  it "a starter config that already has a [[hosts]] entry is not given a second"
+  assert_eq "$(grep -c '^\[\[hosts\]\]' "$ne_dir/new.toml")" "1"
+  assert_file_missing "$ne_dir/apt.calls"
+  rm -rf "$ne_dir"
+
+  it "--no-perch skips it"
+  assert_contains "$(arise "${cl_base[@]}" --no-xdp --no-perch)" "Skipping perch watchtower"
+
+  out="$(arise "${cl_base[@]}" --no-xdp --client agave --client-version v4.4.1)"
+
+  it "agave builds from the Anza repo"
+  assert_contains "$out" "CLIENT_REPO=https://github.com/anza-xyz/agave.git"
+
+  it "agave gets no Jito flags"
+  assert_not_contains "$out" "--block-engine-url"
+
+  it "agave gets no tip programs"
+  assert_not_contains "$out" "--tip-payment-program-pubkey"
+
+  out="$(arise "${cl_base[@]}" --client firedancer --fd-tag v1.2.3)"
+
+  it "firedancer builds nothing from source"
+  assert_contains "$out" "Firedancer ships as a binary"
+
+  it "firedancer writes validator.sh with the Block Engine settings for reawaken to read"
+  assert_contains "$out" "--block-engine-url https://frankfurt.mainnet.block-engine.jito.wtf"
+
+  it "firedancer leaves sol.service disabled"
+  assert_contains "$out" "IS_FIREDANCER=true"
+
+  it "firedancer hands over to reawaken stage with the release and the admin user"
+  assert_contains "$out" "reawaken.sh stage --host 1.2.3.4 --ssh-key $WORK/key --admin-user monarch --fd-tag v1.2.3 --generate-signer"
+
+  it "firedancer passes a supplied arb signer on"
+  assert_contains "$(arise "${cl_base[@]}" --client firedancer --fd-tag v1.2.3 --hexis-signer "$WORK/signer.json")" \
+    "--hexis-signer $WORK/signer.json"
+
+  it "firedancer points at cutover to start it"
+  assert_contains "$out" "reawaken.sh cutover --host 1.2.3.4"
+
+  it "firedancer is mainnet only"
+  assert_contains "$(arise --host 1.2.3.4 --vote-account "$PK" --network testnet --dry-run \
+    --ssh-key "$WORK/key" --identity "$WORK/id.json" --client firedancer)" "requires --network mainnet"
+
+  it "--hexis needs the jito client"
+  assert_contains "$(arise "${cl_base[@]}" --client agave --hexis --hexis-binary "$WORK/binary")" "--hexis needs --client jito"
+
+  it "an unknown client is refused"
+  assert_contains "$(arise "${cl_base[@]}" --client frankendancer)" "--client must be"
+
+  it "--fd-tag without the firedancer client is refused"
+  assert_contains "$(arise "${cl_base[@]}" --fd-tag v1)" "only go with --client firedancer"
+
+  it "a vote account that is not a pubkey is refused"
+  assert_contains "$(arise --host 1.2.3.4 --vote-account 'x;reboot' --network mainnet --dry-run \
+    --ssh-key "$WORK/key" --identity "$WORK/id.json")" "not a valid base58 pubkey"
+
+  it "a disk that is not a /dev path is refused"
+  assert_contains "$(arise "${cl_base[@]}" --ledger-disk 'nvme0n1; rm -rf /')" "must be a /dev path"
+
+  # --- lib/remote.sh ---
+  source "${ROOT}/lib/remote.sh"
+
+  it "a wrapped script is parsed whole and reads no stdin"
+  assert_eq "$(printf 'echo one\ncat\necho two\n' | wrap_script | bash)" "$(printf 'one\ntwo')"
+
+  it "a wrapped script stops at the first failing command"
+  assert_eq "$(printf 'echo one\nfalse\necho two\n' | wrap_script | bash; echo "rc=$?")" "$(printf 'one\nrc=1')"
+
+  it "a wrapped script's exit status is the script's"
+  printf 'exit 7\n' | wrap_script | bash; assert_eq "$?" "7"
+
+  it "emit_vars quotes values so they cannot run as code"
+  # shellcheck disable=SC2034  # read by name through emit_vars
+  HOSTILE='x"; touch '"$WORK"'/pwned; echo "'
+  ( emit_vars HOSTILE; echo 'printf "%s" "$HOSTILE" > /dev/null' ) | wrap_script | bash
+  assert_file_missing "$WORK/pwned"
+
+  it "the sudo password is sent on stdin, never on the command line"
+  sudo_run() {   # <log name> <root_script | other shell text>; env comes from the caller
+    bash -c "
+      source '${ROOT}/lib/hexis.sh'; source '${ROOT}/lib/remote.sh'
+      SSH_KEY='$WORK/key'; SSH_HOST=1.2.3.4; SOL_USER=sol; ADMIN_USER=monarch; DRY_RUN=false; remote_init
+      $2" > "$WORK/$1.out" 2>&1
+  }
+  STUB_LOG="$WORK/ssh.log" SUDO_PASS='s3cret-pass' sudo_run pass "ask_sudo_pass && echo 'echo hi' | root_script"
+  assert_not_contains "$(cat "$WORK/ssh.log")" "s3cret-pass"
+
+  it "root scripts run through the admin user with sudo reading stdin"
+  assert_contains "$(cat "$WORK/ssh.log")" "monarch@1.2.3.4 sudo -k -S -p '' bash -s"
+
+  it "with passwordless sudo no password line is put in front of the script"
+  STUB_SUDO_NOPASS=1 STUB_LOG="$WORK/nopass.ssh" STUB_SCRIPT_LOG="$WORK/nopass.scripts" SUDO_PASS='s3cret-pass' \
+    sudo_run nopass "ask_sudo_pass && echo 'echo hi' | root_script"
+  assert_contains "$(cat "$WORK/nopass.ssh")" "monarch@1.2.3.4 sudo -n bash -s"
+  assert_not_contains "$(cat "$WORK/nopass.ssh")" "sudo -k -S"
+  assert_not_contains "$(cat "$WORK/nopass.scripts")" "s3cret-pass"
+  assert_contains "$(cat "$WORK/nopass.out")" "passwordless sudo"
+
+  it "with passwordless sudo nobody is asked for a password"
+  STUB_SUDO_NOPASS=1 STUB_LOG="$WORK/noprompt.ssh" sudo_run noprompt "ask_sudo_pass < /dev/null && echo SETTLED"
+  assert_contains "$(cat "$WORK/noprompt.out")" "SETTLED"
+  assert_not_contains "$(cat "$WORK/noprompt.out")" "Enter sudo password"
+
+  it "a root script refuses to run before sudo has been checked"
+  STUB_LOG="$WORK/unasked.ssh" SUDO_PASS='s3cret-pass' sudo_run unasked "echo 'echo hi' | root_script; echo status=\$?"
+  assert_contains "$(cat "$WORK/unasked.out")" "status=1"
+  assert_file_missing "$WORK/unasked.ssh"
+fi
+
+# === Hexis credentials ======================================================
+if should_run "credentials"; then
+group "Hexis credentials (never in the repository)"
+  F="$ROOT/test/fixtures"
+  hexis_args=("${arise_base[@]}" --ssh-key "$WORK/key" --identity "$WORK/id.json"
+              --hexis --hexis-binary "$WORK/binary" --hexis-signer "$WORK/signer.json")
+  touch "$WORK/key" "$WORK/id.json" "$WORK/binary" "$WORK/signer.json"
+  no_creds() { ( unset HEXIS_JUP_KEY SOLANA_METRICS_CONFIG_ARB; "$@" ); }
+
+  it "no script carries a Jupiter key or a metrics token as a default"
+  leaked="$(cd "$ROOT" && grep -lE 'HEXIS_JUP_KEY:-[^}]|SOLANA_METRICS_CONFIG_ARB:-[^}]|p=apiv[0-9]_[A-Za-z0-9]' ./*.sh lib/*.sh README.md || true)"
+  assert_eq "$leaked" ""
+
+  it "lib/hexis.sh has no default for either credential"
+  assert_eq "$(no_creds bash -c "source '${ROOT}/lib/hexis.sh'; echo \"[\$HEXIS_JUP_KEY][\$HEXIS_METRICS_CONFIG]\"")" "[][]"
+
+  out="$(STUB_RESPONSES=$F/host-fresh.responses no_creds arise "${hexis_args[@]}")"; rc=$?
+  it "arise --hexis stops when the credentials were never given"
+  assert_eq "$rc" "1"
+  assert_contains "$out" "--hexis-jup-key"
+  assert_contains "$out" "--hexis-metrics-config"
+
+  it "it stops before anything is written for the host"
+  assert_not_contains "$out" "arb-config.toml"
+
+  out="$(STUB_RESPONSES=$F/host-fresh.responses no_creds arise "${hexis_args[@]}" \
+        --hexis-jup-key flag-key --hexis-metrics-config 'host=https://flag,p=flag-pw')"
+  it "the flags supply them"
+  assert_contains "$out" 'jup_key        = "flag-key"'
+  assert_contains "$out" 'export SOLANA_METRICS_CONFIG_ARB="host=https://flag,p=flag-pw"'
+
+  printf '%s\n' '# from Hexis' 'HEXIS_JUP_KEY="file-key"' "SOLANA_METRICS_CONFIG_ARB='host=https://file,p=file-pw'" > "$WORK/hexis.env"
+  out="$(STUB_RESPONSES=$F/host-fresh.responses HEXIS_ENV_FILE="$WORK/hexis.env" no_creds arise "${hexis_args[@]}")"
+  it "hexis.env supplies them"
+  assert_contains "$out" 'jup_key        = "file-key"'
+  assert_contains "$out" 'export SOLANA_METRICS_CONFIG_ARB="host=https://file,p=file-pw"'
+
+  printf '%s\n' 'HEXIS_JUP_KEY=x; touch '"$WORK"'/env-ran' > "$WORK/hostile.env"
+  HEXIS_ENV_FILE="$WORK/hostile.env" no_creds bash -c "source '${ROOT}/lib/hexis.sh'" >/dev/null 2>&1
+  it "hexis.env is read, not run"
+  assert_file_missing "$WORK/env-ran"
+
+  out="$(STUB_RESPONSES=$F/host-fresh.responses HEXIS_ENV_FILE="$WORK/hexis.env" arise "${hexis_args[@]}")"
+  it "the environment wins over hexis.env"
+  assert_contains "$out" 'jup_key        = "test-jup-key"'
+
+  out="$(STUB_RESPONSES=$F/host-fresh.responses no_creds arise "${hexis_args[@]}" \
+        --hexis-jup-key "" --hexis-metrics-config "")"; rc=$?
+  it "an empty value is a decision to go without, and is said out loud"
+  assert_eq "$rc" "0"
+  assert_contains "$out" "No Jupiter API key"
+  assert_contains "$out" "No arb metrics config"
+  assert_not_contains "$out" "jup_key        ="
+
+  out="$(no_creds ascend migrate --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary" --dry-run)"; rc=$?
+  it "ascend migrate stops when the credentials were never given"
+  assert_eq "$rc" "1"
+  assert_contains "$out" "Hexis credentials are not kept in this repository"
+
+  out="$(no_creds ascend upgrade --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary" --dry-run)"
+  it "ascend upgrade, which writes neither, does not ask for them"
+  assert_not_contains "$out" "Hexis credentials are not kept"
+
+  # At a terminal the missing ones are asked for. HEXIS_ASSUME_TTY stands in for
+  # the terminal; the answers are: key, save?, metrics string, save?
+  ask_env="$WORK/asked/hexis.env"; mkdir -p "$WORK/asked"
+  asking() { ( unset HEXIS_JUP_KEY SOLANA_METRICS_CONFIG_ARB; HEXIS_ASSUME_TTY=1 HEXIS_ENV_FILE="$ask_env" "$@" ); }
+  ask_metrics='host=https://asked,db=d,u=u,p=asked-pw'
+
+  out="$(printf '%s\n' 'asked-key' 'y' "$ask_metrics" '' | STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" 2>&1)"; rc=$?
+  it "at a terminal arise asks for the missing credentials and uses the answers"
+  assert_eq "$rc" "0"
+  assert_contains "$out" 'jup_key        = "asked-key"'
+  assert_contains "$out" "export SOLANA_METRICS_CONFIG_ARB=\"${ask_metrics}\""
+
+  it "the answers are saved to hexis.env, readable only by the owner"
+  assert_eq "$(cat "$ask_env")" "$(printf '%s\n' 'HEXIS_JUP_KEY="asked-key"' "SOLANA_METRICS_CONFIG_ARB=\"${ask_metrics}\"")"
+  assert_eq "$(find "$ask_env" -perm 600 | wc -l | tr -d ' ')" "1"
+
+  out="$(STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" </dev/null 2>&1)"; rc=$?
+  it "the next run reads the saved file and asks nothing"
+  assert_eq "$rc" "0"
+  assert_not_contains "$out" "Enter the"
+  assert_contains "$out" 'jup_key        = "asked-key"'
+
+  rm -f "$ask_env"
+  out="$(printf '%s\n' 'once-key' 'n' "$ask_metrics" 'n' | STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" 2>&1)"
+  it "answering no to saving uses the value for this run only"
+  assert_contains "$out" 'jup_key        = "once-key"'
+  assert_file_missing "$ask_env"
+
+  printf '%s\n' '# from Hexis' 'HEXIS_JUP_KEY="old-key"' > "$ask_env"; chmod 644 "$ask_env"
+  out="$(printf '%s\n' "$ask_metrics" 'y' | STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" 2>&1)"
+  it "only the missing one is asked for, and the rest of hexis.env is kept"
+  assert_not_contains "$out" "Enter the Jupiter API key"
+  assert_eq "$(cat "$ask_env")" "$(printf '%s\n' '# from Hexis' 'HEXIS_JUP_KEY="old-key"' "SOLANA_METRICS_CONFIG_ARB=\"${ask_metrics}\"")"
+  assert_eq "$(find "$ask_env" -perm 600 | wc -l | tr -d ' ')" "1"
+
+  rm -f "$ask_env"
+  out="$(printf '%s\n' '' 'y' 'not-a-metrics-string' "$ask_metrics" 'y' | STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" 2>&1)"; rc=$?
+  it "Enter alone goes without the key and that choice is saved"
+  assert_eq "$rc" "0"
+  assert_contains "$out" "No Jupiter API key"
+  assert_contains "$(cat "$ask_env")" 'HEXIS_JUP_KEY=""'
+
+  it "a metrics string in the wrong form is asked for again"
+  assert_contains "$out" "does not look like the arb metrics string"
+  assert_contains "$out" "export SOLANA_METRICS_CONFIG_ARB=\"${ask_metrics}\""
+
+  it "what is typed is never printed back"
+  out="$(printf '%s\n' 'secret-key-value' 'n' "$ask_metrics" 'n' | STUB_RESPONSES=$F/host-fresh.responses asking arise "${hexis_args[@]}" --dry-run 2>&1 | grep -v 'jup_key  \|SOLANA_METRICS_CONFIG_ARB' | grep -c 'secret-key-value\|asked-pw')"
+  assert_eq "$out" "0"
+
+  rm -f "$ask_env"
+  out="$(printf '%s\n' 'k' 'y' | asking ascend migrate --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary" --dry-run --yes 2>&1)"; rc=$?
+  it "--yes never asks: a missing credential still stops the run"
+  assert_eq "$rc" "1"
+  assert_contains "$out" "Hexis credentials are not kept in this repository"
+  assert_file_missing "$ask_env"
+fi
+
 # === flash loans ============================================================
 if should_run "flash"; then
 group "flash loans"
@@ -401,7 +786,8 @@ group "XDP / PoH flag rename"
   new_ok="*agave-validator --xdp-cpu-cores 1 --version*|yes"
   new_rejected="*agave-validator --xdp-cpu-cores 1 --version*|no"
   old_rejected="*agave-validator --experimental-retransmit-xdp-cpu-cores 1 --version*|no"
-  diff_back="*_ascend.sh*|--- /home/sol/validator.sh"
+  # sol_script streams its script over stdin, so the call is "sol@host bash -s"
+  diff_back="*sol@1.2.3.4 bash -s|--- /home/sol/validator.sh"
 
   printf '%s\n' "$old_xdp" "$new_ok" "$diff_back" > "$WORK/xdp-new.responses"
   cat "$F/host-hexis.responses" >> "$WORK/xdp-new.responses"
@@ -470,6 +856,154 @@ group "XDP / PoH flag rename"
   it "perch's only endpoint is not taken away, and the script says so"
   assert_contains "$(SS_PORTS="" pc_run perch_local_rpc_off_cmd)" "its only endpoint is this host's own RPC"
   assert_contains "$(cat "$pc_dir/config.toml")" "127.0.0.1:8899"
+
+  # --- perch installed system-wide, as the current arise.sh does it ---
+  it "from root, the restart is declared to a perch in the user's home or a system-wide one"
+  assert_contains "$(perch_maint_cmd sol 2h root)" 'elif command -v perch >/dev/null 2>&1 && [ -f /etc/perch/config.toml ]; then perch --config /etc/perch/config.toml maint restart 2h'
+
+  printf '#!/bin/sh\necho "$@" >> "%s/perch.calls"\n' "$pc_dir" > "$pc_dir/bin/perch"; chmod +x "$pc_dir/bin/perch"
+  ( PERCH_SYSTEM_CFG="$pc_dir/system.toml"; touch "$PERCH_SYSTEM_CFG"; PATH="$pc_dir/bin:$PATH"; eval "$(perch_maint_cmd nobody-here 2h root)" )
+  it "a system-wide perch is told through its own command"
+  assert_eq "$(cat "$pc_dir/perch.calls" 2>/dev/null)" "--config $pc_dir/system.toml maint restart 2h"
+
+  rm -f "$pc_dir/perch.calls"
+  ( PERCH_SYSTEM_CFG="$pc_dir/none.toml"; PATH="$pc_dir/bin:$PATH"; eval "$(perch_maint_cmd nobody-here 2h root)" )
+  it "a host with no perch config is left alone"
+  assert_file_missing "$pc_dir/perch.calls"
+
+  it "the validator user's own text never reaches for the system-wide perch"
+  assert_not_contains "$(perch_maint_cmd sol 1h)" "/etc/perch"
+
+  it "the config helpers fall back to the system-wide config when the home has none"
+  # shellcheck disable=SC2154  # perch_cfg is set by the line being evaluated
+  assert_eq "$(PERCH_SYSTEM_CFG="$pc_dir/system.toml"; eval "$(perch_cfg_line nobody-here)"; echo "$perch_cfg")" "$pc_dir/system.toml"
+
+  # the whole way there and back on a system-wide config: sc_run leaves line 1 alone
+  sc_run() { ( PERCH_SYSTEM_CFG="$pc_dir/config.toml"; PATH="$pc_dir/bin:$PATH"; eval "$("$1" nobody-here)" ); }
+  pc_write; chmod 640 "$pc_dir/config.toml"; rm -f "$pc_dir/config.toml.bak-pre-firedancer"
+  SS_PORTS="" sc_run perch_local_rpc_off_cmd >/dev/null
+  it "a system-wide perch loses the dead local endpoint too"
+  assert_not_contains "$(cat "$pc_dir/config.toml")" "127.0.0.1:8899"
+  assert_contains "$(cat "$pc_dir/config.toml.bak-pre-firedancer")" "127.0.0.1:8899"
+
+  sc_run perch_local_rpc_on_cmd >/dev/null
+  it "and gets it back on a rollback, with the file's mode unchanged"
+  assert_contains "$(cat "$pc_dir/config.toml")" "127.0.0.1:8899"
+  assert_eq "$(file_mode "$pc_dir/config.toml")" "640"
+  assert_file_missing "$pc_dir/config.toml.bak-pre-firedancer"
+
+  { printf '%s\n' '*command -v perch*|system'; cat "$WORK/xdp-new.responses"; } > "$WORK/perch-system.responses"
+  out="$(STUB_RESPONSES=$WORK/perch-system.responses ascend promote --host 1.2.3.4 --ssh-key "$WORK/key" \
+        --release 'v4.2.2+concorde.1' --yes --restart --dry-run)"
+  it "ascend declares a restart to a system-wide perch through root, after the window"
+  assert_order "$out" "wait-for-restart-window --min-idle-time 20" "perch --config /etc/perch/config.toml maint restart 1h"
+  assert_contains "$out" "[DRY RUN] root script via monarch@1.2.3.4"
+
+  # --- perch reading Firedancer's metrics -----------------------------------
+  # A perch that answers --version with $PERCH_VER and turns down any config
+  # holding the word in $PERCH_REJECT.
+  cat > "$pc_dir/bin/perch" <<'FAKE'
+#!/bin/sh
+case "$*" in
+  *--version*) echo "perch ${PERCH_VER} (abc1234)" ;;
+  *--check-config*) [ -z "${PERCH_REJECT:-}" ] || ! grep -q "$PERCH_REJECT" "$2" ;;
+esac
+FAKE
+  chmod +x "$pc_dir/bin/perch"
+  printf '%s\n' '[layout]' '    net_tile_count = 1' '' '[tiles.metric]' '    prometheus_listen_address = "10.1.2.3"' \
+    '    prometheus_listen_port = 7999' '' '[tiles.gui]' '    prometheus_listen_port = 1' > "$pc_dir/fd.toml"
+  fd_url='firedancer_url = "http://10.1.2.3:7999/metrics"'
+  pf_write() {
+    printf '%s\n' '[[endpoints]]' 'name = "public"' 'url = "https://rpc.example"' '' \
+      '[[hosts]]' 'name = "this-hw"' 'url = "http://127.0.0.1:9100/metrics"' 'mountpoints = ["/"]' '' \
+      '[checks.cluster_stake]' 'enabled = false' > "$pc_dir/config.toml"
+  }
+  pf_on()  { ( PATH="$pc_dir/bin:$PATH"; eval "$(perch_firedancer_on_cmd nobody-here "${1:-$pc_dir/fd.toml}" | sed "1s|.*|perch_cfg=\"$pc_dir/config.toml\"|")" ); }
+  pf_off() { ( PATH="$pc_dir/bin:$PATH"; eval "$(perch_firedancer_off_cmd nobody-here | sed "1s|.*|perch_cfg=\"$pc_dir/config.toml\"|")" ); }
+
+  pf_write; chmod 640 "$pc_dir/config.toml"
+  out="$(PERCH_VER=1.6.0 pf_on)"
+  it "a perch new enough is pointed at the address Firedancer serves its metrics on"
+  assert_contains "$out" "now reads Firedancer's metrics at http://10.1.2.3:7999/metrics"
+  assert_eq "$(grep -c 'firedancer_url' "$pc_dir/config.toml")" "1"
+
+  it "the line goes under the url of this machine's [[hosts]] entry"
+  assert_eq "$(grep -A1 '^url = "http://127.0.0.1:9100/metrics"' "$pc_dir/config.toml" | tail -1)" "$fd_url"
+
+  it "nothing else in the config changes, and it keeps its mode"
+  assert_eq "$(grep -v 'firedancer_url' "$pc_dir/config.toml")" "$(pf_write; cat "$pc_dir/config.toml")"
+  PERCH_VER=1.6.0 pf_on >/dev/null
+  assert_eq "$(file_mode "$pc_dir/config.toml")" "640"
+  assert_file_missing "$pc_dir/config.toml.new"
+
+  out="$(PERCH_VER=1.6.0 pf_on)"
+  it "running it again adds no second line"
+  assert_contains "$out" "already reads Firedancer's metrics"
+  assert_eq "$(grep -c 'firedancer_url' "$pc_dir/config.toml")" "1"
+
+  out="$(pf_off)"
+  it "going back to Agave takes the line out again"
+  assert_contains "$out" "no longer reads Firedancer's metrics"
+  assert_eq "$(cat "$pc_dir/config.toml")" "$(pf_write; cat "$pc_dir/config.toml")"
+
+  it "and says nothing when there was no such line"
+  assert_eq "$(pf_off)" ""
+
+  pf_write
+  out="$(PERCH_VER=1.5.4 pf_on)"
+  it "an older perch, which would refuse the key, is left alone and the reason given"
+  assert_contains "$out" "1.5.4 cannot read Firedancer's metrics"
+  assert_contains "$out" "needs perch 1.6.0 or newer"
+  assert_not_contains "$(cat "$pc_dir/config.toml")" "firedancer_url"
+
+  out="$(PERCH_VER=1.10.2 pf_on)"
+  it "versions are compared as versions: 1.10 is newer than 1.6"
+  assert_contains "$(cat "$pc_dir/config.toml")" "$fd_url"
+
+  pf_write
+  out="$(PERCH_VER=1.6.0 PERCH_REJECT=firedancer_url pf_on)"
+  it "a config perch itself turns down is not put in place"
+  assert_contains "$out" "turned down the config"
+  assert_not_contains "$(cat "$pc_dir/config.toml")" "firedancer_url"
+  assert_file_missing "$pc_dir/config.toml.new"
+
+  printf '%s\n' '[[hosts]]' 'name = "other"' 'url = "http://10.0.0.9:9100/metrics"' '' \
+    '[[hosts]]' 'name = "this-hw"' 'url = "http://127.0.0.1:9100/metrics"' '' '[quorum]' 'url = "x"' > "$pc_dir/config.toml"
+  PERCH_VER=1.6.0 pf_on >/dev/null
+  it "with several hosts, the one on loopback is this machine"
+  assert_eq "$(grep -B1 'firedancer_url' "$pc_dir/config.toml" | head -1)" 'url = "http://127.0.0.1:9100/metrics"'
+  assert_eq "$(grep -c 'firedancer_url' "$pc_dir/config.toml")" "1"
+
+  printf '%s\n' '[[hosts]]' 'url = "http://10.0.0.8:9100/metrics"' '' '[[hosts]]' 'url = "http://10.0.0.9:9100/metrics"' > "$pc_dir/config.toml"
+  out="$(PERCH_VER=1.6.0 pf_on)"
+  it "with several hosts and none on loopback, it does not guess"
+  assert_contains "$out" "no [[hosts]] entry"
+  assert_contains "$out" "$fd_url"
+  assert_not_contains "$(cat "$pc_dir/config.toml")" "firedancer_url"
+
+  printf '%s\n' '[[endpoints]]' 'url = "https://rpc.example"' > "$pc_dir/config.toml"
+  out="$(PERCH_VER=1.6.0 pf_on)"
+  it "a perch that watches no host is left alone, and told what is missing"
+  assert_contains "$out" "has no [[hosts]] entry for this machine"
+  assert_contains "$out" "$fd_url"
+  assert_not_contains "$(cat "$pc_dir/config.toml")" "firedancer_url"
+  assert_file_missing "$pc_dir/config.toml.new"
+
+  pf_write
+  printf '%s\n' '[tiles.metric]' '    prometheus_listen_address = "0.0.0.0"' > "$pc_dir/fd-any.toml"
+  PERCH_VER=1.6.0 pf_on "$pc_dir/fd-any.toml" >/dev/null
+  it "metrics served on every address are read over loopback, on the default port"
+  assert_contains "$(cat "$pc_dir/config.toml")" 'firedancer_url = "http://127.0.0.1:7999/metrics"'
+
+  PERCH_VER=1.6.0 pf_on >/dev/null
+  it "a metrics address that changed replaces the old line"
+  assert_eq "$(grep 'firedancer_url' "$pc_dir/config.toml")" "$fd_url"
+
+  rm -f "$pc_dir/bin/perch"
+  pf_write
+  it "a host without perch hears nothing about it"
+  assert_eq "$(PATH="$pc_dir/bin:/usr/bin:/bin"; eval "$(perch_firedancer_on_cmd nobody-here "$pc_dir/fd.toml" | sed "1s|.*|perch_cfg=\"$pc_dir/config.toml\"|")")" ""
+
   rm -rf "$pc_dir"
 
   it "perch not hearing about it never stops a restart"
@@ -523,7 +1057,7 @@ group "cluster metrics (SFDP)"
   it "arise exports SOLANA_METRICS_CONFIG on mainnet"
   assert_contains "$out" "export SOLANA_METRICS_CONFIG=\"$SFDP_METRICS_MAINNET\""
 
-  out="$(STUB_RESPONSES=$F/host-fresh.responses arise --host 1.2.3.4 --vote-account V1 \
+  out="$(STUB_RESPONSES=$F/host-fresh.responses arise --host 1.2.3.4 --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 \
         --network testnet --no-auto-disks --no-xdp --dry-run \
         --ssh-key "$WORK/key" --identity "$WORK/id.json")"
 
@@ -644,7 +1178,7 @@ group "CLI validation"
 
   it "arise rejects --hexis on testnet"
   assert_contains "$(arise --host 1.2.3.4 --ssh-key "$WORK/key" --identity "$WORK/id.json" \
-    --vote-account V --network testnet --hexis)" "requires --network mainnet"
+    --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network testnet --hexis)" "requires --network mainnet"
 
   it "arise requires --host"
   assert_contains "$(arise)" "--host is required"
@@ -659,16 +1193,24 @@ group "CLI validation"
     --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary")" \
     "ssh -o IdentitiesOnly=yes -i $WORK/key sol@1.2.3.4"
 
-  # Root may only have a password, and Step 12 turns password auth off, so root
-  # work after the bootstrap has to go through sol + sudo.
+  # --root-user only creates the admin user. Step 12 turns root login off, so
+  # root work after the bootstrap goes through the admin user + sudo, and never
+  # through sol, which has no sudo at all.
   out="$(STUB_RESPONSES=$ROOT/test/fixtures/host-fresh.responses arise "${arise_base[@]}" \
     --ssh-key "$WORK/key" --identity "$WORK/id.json" --root-user root)"
 
-  it "arise runs root scripts as sol even with --root-user"
-  assert_contains "$out" "root_script on sol@1.2.3.4"
+  it "arise runs root scripts as the admin user even with --root-user"
+  assert_contains "$out" "root script via monarch@1.2.3.4"
 
   it "arise never runs root scripts over the root login"
-  assert_not_contains "$out" "root_script on root@"
+  assert_not_contains "$out" "root script via root@"
+
+  it "arise never runs root scripts as sol"
+  assert_not_contains "$out" "root script via sol@"
+
+  it "--admin-user names the account that holds sudo"
+  assert_contains "$(STUB_RESPONSES=$ROOT/test/fixtures/host-fresh.responses arise "${arise_base[@]}" \
+    --ssh-key "$WORK/key" --identity "$WORK/id.json" --admin-user ops)" "root script via ops@1.2.3.4"
 
   it "ascend refuses to upgrade a host with no hexis install"
   assert_contains "$(STUB_RESPONSES=$ROOT/test/fixtures/host-jito.responses ascend upgrade \
@@ -843,44 +1385,67 @@ exec agave-validator \
   rm -rf "$seed_dir"
 
   # Run the generated pre-download lines with curl replaced by a mirror and a
-  # trusted validator that live in scratch files
+  # trusted validator that live in scratch files. The mirror's file is a little
+  # over 3 MiB and is fetched in 1 MiB pieces, so there are four of them.
   pf_dir="$(mktemp -d)"; mkdir "$pf_dir/fd" "$pf_dir/agave"
   pf_key="7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2"
   pf_name="snapshot-300-HD9P3x1tKAqbNvn8PJzNrqmJA9nBxNHCompRkfGT8Edm.tar.zst"
-  { printf '\x28\xb5\x2f\xfd'; head -c 999 /dev/urandom; } > "$pf_dir/mirror-file"
+  { printf '\x28\xb5\x2f\xfd'; head -c 3146727 /dev/urandom; } > "$pf_dir/mirror-file"
+  pf_size=3146731
   printf '[snapshots.sources.gossip]\n    allow_list = [\n        "%s",\n    ]\n' "$pf_key" > "$pf_dir/config.toml"
   printf 'NOTICE snapct: allowed gossip peer added with public key `%s` and RPC address `10.0.0.9:8899`\n' "$pf_key" > "$pf_dir/fd.log"
+  # prefetch <agave dir or ""> [rpc port] — knobs, all optional:
+  #   PEER_NAME    the full snapshot the trusted validator serves
+  #   SHORT_BY     every piece comes up this many bytes short, every time
+  #   FLAKY=1      each piece comes up short the first time it is asked for
+  #   MIRROR_NAME  what the mirror serves (default: $pf_name)
+  #   MOVES_ON=1   the mirror serves another snapshot once the download has begun
   prefetch() {
     (
+      rm -f "$pf_dir"/asked.* "$pf_dir/started"
       curl() {
-        local out="" range="" url="" headers=false s e
+        local out="" range="" url="" headers=false post=false s e short
         while (($#)); do
           case "$1" in
             -o) out="$2"; shift 2 ;;
             -r) range="$2"; shift 2 ;;
             -D) headers=true; shift 2 ;;
-            -m|-A|-X|-H|-d|-w) shift 2 ;;
+            -X) post=true; shift 2 ;;
+            -m|-A|-H|-d|-w|--connect-timeout|--speed-limit|--speed-time) shift 2 ;;
             -*) shift ;;
             *)  url="$1"; shift ;;
           esac
         done
         case "$url" in
           http://10.0.0.9:8899/snapshot.tar.bz2) printf '%s' "http://10.0.0.9:8899/${PEER_NAME}" ;;
-          https://mirror.test/snapshot.tar.bz2)  printf '%s' "https://store.test/${pf_name}?sig=1" ;;
+          https://mirror.test/snapshot.tar.bz2)
+            if [ -n "${MOVES_ON:-}" ] && [ -e "$pf_dir/started" ]; then
+              printf '%s' "https://store.test/snapshot-999-HD9P3x1tKAqbNvn8PJzNrqmJA9nBxNHCompRkfGT8Edm.tar.zst?sig=2"
+            else
+              printf '%s' "https://store.test/${MIRROR_NAME:-$pf_name}?sig=1"
+            fi ;;
+          https://api.mainnet-beta.solana.com)
+            $post && printf '{"result":[{"pubkey":"%s","rpc":"10.0.0.9:8899"},{"pubkey":"SomeoneElse","rpc":"10.9.9.9:8899"}]}' "$pf_key" ;;
           https://store.test/*)
             if $headers; then
-              printf 'HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1003\r\n'
+              printf 'HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/%s\r\n' "$pf_size"
             else
-              s="${range%-*}"; e="${range#*-}"
-              tail -c "+$((s + 1))" "$pf_dir/mirror-file" | head -c "$((e - s + 1 - ${SHORT_BY:-0}))" > "$out"
+              : > "$pf_dir/started"
+              s="${range%-*}"; e="${range#*-}"; short="${SHORT_BY:-0}"
+              if [ -n "${FLAKY:-}" ] && [ ! -e "$pf_dir/asked.$s" ]; then short=7; fi
+              : > "$pf_dir/asked.$s"
+              tail -c "+$((s + 1))" "$pf_dir/mirror-file" 2>/dev/null | head -c "$((e - s + 1 - short))"
             fi ;;
         esac
       }
       # shellcheck disable=SC2034  # read by the eval'd lines
-      PF_PROGRESS_SECONDS=0.1
-      eval "$(fd_render_snapshot_prefetch https://mirror.test "$pf_dir/fd" "$(id -un)" "$pf_dir/config.toml" "$pf_dir/fd.log" "$1" 8899)"
+      PF_PROGRESS_SECONDS=0.1 PF_RETRY_SECONDS=0 PF_CHUNK_MB=1 PF_STREAMS=3
+      eval "$(fd_render_snapshot_prefetch https://mirror.test "$pf_dir/fd" "$(id -un)" "$pf_dir/config.toml" "$pf_dir/fd.log" "$1" "${2:-8899}")"
     )
   }
+  prefetch_down() { ( curl() { return 7; }; eval "$(fd_render_snapshot_prefetch https://mirror.test "$pf_dir/fd" "$(id -un)" "$pf_dir/config.toml" "$pf_dir/fd.log" "" none)" ); }
+  pf_left="agave,config.toml,fd,fd.log,mirror-file"
+  pf_tidy() { rm -f "$pf_dir"/asked.* "$pf_dir/started"; ls -A "$pf_dir" | paste -sd, -; }
 
   it "does not take the mirror's snapshot when no trusted validator serves the same one"
   assert_contains "$(PEER_NAME="snapshot-200-SomeOtherHashSomeOtherHashSomeOtherHash1.tar.zst" prefetch "")" "no trusted validator serves ${pf_name}"
@@ -888,29 +1453,94 @@ exec agave-validator \
   it "and leaves the snapshot directory empty then"
   assert_eq "$(ls -A "$pf_dir/fd" | wc -l | tr -d ' ')" "0"
 
-  it "discards a download that comes up short"
+  it "discards a download whose pieces keep coming up short"
   assert_contains "$(PEER_NAME="$pf_name" SHORT_BY=1 prefetch "")" "did not complete — discarded"
 
   it "and leaves nothing behind from it"
-  assert_eq "$(ls -A "$pf_dir" | paste -sd, -)" "agave,config.toml,fd,fd.log,mirror-file"
+  assert_eq "$(pf_tidy)" "$pf_left"
+  assert_eq "$(ls -A "$pf_dir/fd" | wc -l | tr -d ' ')" "0"
+
+  it "discards the download when the mirror moves on to another snapshot part way"
+  assert_contains "$(PEER_NAME="$pf_name" FLAKY=1 MOVES_ON=1 prefetch "")" "did not complete — discarded"
+  assert_eq "$(pf_tidy)" "$pf_left"
+
+  it "gives up at the deadline and lets Firedancer start"
+  assert_contains "$(PEER_NAME="$pf_name" PF_DEADLINE=0 prefetch "")" "did not complete — discarded"
+  assert_eq "$(pf_tidy)" "$pf_left"
 
   touch "$pf_dir/agave/snapshot-300-AgaveOwnCopyAgaveOwnCopyAgaveOwnCopy1.tar.zst"
   it "skips the download when Agave holds that full snapshot already"
   assert_contains "$(PEER_NAME="$pf_name" prefetch "$pf_dir/agave")" "Agave already holds the full snapshot at slot 300"
 
-  pf_out="$(PEER_NAME="$pf_name" prefetch "")"
+  # Two older full snapshots and their incrementals are on disk before the fetch
+  for old_slot in 100 200; do
+    : > "$pf_dir/fd/snapshot-${old_slot}-OldFuLLoLdFuLLoLdFuLLoLdFuLLoLdFuLL${old_slot}.tar.zst"
+    : > "$pf_dir/fd/incremental-snapshot-${old_slot}-$((old_slot + 50))-oLdincoLdincoLdincoLdincoLdincoLd${old_slot}.tar.zst"
+  done
+  pf_out="$(PEER_NAME="$pf_name" FLAKY=1 prefetch "")"
   it "fetches the mirror's full snapshot when a trusted validator serves the same slot and hash"
   assert_contains "$pf_out" "1 of 1 trusted validators serve ${pf_name}"
+  assert_contains "$pf_out" "in 4 pieces, 3 at a time"
 
-  it "joins the ranges back into the file the mirror has, byte for byte"
+  it "a piece that comes up short is fetched again, and the file is the mirror's byte for byte"
   assert_eq "$(cmp "$pf_dir/mirror-file" "$pf_dir/fd/$pf_name" && echo same)" "same"
 
+  it "the file is the validator user's, closed to everyone else"
+  assert_eq "$(find "$pf_dir/fd/$pf_name" -perm 600 -user "$(id -un)" | wc -l | tr -d ' ')" "1"
+
   it "cleans up its working directory"
-  assert_eq "$(ls -A "$pf_dir" | paste -sd, -)" "agave,config.toml,fd,fd.log,mirror-file"
+  assert_eq "$(pf_tidy)" "$pf_left"
+
+  it "keeps the full snapshot from before and removes older ones, with their incrementals"
+  assert_eq "$(ls "$pf_dir/fd" | cut -d- -f1-3 | cut -d. -f1 | paste -sd, -)" "incremental-snapshot-200,snapshot-200-OldFuLLoLdFuLLoLdFuLLoLdFuLLoLdFuLL200,snapshot-300-HD9P3x1tKAqbNvn8PJzNrqmJA9nBxNHCompRkfGT8Edm"
+  assert_contains "$pf_out" "removed snapshot-100-"
 
   it "fetches nothing when that full snapshot is on disk already"
   assert_contains "$(PEER_NAME="$pf_name" prefetch "")" "slot 300 is already on disk"
+
+  rm -f "$pf_dir/fd"/*; : > "$pf_dir/fd.log"
+  it "on a host that has run no validator, a public RPC endpoint names the trusted validators"
+  assert_contains "$(PEER_NAME="$pf_name" prefetch "" none)" "1 of 1 trusted validators serve ${pf_name}"
+  assert_eq "$(cmp "$pf_dir/mirror-file" "$pf_dir/fd/$pf_name" && echo same)" "same"
+
+  it "a mirror that names something other than a snapshot is passed over"
+  assert_contains "$(MIRROR_NAME="index.html" PEER_NAME="$pf_name" prefetch "")" "named no snapshot — skipped"
+
+  it "and so is one that does not answer"
+  assert_contains "$(PEER_NAME="$pf_name" prefetch_down)" "did not answer — skipped"
+
+  # The same lines, installed as the script the unit runs before each start
+  pf_script="$pf_dir/prefetch-script"
+  ( FD_PREFETCH_SCRIPT="$pf_script"; chown() { :; }
+    eval "$(fd_render_prefetch_install on https://mirror.test /mnt/ledger/firedancer/snapshots sol /home/sol/firedancer/config.toml /mnt/ledger/firedancer/firedancer.log)" ) >/dev/null
+  it "the pre-start script is a whole bash script that parses"
+  assert_eq "$(head -1 "$pf_script")" "#!/bin/bash"
+  assert_eq "$(bash -n "$pf_script" && echo parses)" "parses"
+
+  it "it carries this host's mirror, directories and user, and asks no local Agave"
+  assert_contains "$(cat "$pf_script")" 'PF_MIRROR="https://mirror.test"'
+  assert_contains "$(cat "$pf_script")" 'PF_TO="/mnt/ledger/firedancer/snapshots"'
+  assert_contains "$(cat "$pf_script")" 'PF_RPC_PORT="none"'
+  assert_contains "$(cat "$pf_script")" 'PF_AGAVE=""'
+
+  it "it can never fail the start: it ends with exit 0 and is executable"
+  assert_eq "$(tail -1 "$pf_script")" "exit 0"
+  assert_eq "$(test -x "$pf_script" && echo yes)" "yes"
+
+  ( FD_PREFETCH_SCRIPT="$pf_script"; eval "$(fd_render_prefetch_install off)" )
+  it "turned off, the script is taken away"
+  assert_file_missing "$pf_script"
   rm -rf "$pf_dir"
+
+  it "the unit runs the pre-download after configure, lets it fail, and waits long enough for it"
+  unit_on="$(fd_render_unit /fd/firedancer /fd/config.toml sol on)"
+  assert_order "$unit_on" "ExecStartPre=/fd/firedancer configure init all" "ExecStartPre=-${FD_PREFETCH_SCRIPT}"
+  assert_order "$unit_on" "ExecStartPre=-${FD_PREFETCH_SCRIPT}" "ExecStart=/fd/firedancer run"
+  assert_contains "$unit_on" "TimeoutStartSec=$((FD_SNAPSHOT_DEADLINE * 2))"
+
+  it "without it the unit has neither line"
+  assert_not_contains "$(fd_render_unit /fd/firedancer /fd/config.toml sol off)" "snapshot-prefetch"
+  assert_not_contains "$(fd_render_unit /fd/firedancer /fd/config.toml sol)" "TimeoutStartSec"
 
   it "the unit asks for the open-file limit the sysctl step provides"
   assert_contains "$out" "LimitNOFILE=${FD_NOFILE}"
@@ -944,24 +1574,6 @@ group "reawaken.sh"
   reawaken() { ( cd "$ROOT" && ./reawaken.sh "$@" ) 2>&1; }
   T="$ROOT/test/fixtures/concorde-tables.toml"
 
-  # fd_host <file> <facts overrides, \n separated> <validator.sh body lines, \n separated>
-  # Builds the stub responses for a host: its facts, validator.sh, arb-config.toml.
-  fd_host() {
-    local file="$1" facts="$2" body="$3"
-    local base='vendor=AuthenticAMD\nfamily=25\nmodel=AMD EPYC 9254 24-Core Processor\nflags=avx2 avx512f \nglibc=2.39\nmem_gib=377\nip=9.9.9.9\ndoublezero=no\nufw=active\nagave_active=active\nagave_enabled=enabled\nfd_active=inactive\nfd_enabled=disabled\nfd_unit=no\nfd_release=\nfd_version=\nfd_config=no\nfd_signer=no\nvsh=yes'
-    {
-      printf '%s\n' '*echo ok*|ok'
-      printf '%s\n' "*host-facts*|${facts}${facts:+\\n}${base}"
-      printf '%s\n' "*cat /home/sol/validator.sh*|#!/bin/bash\\nexec agave-validator \\\\\\\\\\n    --identity /home/sol/identity.json \\\\\\\\\\n    --authorized-voter /home/sol/staked_identity.json \\\\\\\\\\n    --vote-account VoTe111 \\\\\\\\\\n    --ledger /mnt/ledger \\\\\\\\\\n    --accounts /mnt/accounts \\\\\\\\\\n    --entrypoint entrypoint.mainnet-beta.solana.com:8001 \\\\\\\\\\n    --expected-genesis-hash 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d \\\\\\\\\\n${body}    --limit-ledger-size"
-      printf '%s\n' '*cat /home/sol/hexis/arb-config.toml*|[engine]\nsigner_path    = "/home/sol/hexis/arb_signer_keypair.json"\njupiter_token_ledger = "JUPfromAgave"\nokx_token_ledger = "OKXfromAgave"'
-      printf '%s\n' '*key-info*|/home/sol/identity.json|/home/sol/unstaked_identity.json|UNSTAKEDpk\n/home/sol/staked_identity.json|/home/sol/staked_identity.json|STAKEDpk'
-      printf '%s\n' '*cat /home/sol/firedancer/config.toml*|name = "fd1"\nuser = "sol"\n[paths]\n    base = "/mnt/ledger/firedancer"\n    snapshots = "/mnt/ledger/firedancer/snapshots"'
-    } > "$file"
-  }
-  L='\\\\\\\\\\n'   # one validator.sh line break, as the stub file needs it
-  KV="    --known-validator K1 ${L}    --known-validator K2 ${L}    --known-validator K3 ${L}"
-  JITO="    --block-engine-url https://ny.mainnet.block-engine.jito.wtf ${L}    --commission-bps 1000 ${L}    --merkle-root-upload-authority AUTH111 ${L}    --shred-receiver-address 233.84.178.1:7733,1.2.3.4:1002${L}"
-  HEXIS="    --arb-config /home/sol/hexis/arb-config.toml ${L}"
   base_args=(stage --host 1.2.3.4 --ssh-key "$WORK/key" --concorde-tables "$T" --dry-run)
 
   # --- Hexis Agave source ---
@@ -1166,8 +1778,107 @@ group "reawaken.sh"
   it "cutover declares the restart to perch, with room for a reboot and a snapshot download"
   assert_contains "$out" "perch maint restart 2h, if the host runs perch"
 
-  it "cutover ends by taking the dead RPC endpoint out of perch"
+  it "cutover takes the dead RPC endpoint out of perch"
   assert_contains "$out" "drop this host's own RPC from perch's endpoints, if the host runs perch"
+
+  it "and does so before Firedancer starts, so a reboot leaves nothing to come back for"
+  assert_order "$out" "drop this host's own RPC from perch's endpoints" "systemctl start firedancer"
+
+  it "cutover makes room for the 1 GiB pages before the start"
+  assert_order "$out" "drop the page cache and compact memory" "systemctl start firedancer"
+  assert_order "$out" "point perch at Firedancer's metrics" "systemctl start firedancer"
+
+  it "the dry run says a reboot may be offered"
+  assert_contains "$out" "offer to reboot, then wait for Firedancer to come up"
+
+  # --- a real cutover against the stub: order of the steps, and the reboot ---
+  # cut_run <name> <facts> <script responses> <stdin> args... -> $WORK/<name>.{out,scripts}, status in $cut_rc
+  cut_run() {
+    local name="$1" facts="$2" scripts="$3" input="$4"; shift 4
+    fd_host "$WORK/$name.host" "fd_unit=yes\nfd_config=yes\nfd_signer=yes\nfd_release=v26.10.8+concorde.4\nhp1g_total=0\nuptime_days=12\nboot_id=boot-old${facts:+\\n}${facts}" "${KV}${JITO}${HEXIS}"
+    {
+      printf '%s\n' '*firedancer mem*|  Total Memory Locked      189 GiB + 644 MiB\n  Required Gigantic Pages  183'
+      printf '%s\n' '*is-active firedancer*|active'
+      cat "$WORK/$name.host"
+    } > "$WORK/$name.responses"
+    printf '%b' "$scripts" > "$WORK/$name.script-responses"
+    : > "$WORK/$name.scripts"
+    printf '%b' "$input" | STUB_RESPONSES="$WORK/$name.responses" STUB_SCRIPT_RESPONSES="$WORK/$name.script-responses" \
+      STUB_SCRIPT_LOG="$WORK/$name.scripts" SUDO_PASS=pw REBOOT_POLL_SECONDS=0 \
+      reawaken cutover --host 1.2.3.4 --ssh-key "$WORK/key" --now --no-snapshot-prefetch "$@" > "$WORK/$name.out"
+    cut_rc=$?
+  }
+
+  cut_run plain "" "" "" --yes
+  it "a cutover that finds its pages completes without a reboot"
+  assert_eq "$cut_rc" "0"
+  assert_contains "$(cat "$WORK/plain.out")" "cutover complete"
+  assert_not_contains "$(cat "$WORK/plain.scripts")" "systemctl reboot"
+
+  it "the script on the host deals with perch before it starts Firedancer"
+  assert_order "$(cat "$WORK/plain.scripts")" 'perch_cfg="/home/sol/perch/config.toml"' "systemctl start firedancer"
+
+  it "and frees and compacts memory before it starts Firedancer"
+  assert_order "$(cat "$WORK/plain.scripts")" "compact_memory" "systemctl start firedancer"
+
+  it "and points perch at Firedancer's own metrics before it starts"
+  assert_order "$(cat "$WORK/plain.scripts")" 'perch_fd_config="/home/sol/firedancer/config.toml"; perch_fd_min="1.6.0"' "systemctl start firedancer"
+
+  it "and stops Agave before any of that"
+  assert_order "$(cat "$WORK/plain.scripts")" "systemctl stop sol" 'perch_cfg="/home/sol/perch/config.toml"'
+
+  NEEDS_REBOOT='*systemctl start firedancer*|@exit 42\n'
+  cut_run reboot-yes "" "$NEEDS_REBOOT" "" --yes
+  printf '%s\n' '*cat /proc/sys/kernel/random/boot_id*|boot-new' > "$WORK/boot-new"
+  cat "$WORK/boot-new" "$WORK/reboot-yes.responses" > "$WORK/reboot-back.responses"
+  rb_out="$(STUB_RESPONSES="$WORK/reboot-back.responses" STUB_SCRIPT_RESPONSES="$WORK/reboot-yes.script-responses" \
+        STUB_SCRIPT_LOG="$WORK/reboot-back.scripts" SUDO_PASS=pw REBOOT_POLL_SECONDS=0 \
+        reawaken cutover --host 1.2.3.4 --ssh-key "$WORK/key" --now --no-snapshot-prefetch --yes)"; rc=$?
+  it "when the pages cannot be reserved, cutover reboots the host and waits for Firedancer"
+  assert_eq "$rc" "0"
+  assert_contains "$rb_out" "could not reserve its 1 GiB pages"
+  assert_contains "$(cat "$WORK/reboot-back.scripts")" "systemctl reboot"
+  assert_contains "$rb_out" "firedancer.service started after the reboot"
+  assert_contains "$rb_out" "cutover complete"
+
+  it "a host that does not come back is reported, not waited on forever"
+  assert_eq "$cut_rc" "1"
+  assert_contains "$(cat "$WORK/reboot-yes.out")" "has not come back"
+  assert_not_contains "$(cat "$WORK/reboot-yes.out")" "cutover complete"
+
+  cut_run reboot-no "" "$NEEDS_REBOOT" "yes\nno\n"
+  it "the reboot is asked for, and declining it reboots nothing"
+  assert_eq "$cut_rc" "1"
+  assert_contains "$(cat "$WORK/reboot-no.out")" "Not rebooted"
+  assert_not_contains "$(cat "$WORK/reboot-no.scripts")" "systemctl reboot"
+
+  it "declining says nothing needs to be run after the reboot, and how to go back"
+  assert_contains "$(cat "$WORK/reboot-no.out")" "nothing needs to be run afterwards"
+  assert_contains "$(cat "$WORK/reboot-no.out")" "reawaken.sh rollback --host 1.2.3.4"
+
+  cut_run other-failure "" '*systemctl start firedancer*|@exit 1\n' "" --yes
+  it "any other start failure stops there and offers no reboot"
+  assert_eq "$cut_rc" "1"
+  assert_not_contains "$(cat "$WORK/other-failure.out")" "Reboot"
+  assert_not_contains "$(cat "$WORK/other-failure.scripts")" "systemctl reboot"
+
+  # --- huge-page outlook in status ---
+  hp_status() {   # <facts> -> status output
+    fd_host "$WORK/hp.host" "fd_unit=yes\nfd_config=yes\nfd_signer=yes\n$1" "${KV}${JITO}${HEXIS}"
+    { printf '%s\n' '*firedancer mem*|  Total Memory Locked      189 GiB\n  Required Gigantic Pages  183'; cat "$WORK/hp.host"; } > "$WORK/hp.responses"
+    STUB_RESPONSES="$WORK/hp.responses" reawaken status --host 1.2.3.4 --ssh-key "$WORK/key"
+  }
+  it "status says a long-running host should expect the reboot"
+  assert_contains "$(hp_status "hp1g_total=0\nuptime_days=12")" "183 one-GiB pages needed, 0 reserved. Up 12 day(s): expect cutover to need a reboot"
+
+  it "status says no reboot is needed when the pages are already reserved"
+  assert_contains "$(hp_status "hp1g_total=183\nuptime_days=12")" "183 already reserved — no reboot needed"
+
+  it "status says a host booted today usually finds them"
+  assert_contains "$(hp_status "hp1g_total=0\nuptime_days=0")" "Booted today"
+
+  it "status on a running Firedancer says the pages are in use"
+  assert_contains "$(hp_status "hp1g_total=183\nuptime_days=3\nfd_active=active")" "held by the running Firedancer"
 
   it "cutover hands Agave's newest snapshot to Firedancer"
   assert_contains "$out" "seed /mnt/ledger/firedancer/snapshots with the newest snapshot in /mnt/ledger"
@@ -1225,8 +1936,47 @@ group "reawaken.sh"
   fd_host "$WORK/fd-live.responses" "fd_unit=yes\nfd_config=yes\nfd_active=active\nagave_active=inactive" "${KV}${JITO}${HEXIS}"
   out="$(STUB_RESPONSES=$WORK/fd-live.responses reawaken rollback --host 1.2.3.4 --ssh-key "$WORK/key" --dry-run)"
 
+  # --- unit: bring an existing host's unit and pre-start step up to date ---
+  unit_out="$(STUB_RESPONSES=$WORK/fd-live.responses reawaken unit --host 1.2.3.4 --ssh-key "$WORK/key" --dry-run)"
+  it "unit shows the new firedancer.service and the pre-start step, and restarts nothing"
+  assert_contains "$unit_out" "[DRY RUN] install ${FD_PREFETCH_SCRIPT}: before each start, fetch the full snapshot from ${FD_SNAPSHOT_MIRROR} into /mnt/ledger/firedancer/snapshots"
+  assert_contains "$unit_out" "ExecStartPre=-${FD_PREFETCH_SCRIPT}"
+  assert_contains "$unit_out" "Firedancer is not restarted"
+
+  : > "$WORK/unit.scripts"
+  unit_out="$(STUB_RESPONSES=$WORK/fd-live.responses STUB_SCRIPT_LOG="$WORK/unit.scripts" SUDO_PASS=pw \
+      reawaken unit --host 1.2.3.4 --ssh-key "$WORK/key")"; rc=$?
+  it "unit installs the script as root's, then the unit, then reloads systemd"
+  assert_eq "$rc" "0"
+  assert_order "$(cat "$WORK/unit.scripts")" "chown root:root ${FD_PREFETCH_SCRIPT}.new" "cat > /etc/systemd/system/firedancer.service"
+  assert_order "$(cat "$WORK/unit.scripts")" "cat > /etc/systemd/system/firedancer.service" "systemctl daemon-reload"
+  assert_contains "$(cat "$WORK/unit.scripts")" 'PF_TO="/mnt/ledger/firedancer/snapshots"'
+
+  it "and never stops, starts or restarts a validator"
+  assert_eq "$(grep -cE 'systemctl (stop|start|restart|try-restart|enable|disable)' "$WORK/unit.scripts")" "0"
+
+  : > "$WORK/unit.scripts"
+  STUB_RESPONSES=$WORK/fd-live.responses STUB_SCRIPT_LOG="$WORK/unit.scripts" SUDO_PASS=pw \
+      reawaken unit --host 1.2.3.4 --ssh-key "$WORK/key" --no-snapshot-prefetch >/dev/null
+  it "unit --no-snapshot-prefetch takes the pre-start step out again"
+  assert_contains "$(cat "$WORK/unit.scripts")" "rm -f ${FD_PREFETCH_SCRIPT}"
+  assert_not_contains "$(cat "$WORK/unit.scripts")" "ExecStartPre=-"
+
+  unit_out="$(STUB_RESPONSES=$WORK/fd-hexis.responses reawaken unit --host 1.2.3.4 --ssh-key "$WORK/key" --dry-run)"; rc=$?
+  it "unit refuses a host where Firedancer was never staged"
+  assert_eq "$rc" "1"
+  assert_contains "$unit_out" "Firedancer is not staged"
+
   it "rollback releases Firedancer's huge pages before Agave starts"
   assert_contains "$out" "firedancer configure fini all"
+
+  live_cut="$(STUB_RESPONSES=$WORK/fd-live.responses reawaken cutover --host 1.2.3.4 --ssh-key "$WORK/key" --dry-run)"
+  it "cutover on a host already on Firedancer still points perch at its metrics"
+  assert_contains "$live_cut" "nothing to cut over"
+  assert_contains "$live_cut" "[DRY RUN] point perch at Firedancer's metrics, if the host runs perch 1.6.0 or newer"
+
+  it "rollback stops perch reading Firedancer's metrics"
+  assert_contains "$out" "[DRY RUN] stop perch reading Firedancer's metrics, if it was"
 
   it "rollback re-enables the Agave unit"
   assert_contains "$out" "systemctl enable sol; systemctl start sol"
@@ -1236,6 +1986,13 @@ group "reawaken.sh"
   fd_host "$WORK/fd-up.responses" "fd_unit=yes\nfd_config=yes\nfd_signer=yes\nfd_active=active\nfd_enabled=enabled\nagave_active=inactive\nfd_release=v1+concorde.1\nfd_version=1.0" "${KV}${JITO}${HEXIS}"
   printf '%s\n' '*test -x /home/sol/firedancer/releases/v0+concorde.9/firedancer*|yes' '*cat /home/sol/firedancer/.previous-release*|v0+concorde.9' >> "$WORK/fd-up.responses"
   out="$(STUB_RESPONSES=$WORK/fd-up.responses reawaken "${up[@]}" --fd-tag v2+concorde.1)"
+
+  it "staging a release writes a unit that fetches the snapshot from the mirror before a start"
+  assert_contains "$out" "ExecStartPre=-${FD_PREFETCH_SCRIPT}"
+  assert_contains "$out" "[DRY RUN] ${FD_PREFETCH_SCRIPT}: before each start, fetch the full snapshot from ${FD_SNAPSHOT_MIRROR}"
+
+  it "and with --no-snapshot-prefetch it does not"
+  assert_not_contains "$(STUB_RESPONSES=$WORK/fd-up.responses reawaken "${up[@]}" --fd-tag v2+concorde.1 --no-snapshot-prefetch)" "snapshot-prefetch"
 
   it "upgrade names the release it leaves and the one it moves to"
   assert_contains "$out" "Firedancer v1+concorde.1 -> v2+concorde.1"
@@ -1397,6 +2154,80 @@ else
   it "a cutover that Firedancer finished by itself after a reboot is still offered, to retire jag-snap"
   assert_contains "$(STUB_RESPONSES=$WORK/st-fd-jag.responses system firedancer "${st[@]}" --print)" "Would run: ./reawaken.sh cutover --host 1.2.3.4 --ssh-key $WORK/key"
 
+  # --- who holds sudo, and the host checks ---
+  HX="agave_active=active\nfd_active=inactive\nfd_enabled=disabled\nfd_config=no\njag_snap=down\nperch_local=no\nagave_release=v5.0.0+concorde.1"
+  # adm_host <file> <extra facts> <responses that go first, \n separated>
+  adm_host() {
+    st_host "$WORK/adm.base" "$HX${2:+\\n}$2" "$S_JITO$S_HEXIS"
+    { [[ -n "$3" ]] && printf '%b\n' "$3"; cat "$WORK/adm.base"; } > "$1"
+  }
+  NO_MONARCH='*monarch@1.2.3.4 true|@fail'
+
+  adm_host "$WORK/adm-ok.responses" "" ""
+  out="$(STUB_RESPONSES=$WORK/adm-ok.responses system "${st[@]}")"
+  it "a host whose default admin user takes the key is left as it is"
+  assert_not_contains "$out" "Admin user:"
+  assert_not_contains "$out" "--admin-user"
+
+  adm_host "$WORK/adm-ubuntu.responses" "" "$NO_MONARCH\n*admin-candidates*|ubuntu\\\\nops\n*ubuntu@1.2.3.4*admin-sudo*|nopass"
+  out="$(STUB_RESPONSES=$WORK/adm-ubuntu.responses system "${st[@]}")"
+  it "a host without the default admin user gets the one that does hold sudo"
+  assert_contains "$out" "Admin user:      ubuntu, with passwordless sudo — there is no 'monarch' login for this key"
+
+  it "and every command printed for it carries that user"
+  assert_contains "$out" "./reawaken.sh stage --host 1.2.3.4 --ssh-key $WORK/key --admin-user ubuntu"
+  assert_contains "$out" "./arise.sh --host 1.2.3.4 --ssh-key $WORK/key --admin-user ubuntu"
+
+  it "the goal that is run carries it too"
+  assert_contains "$(STUB_RESPONSES=$WORK/adm-ubuntu.responses system firedancer "${st[@]}" --print)" "--admin-user ubuntu"
+
+  adm_host "$WORK/adm-second.responses" "" "$NO_MONARCH\n*admin-candidates*|deploy\\\\nops\n*deploy@1.2.3.4*admin-sudo*|\n*ops@1.2.3.4*admin-sudo*|pass"
+  out="$(STUB_RESPONSES=$WORK/adm-second.responses system "${st[@]}")"
+  it "a login that holds no sudo is passed over for one that does"
+  assert_contains "$out" "Admin user:      ops, with sudo by password"
+
+  adm_host "$WORK/adm-none.responses" "" "$NO_MONARCH\n*admin-candidates*|deploy\n*deploy@1.2.3.4*admin-sudo*|"
+  out="$(STUB_RESPONSES=$WORK/adm-none.responses system "${st[@]}")"
+  it "a host with no admin login at all is said to have none"
+  assert_contains "$out" "Admin user:      none found"
+  assert_contains "$out" "--root-user"
+
+  adm_host "$WORK/adm-given.responses" "" "$NO_MONARCH\n*admin-candidates*|ubuntu\n*ubuntu@1.2.3.4*admin-sudo*|nopass"
+  out="$(STUB_RESPONSES=$WORK/adm-given.responses system "${st[@]}" --admin-user ops)"
+  it "an --admin-user that was given is not second-guessed"
+  assert_contains "$out" "--admin-user ops"
+  assert_not_contains "$out" "ubuntu"
+
+  adm_host "$WORK/chk-clean.responses" "chk_root_owner=root\nchk_groups=sol users\nchk_sudo=no\nchk_ufw=active\nchk_keys=" ""
+  it "a clean host is said to be clean, with what was looked at"
+  assert_contains "$(STUB_RESPONSES=$WORK/chk-clean.responses system "${st[@]}")" "Host checks:     nothing found (owner of /, sol's privileges, firewall, key file modes)"
+
+  adm_host "$WORK/chk-bad.responses" "chk_root_owner=sol\nchk_groups=sol users docker\nchk_sudo=nopass\nchk_ufw=inactive\nchk_keys=/home/sol/staked_identity.json " ""
+  out="$(STUB_RESPONSES=$WORK/chk-bad.responses system "${st[@]}")"
+  it "a root directory that is not root's is reported with its fix"
+  assert_contains "$out" "/ is owned by sol, not root"
+  assert_contains "$out" "monarch@1.2.3.4 'sudo chown root:root /'"
+
+  it "the validator user being in the docker group is reported"
+  assert_contains "$out" "sol is in the docker group, which is root in all but name"
+
+  it "the validator user holding sudo is reported"
+  assert_contains "$out" "sol, the user the validator runs as, holds sudo"
+
+  it "a firewall that is off is reported"
+  assert_contains "$out" "the firewall (ufw) is not enabled"
+
+  it "a key file others can read is reported with its fix"
+  assert_contains "$out" "readable by other users: /home/sol/staked_identity.json"
+  assert_contains "$out" "'chmod 600 /home/sol/staked_identity.json'"
+
+  it "the report still lists what can be done from here"
+  assert_contains "$out" "From here:"
+
+  adm_host "$WORK/chk-unknown.responses" "" ""
+  it "a host the checks could not read is not called clean"
+  assert_not_contains "$(STUB_RESPONSES=$WORK/chk-unknown.responses system "${st[@]}")" "Host checks:"
+
   it "says there is nothing to upgrade on the newest release"
   assert_contains "$out" "upgrade     nothing to do: already on v5.0.0+concorde.1"
 
@@ -1427,10 +2258,17 @@ else
   it "a Jito host is offered the move to the Hexis Agave client"
   assert_contains "$out" "hexis       ./ascend.sh migrate --host 1.2.3.4 --ssh-key $WORK/key --hexis-tag 'v5.0.0+concorde.1' --restart"
 
-  it "and upgrade is refused there with the reason"
+  it "and is told how to switch between Jito and Agave or change version"
+  assert_contains "$out" "./arise.sh --host 1.2.3.4 --ssh-key $WORK/key --identity <staked_identity.json> --vote-account <pubkey> --network <net> --client <jito|agave> --client-version <tag> --restart"
+
+  it "and upgrade there points at arise.sh, which is not run from here"
   out="$(STUB_RESPONSES=$WORK/st-jito.responses system upgrade "${st[@]}" --print; echo "rc=$?")"
-  assert_contains "$out" "these scripts upgrade the Hexis builds only"
+  assert_contains "$out" "arise.sh upgrades it"
   assert_contains "$out" "rc=1"
+
+  it "a non-default admin user is passed on to the script that is run"
+  assert_contains "$(STUB_RESPONSES=$WORK/st-jito.responses system hexis "${st[@]}" --admin-user ops --print)" \
+    "./ascend.sh migrate --host 1.2.3.4 --ssh-key $WORK/key --admin-user ops --hexis-tag"
 
   printf '%s\n' '*echo ok*|ok' > "$WORK/st-fresh.responses"
   it "a host with no validator is pointed at arise.sh, which is not run from here"
@@ -1444,6 +2282,226 @@ else
   assert_contains "$out" "Cannot SSH to sol@1.2.3.4"
   assert_contains "$out" "rc=1"
   unset STUB_RELEASES
+fi
+
+# === arise.sh on a host that already runs a validator =======================
+# These run arise.sh for real (not --dry-run) against the stub ssh, which
+# answers the host-state probes and records every script and file sent.
+if should_run "switch"; then
+group "client switch (arise.sh on a live host)"
+  PK=7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2
+  JITO_REPO=https://github.com/jito-foundation/jito-solana.git
+  AGAVE_REPO=https://github.com/anza-xyz/agave.git
+  ID_SUM="$(shasum -a 256 "$WORK/id.json" | cut -d' ' -f1)"
+  EXE=/home/sol/.local/share/solana/install/releases/v4.4.1-jito/bin/agave-validator
+  sw_base=(--host 1.2.3.4 --vote-account "$PK" --network mainnet --commission-bps 0
+           --jito-region frankfurt --no-auto-disks --no-xdp --no-perch
+           --ssh-key "$WORK/key" --identity "$WORK/id.json")
+
+  # sw_run <name> <state: agave_active fd_active fd_enabled client exe> <build line> <extra ssh responses> <args...>
+  # Leaves the output in $out, scripts and written files in $WORK/<name>.scripts
+  # and every ssh command line in $WORK/<name>.ssh.
+  sw_run() {
+    local name="$1" state="$2" build="$3" extra="$4"; shift 4
+    local a b c d e
+    read -r a b c d e <<<"$state"
+    {
+      printf '%s\n' "*fd_enabled*|STATE|agave_active|$a\\nSTATE|fd_active|$b\\nSTATE|fd_enabled|$c\\nSTATE|client|$d\\nSTATE|exe|${e:-}"
+      printf '%s\n' "*.arise-build*cut*|$build"
+      printf '%s\n' '*PROBE_DONE*|PROBE_DONE'
+    } > "$WORK/$name.script-responses"
+    {
+      printf '%s\n' "*sha256sum*|$ID_SUM"
+      [[ -n "$extra" ]] && printf '%b\n' "$extra"
+      printf '%s\n' '*echo ok*|ok'
+    } > "$WORK/$name.responses"
+    : > "$WORK/$name.scripts"; : > "$WORK/$name.ssh"
+    out="$(STUB_RESPONSES="$WORK/$name.responses" STUB_SCRIPT_RESPONSES="$WORK/$name.script-responses" \
+           STUB_SCRIPT_LOG="$WORK/$name.scripts" STUB_LOG="$WORK/$name.ssh" SUDO_PASS=pw \
+           arise "${sw_base[@]}" "$@" </dev/null; echo "rc=$?")"
+  }
+  # The validator.sh that was written, from the recorded files
+  sw_vsh() { awk '/^### /{f=0} /^### .*validator\.sh\.arise-tmp/{f=1; next} f' "$WORK/$1.scripts"; }
+
+  # --- a new server ---
+  sw_run fresh "inactive inactive not-found none" "BUILD|NONE|" "" --client-version v4.4.1-jito
+
+  it "a new server is installed from scratch"
+  assert_contains "$out" "No validator on this host yet"
+
+  it "the client is built there"
+  assert_contains "$(cat "$WORK/fresh.scripts")" "CLIENT_REPO=$JITO_REPO"
+
+  it "sol.service is enabled"
+  assert_contains "$(cat "$WORK/fresh.scripts")" "HOLD_SOL=false"
+
+  it "nothing is restarted on a new server, even with --restart"
+  sw_run fresh-r "inactive inactive not-found none" "BUILD|NONE|" "" --client-version v4.4.1-jito --restart
+  assert_contains "$out" "no validator was running on this host"
+  assert_not_contains "$(cat "$WORK/fresh-r.ssh")" " exit "
+
+  # --- Jito -> Agave, no restart ---
+  sw_run j2a "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" "" --client agave --client-version v4.4.1
+
+  it "a live Jito host is recognised"
+  assert_contains "$out" "This host runs Jito today"
+
+  it "asking for Agave builds Agave beside the Jito build"
+  assert_contains "$out" "not agave from $AGAVE_REPO"
+  assert_contains "$(cat "$WORK/j2a.scripts")" "CLIENT_REPO=$AGAVE_REPO"
+
+  it "the new validator.sh has no Jito flags"
+  assert_not_contains "$(sw_vsh j2a)" "--block-engine-url"
+  assert_contains "$(sw_vsh j2a)" "--vote-account $PK"
+
+  it "the running validator is left alone without --restart"
+  assert_contains "$out" "The validator that is running was not touched"
+  assert_not_contains "$(cat "$WORK/j2a.ssh")" " exit "
+
+  it "the restart command is given, through the binary that is running"
+  assert_contains "$out" "$EXE --ledger /home/sol/ledger exit --min-idle-time 20 --max-delinquent-stake 5"
+
+  it "the run succeeds"
+  assert_contains "$out" "rc=0"
+
+  # --- Jito -> Agave with --restart ---
+  sw_run j2a-r "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" \
+    '*--version*|agave-validator 4.4.1\n*systemctl is-active sol*|active\n*readlink /proc*|/home/sol/new/agave-validator' \
+    --client agave --client-version v4.4.1 --restart --min-idle-time 30
+
+  it "--restart waits for a restart window before anything stops"
+  assert_contains "$(cat "$WORK/j2a-r.ssh")" "$EXE --ledger /home/sol/ledger wait-for-restart-window --min-idle-time 30 --max-delinquent-stake 5"
+
+  it "--restart exits through the binary that is running"
+  assert_contains "$(cat "$WORK/j2a-r.ssh")" "$EXE --ledger /home/sol/ledger exit --min-idle-time 30 --max-delinquent-stake 5"
+
+  it "the window comes before the exit, and both after validator.sh is written"
+  order="$(grep -n -e 'validator.sh.arise-tmp' -e 'wait-for-restart-window' -e ' exit --min-idle-time' "$WORK/j2a-r.ssh" | sed -e 's/^[0-9]*://' -e 's/.*validator\.sh.*/vsh/' -e 's/.*wait-for.*/window/' -e 's/.* exit .*/exit/' | tr '\n' ' ')"
+  assert_eq "$order" "vsh window exit "
+
+  it "--restart tells perch, wherever it is installed, between the window and the exit"
+  assert_contains "$(cat "$WORK/j2a-r.scripts")" "runuser -u sol -- /home/sol/perch/maint restart 1h"
+  assert_contains "$(cat "$WORK/j2a-r.scripts")" "perch --config /etc/perch/config.toml maint restart 1h"
+
+  it "--restart reports the validator back up"
+  assert_contains "$out" "sol.service is active again, now running: /home/sol/new/agave-validator"
+  assert_contains "$out" "rc=0"
+
+  it "--restart is called off when the new binary does not run"
+  sw_run j2a-bad "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" '*--version*|@fail' \
+    --client agave --client-version v4.4.1 --restart
+  assert_contains "$out" "not restarting"
+  assert_not_contains "$(cat "$WORK/j2a-bad.ssh")" " exit "
+  assert_contains "$out" "rc=1"
+
+  it "--restart is called off when no restart window is found"
+  sw_run j2a-nowin "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" \
+    '*wait-for-restart-window*|@fail\n*--version*|agave-validator 4.4.1' --client agave --client-version v4.4.1 --restart
+  assert_contains "$out" "No restart window was found"
+  assert_not_contains "$(cat "$WORK/j2a-nowin.ssh")" " exit "
+
+  # --- same client ---
+  it "the same client and version is not rebuilt"
+  sw_run same "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" "" --client-version v4.4.1-jito
+  assert_contains "$out" "already installed — skipping build"
+  assert_not_contains "$(cat "$WORK/same.scripts")" "cargo-install-all.sh"
+
+  it "a new version of the same client is built"
+  sw_run up "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" "" --client-version v4.4.2-jito
+  assert_contains "$out" "Installed build is v4.4.1-jito; building v4.4.2-jito"
+  assert_contains "$(cat "$WORK/up.scripts")" "CLIENT_VERSION=v4.4.2-jito"
+
+  it "a build from an older version of this script counts as Jito"
+  sw_run legacy "active inactive not-found jito $EXE" "BUILD|LEGACY|" "" --client agave --client-version v4.4.1
+  assert_contains "$(cat "$WORK/legacy.scripts")" "CLIENT_REPO=$AGAVE_REPO"
+
+  # --- leaving Hexis ---
+  # A --hexis host has only the prebuilt Solana CLI in active_release
+  sw_run unhexis "active inactive not-found hexis /home/sol/hexis/releases/v5/agave-validator" "BUILD|NONE|" "" --client-version v4.4.1-jito
+
+  it "leaving Hexis builds the plain client: the prebuilt CLI is not taken for it"
+  assert_contains "$(cat "$WORK/unhexis.scripts")" "cargo-install-all.sh"
+
+  it "leaving Hexis drops the arb flags from validator.sh"
+  assert_not_contains "$(sw_vsh unhexis)" "--arb-config"
+  assert_contains "$(sw_vsh unhexis)" "--block-engine-url"
+
+  it "leaving Hexis closes the Control port"
+  assert_contains "$(cat "$WORK/unhexis.scripts")" 'ufw delete allow from "$HEXIS_CONTROL_ALLOW"'
+
+  it "the Control port is not touched on a host that never ran Hexis"
+  assert_not_contains "$(cat "$WORK/j2a.scripts")" 'ufw delete allow from "$HEXIS_CONTROL_ALLOW"'
+
+  # --- a host that runs Firedancer ---
+  sw_run fd2j "inactive active enabled jito" "BUILD|NONE|" "" --client-version v4.4.1-jito
+
+  it "a Firedancer host is recognised"
+  assert_contains "$out" "This host runs Firedancer today"
+
+  it "the Agave-family client is installed beside Firedancer"
+  assert_contains "$(cat "$WORK/fd2j.scripts")" "cargo-install-all.sh"
+  assert_contains "$out" "jito is installed beside Firedancer"
+
+  it "sol.service is not enabled next to a Firedancer that holds the identity"
+  assert_contains "$(cat "$WORK/fd2j.scripts")" "HOLD_SOL=true"
+
+  it "the switch itself is reawaken.sh rollback"
+  assert_contains "$out" "reawaken.sh rollback --host 1.2.3.4 --ssh-key $WORK/key --admin-user monarch"
+  assert_contains "$out" "rc=0"
+
+  it "Firedancer staged but not enabled does not hold sol.service back"
+  sw_run fdstaged "active inactive disabled jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" "" --client-version v4.4.1-jito
+  assert_contains "$(cat "$WORK/fdstaged.scripts")" "HOLD_SOL=false"
+
+  # --restart there hands over to reawaken.sh, which reads the host itself and
+  # asks before it stops anything. No answer is given here, so it stops at the question.
+  fd_host "$WORK/fd-live-sw.facts" 'agave_active=inactive\nagave_enabled=disabled\nfd_active=active\nfd_enabled=enabled\nfd_unit=yes\nfd_release=v1.0.0\nfd_version=1.0.0\nfd_config=yes\nfd_signer=yes' "${KV}${JITO}"
+  sw_run fd2j-r "inactive active enabled jito" "BUILD|NONE|" "$(sed 's/\\/\\\\/g' "$WORK/fd-live-sw.facts")" --client-version v4.4.1-jito --restart
+
+  it "--restart on a Firedancer host hands over to reawaken.sh rollback"
+  assert_contains "$out" "handing over to reawaken.sh rollback"
+  assert_contains "$out" "This stops Firedancer on sol@1.2.3.4"
+
+  it "and nothing is stopped without the operator's yes"
+  assert_contains "$out" "Nothing changed"
+  assert_not_contains "$(cat "$WORK/fd2j-r.scripts")" "systemctl stop firedancer"
+
+  # --- a live host asked to become Firedancer ---
+  # reawaken.sh stage runs for real here too, against a host whose validator.sh
+  # is the Jito one. The binary handed over is a fake, so stage stops at its check.
+  fd_host "$WORK/jito-live-sw.facts" '' "${KV}${JITO}"
+  sw_run a2fd "active inactive not-found jito $EXE" "BUILD|v4.4.1-jito|$JITO_REPO" "$(sed 's/\\/\\\\/g' "$WORK/jito-live-sw.facts")" \
+    --client firedancer --fd-binary "$WORK/binary" --concorde-tables "$ROOT/test/fixtures/concorde-tables.toml"
+
+  it "validator.sh of the running validator is not rewritten on the way to Firedancer"
+  assert_contains "$out" "validator.sh left as it is"
+  assert_not_contains "$(cat "$WORK/a2fd.ssh")" "validator.sh.arise-tmp"
+
+  it "nor is its unit, and it stays enabled until the cutover"
+  assert_contains "$(cat "$WORK/a2fd.scripts")" "KEEP_RUNNING_SETUP=true"
+  assert_contains "$out" "Staging Firedancer with reawaken.sh"
+
+  it "reawaken.sh stages from the Jito validator.sh that was left in place"
+  assert_contains "$out" "Plan for sol@1.2.3.4 (Jito -> Firedancer with the Concorde)"
+  assert_contains "$out" "Block Engine:   https://ny.mainnet.block-engine.jito.wtf"
+
+  it "a Firedancer binary that does not run stops the staging, and arise.sh says how to resume"
+  assert_contains "$out" "The uploaded binary does not run on this host — nothing has been changed"
+  assert_contains "$out" "Staging Firedancer did not finish"
+  assert_contains "$out" "rc=1"
+
+  it "--concorde-tables is refused without the firedancer client"
+  assert_contains "$(arise "${sw_base[@]}" --dry-run --concorde-tables "$ROOT/test/fixtures/concorde-tables.toml")" "only go with --client firedancer"
+
+  # --- flags ---
+  it "--min-idle-time must be a number"
+  assert_contains "$(arise "${sw_base[@]}" --dry-run --min-idle-time soon)" "--min-idle-time must be a number of minutes"
+
+  it "--max-delinquent-stake must be a number"
+  assert_contains "$(arise "${sw_base[@]}" --dry-run --max-delinquent-stake lots)" "--max-delinquent-stake must be a percentage"
+
+  it "a dry run says what --restart would do"
+  assert_contains "$(arise "${sw_base[@]}" --dry-run --restart)" "[DRY RUN] --restart: if a validator is running, would wait for a restart window"
 fi
 
 # ---------------------------------------------------------------------------

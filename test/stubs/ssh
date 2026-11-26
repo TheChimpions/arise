@@ -1,17 +1,50 @@
 #!/usr/bin/env bash
 # Stub ssh. Responses come from $STUB_RESPONSES: lines of "<glob>|<output>".
 # The first glob matching the joined argv wins. Every call is appended to $STUB_LOG.
+#
+# A script piped to a remote 'bash -s' is matched on its text instead, against
+# $STUB_SCRIPT_RESPONSES (same format; the glob is matched against the script).
+# The script itself is appended to $STUB_SCRIPT_LOG under a "### <argv>" line,
+# so a test can assert on what would have run on the host. Files written with
+# 'cat > <path>' are kept there the same way.
 args="$*"
 [[ -n "${STUB_LOG:-}" ]] && printf '%s\n' "$args" >> "$STUB_LOG"
 
-if [[ -n "${STUB_RESPONSES:-}" && -f "$STUB_RESPONSES" ]]; then
+# The probe for passwordless sudo. A stubbed host asks for a password unless the
+# test says otherwise with STUB_SUDO_NOPASS=1.
+if [[ "$args" == *"sudo -k -n true" ]]; then
+  [[ "${STUB_SUDO_NOPASS:-}" == "1" ]] && exit 0
+  exit 1
+fi
+
+respond() {   # <file> <text to match>
+  local pattern output
+  [[ -n "$1" && -f "$1" ]] || return 1
   while IFS='|' read -r pattern output; do
     [[ -z "$pattern" || "$pattern" == \#* ]] && continue
     # shellcheck disable=SC2053
-    if [[ "$args" == $pattern ]]; then
+    if [[ "$2" == $pattern ]]; then
+      # "@fail" as the output makes this one call fail, with nothing printed
+      [[ "$output" == "@fail" ]] && exit 1
+      # "@exit N" makes it end with that status instead
+      [[ "$output" == "@exit "* ]] && exit "${output#@exit }"
       [[ -n "$output" ]] && printf '%b\n' "$output"
-      exit "${STUB_EXIT:-0}"
+      return 0
     fi
-  done < "$STUB_RESPONSES"
+  done < "$1"
+  return 1
+}
+
+if [[ "$args" == *"bash -s" && ( -n "${STUB_SCRIPT_RESPONSES:-}" || -n "${STUB_SCRIPT_LOG:-}" ) ]]; then
+  script="$(cat)"
+  [[ -n "${STUB_SCRIPT_LOG:-}" ]] && printf '### %s\n%s\n' "$args" "$script" >> "$STUB_SCRIPT_LOG"
+  respond "${STUB_SCRIPT_RESPONSES:-}" "$script" && exit "${STUB_EXIT:-0}"
 fi
+
+# A file written through 'cat > <path>': keep what was written
+if [[ "$args" == *"cat > "* && -n "${STUB_SCRIPT_LOG:-}" ]]; then
+  printf '### %s\n%s\n' "$args" "$(cat)" >> "$STUB_SCRIPT_LOG"
+fi
+
+respond "${STUB_RESPONSES:-}" "$args"
 exit "${STUB_EXIT:-0}"

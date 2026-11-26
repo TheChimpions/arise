@@ -18,6 +18,8 @@
 #   reawaken.sh upgrade   On a host already running Firedancer: stage a newer release,
 #                       wait for a safe window and restart onto it. --previous
 #                       goes back to the release that ran before.
+#   reawaken.sh unit      Rewrite firedancer.service and its pre-start snapshot
+#                       download on a host staged earlier. Restarts nothing.
 #   reawaken.sh status    Show which client is installed and running.
 #
 # Only cutover, rollback and upgrade stop or start a validator, and all ask first.
@@ -27,7 +29,7 @@
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
-for lib in hexis.sh firedancer.sh; do
+for lib in hexis.sh firedancer.sh remote.sh; do
   if [[ ! -f "${LIB_DIR}/${lib}" ]]; then
     echo "Missing ${LIB_DIR}/${lib} — run this from a checkout, not as a lone copied file" >&2
     exit 1
@@ -37,6 +39,8 @@ done
 source "${LIB_DIR}/hexis.sh"
 # shellcheck source=lib/firedancer.sh
 source "${LIB_DIR}/firedancer.sh"
+# shellcheck source=lib/remote.sh
+source "${LIB_DIR}/remote.sh"
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -45,6 +49,7 @@ MODE=""
 SSH_HOST=""
 SSH_KEY=""
 SOL_USER="sol"
+ADMIN_USER="monarch"          # holds sudo; sol does not
 VALIDATOR_SH=""              # defaults to /home/$SOL_USER/validator.sh
 AGAVE_SERVICE="sol"
 DRY_RUN=false
@@ -89,7 +94,7 @@ FD_OKX_LEDGER_SET=false
 
 usage() {
   cat <<EOF
-Usage: $0 <stage|cutover|rollback|upgrade|status> [OPTIONS]
+Usage: $0 <stage|cutover|rollback|upgrade|unit|status> [OPTIONS]
 
 Modes:
   stage      Install Firedancer next to the validator that is running, without
@@ -105,6 +110,10 @@ Modes:
              with --fd-tag or --fd-binary exactly as 'stage' does, waits for a
              window with no leader slot, and restarts Firedancer onto it.
              With --previous it switches back to the release that ran before.
+  unit       For a host that already has Firedancer staged or running, set up
+             by an older copy of these scripts. Rewrites firedancer.service and
+             the pre-start snapshot download, and nothing else. Restarts
+             nothing: it takes effect the next time Firedancer starts.
   status     Read-only report.
 
 Required:
@@ -144,9 +153,12 @@ Config (stage):
   --snapshot-allow-any          Take snapshots from any gossip peer (Firedancer's
                                 default). Without it, a validator.sh with three or
                                 more --known-validator keeps to exactly those
-  --snapshot-mirror <url>       Where cutover and upgrade fetch the full snapshot from
-                                before the restart. Default: ${FD_SNAPSHOT_MIRROR}
-  --no-snapshot-prefetch        Do not fetch it; Firedancer downloads from its peers
+  --snapshot-mirror <url>       Where the full snapshot is fetched from when the one on
+                                disk is too old: by cutover and upgrade before the
+                                restart, and by the unit before every start.
+                                Default: ${FD_SNAPSHOT_MIRROR}
+  --no-snapshot-prefetch        Do not fetch it; Firedancer downloads from its peers.
+                                With stage or unit: leave the pre-start step out
   --enable-rpc                  Run the RPC server. Off in the Concorde build: its core
                                 goes to the arb tiles
   --concorde-tables <path>      The Concorde's config tables. Default: fetched from the
@@ -154,6 +166,8 @@ Config (stage):
 
 Paths:
   --user <name>                 Validator user (default: ${SOL_USER})
+  --admin-user <name>           User that holds sudo (default: ${ADMIN_USER}). All root
+                                work goes through it; the validator user has no sudo
   --validator-script <path>     Agave startup script (default: /home/<user>/validator.sh)
   --agave-service <name>        Agave systemd unit (default: ${AGAVE_SERVICE})
   --fd-dir <path>               Binary and config (default: /home/<user>/firedancer)
@@ -178,9 +192,9 @@ EOF
 
 [[ $# -eq 0 ]] && usage
 case "$1" in
-  stage|cutover|rollback|upgrade|status) MODE="$1"; shift ;;
+  stage|cutover|rollback|upgrade|unit|status) MODE="$1"; shift ;;
   -h|--help) usage ;;
-  *) log_error "First argument must be 'stage', 'cutover', 'rollback', 'upgrade' or 'status'"; usage ;;
+  *) log_error "First argument must be 'stage', 'cutover', 'rollback', 'upgrade', 'unit' or 'status'"; usage ;;
 esac
 
 while [[ $# -gt 0 ]]; do
@@ -188,6 +202,7 @@ while [[ $# -gt 0 ]]; do
     --host)             SSH_HOST="$2"; shift 2 ;;
     --ssh-key)          SSH_KEY="$2"; shift 2 ;;
     --user)             SOL_USER="$2"; shift 2 ;;
+    --admin-user)       ADMIN_USER="$2"; shift 2 ;;
     --validator-script) VALIDATOR_SH="$2"; shift 2 ;;
     --agave-service)    AGAVE_SERVICE="$2"; shift 2 ;;
     --fd-tag)           FD_TAG="$2"; shift 2 ;;
@@ -284,50 +299,18 @@ if [[ "$MODE" == "stage" ]] || { [[ "$MODE" == "upgrade" ]] && ! $FD_PREVIOUS; }
   fi
 fi
 
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $SSH_KEY"
-SSH_CMD="ssh -o IdentitiesOnly=yes -i ${SSH_KEY}"
+# Connection settings, and the helpers that use them (root_script, sol_script,
+# remote, sol_write_file), come from lib/remote.sh. Root work goes through the
+# admin user; sol has no sudo.
+remote_init
+# Each remote script in this file sets its own error handling.
+REMOTE_STRICT=":"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-remote() {
-  if $DRY_RUN; then
-    echo "[DRY RUN] ssh $SOL_HOST: $*"
-  else
-    ssh $SSH_OPTS "$SOL_HOST" "$@"
-  fi
-}
-
 # Always runs, even under --dry-run. For reads that must not be faked.
-probe() { ssh -n $SSH_OPTS "$SOL_HOST" "$@" 2>/dev/null || true; }
-
-sol_script() {
-  if $DRY_RUN; then
-    echo "[DRY RUN] sol_script on $SOL_HOST: <script>"
-    cat
-    return
-  fi
-  local tmpscript
-  tmpscript=$(mktemp)
-  cat > "$tmpscript"
-  scp -q $SSH_OPTS "$tmpscript" "$SOL_HOST:/tmp/_reawaken.sh"
-  rm -f "$tmpscript"
-  ssh $SSH_OPTS "$SOL_HOST" 'bash /tmp/_reawaken.sh; rc=$?; rm -f /tmp/_reawaken.sh; exit $rc'
-}
-
-root_script() {
-  if $DRY_RUN; then
-    echo "[DRY RUN] root_script on $SOL_HOST: <script>"
-    cat
-    return
-  fi
-  local tmpscript
-  tmpscript=$(mktemp)
-  cat > "$tmpscript"
-  scp -q $SSH_OPTS "$tmpscript" "$SOL_HOST:/tmp/_reawaken_root.sh"
-  rm -f "$tmpscript"
-  ssh $SSH_OPTS "$SOL_HOST" "echo '${SUDO_PASS:-}' | sudo -S -p '' bash /tmp/_reawaken_root.sh; rc=\$?; rm -f /tmp/_reawaken_root.sh; exit \$rc"
-}
+probe() { ssh -n "${SSH_OPTS[@]}" "$SOL_HOST" "$@" 2>/dev/null || true; }
 
 confirm() {
   $ASSUME_YES && return 0
@@ -337,19 +320,92 @@ confirm() {
   [[ "$reply" == "yes" ]]
 }
 
-SUDO_PASS=""
 need_sudo() {
   $DRY_RUN && return 0
-  [[ -n "$SUDO_PASS" ]] && return 0
-  read -rsp "Sudo password for ${SOL_HOST}: " SUDO_PASS
-  echo ""
-  if ! ssh $SSH_OPTS "$SOL_HOST" "echo '${SUDO_PASS}' | sudo -S -p '' -v 2>/dev/null"; then
-    log_error "Sudo password validation failed"
-    exit 1
-  fi
+  ask_sudo_pass || exit 1
 }
 
 fact() { sed -n "s/^$1=//p" <<<"$FACTS" | head -1; }
+
+# How long to wait between looks at a host that is rebooting
+REBOOT_POLL_SECONDS="${REBOOT_POLL_SECONDS:-10}"
+
+# huge_page_outlook <required 1 GiB pages> — one line on whether the first
+# Firedancer start is likely to need a reboot. Whether the kernel can find that
+# many contiguous gigabytes is only known when it is asked, after Agave has
+# stopped, so this says what is known and does not guess beyond it.
+huge_page_outlook() {
+  local need="$1" have days
+  have=$(fact hp1g_total); days=$(fact uptime_days)
+  [[ "$need" =~ ^[0-9]+$ && "$have" =~ ^[0-9]+$ ]] || return 0
+  if [[ "$(fact fd_active)" == "active" ]]; then
+    echo "${need} one-GiB pages, held by the running Firedancer"
+  elif (( have >= need )); then
+    echo "${need} one-GiB pages needed, ${have} already reserved — no reboot needed"
+  elif [[ "$days" =~ ^[0-9]+$ ]] && (( days < 1 )); then
+    echo "${need} one-GiB pages needed, ${have} reserved. Booted today, so they are usually found without a reboot"
+  else
+    echo "${need} one-GiB pages needed, ${have} reserved. Up ${days:-?} day(s): expect cutover to need a reboot, which it offers"
+  fi
+}
+
+# The remote cutover script exits with this when Firedancer could not get its
+# 1 GiB pages: everything else is done and only a reboot is missing.
+EXIT_NEEDS_REBOOT=42
+
+# reboot_for_huge_pages — Agave is stopped, Firedancer is enabled and could not
+# reserve its pages. Offers the reboot, waits for the host to come back as a new
+# boot, and for Firedancer to be running on it. Returns 1 when the operator
+# declines or the host does not come back in time; says what is left to do.
+reboot_for_huge_pages() {
+  local old_boot new_boot i state=""
+  echo ""
+  log_warn "Firedancer could not reserve its 1 GiB pages: memory on ${SOL_HOST} is too fragmented."
+  log_warn "${AGAVE_SERVICE}.service is stopped and disabled, firedancer.service is enabled, and"
+  log_warn "jag-snap and perch are already taken care of. A reboot is all that is missing:"
+  log_warn "Firedancer starts by itself and takes its pages first thing. The validator is"
+  log_warn "not voting until then."
+  if ! confirm "Reboot ${SOL_HOST} now?"; then
+    log_warn "Not rebooted. Reboot it yourself; nothing needs to be run afterwards:"
+    log_warn "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo systemctl reboot'"
+    log_warn "Or go back to Agave: $0 rollback --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
+    return 1
+  fi
+  old_boot=$(fact boot_id)
+  log_info "Rebooting ${SOL_HOST}"
+  # The connection drops as the host goes down, so the status says nothing
+  echo "systemctl reboot" | admin_root_exec "bash -s" >/dev/null 2>&1 || true
+
+  log_info "Waiting for it to come back (up to 15 minutes)"
+  new_boot=""
+  for ((i = 0; i < 90; i++)); do
+    sleep "$REBOOT_POLL_SECONDS"
+    new_boot=$(probe "cat /proc/sys/kernel/random/boot_id")
+    [[ -n "$new_boot" && "$new_boot" != "$old_boot" ]] && break
+    new_boot=""
+  done
+  if [[ -z "$new_boot" ]]; then
+    log_error "${SOL_HOST} has not come back. When it does, Firedancer starts by itself. Check with:"
+    log_error "  $0 status --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
+    return 1
+  fi
+  log_info "${SOL_HOST} is back. Waiting for firedancer.service"
+  for ((i = 0; i < 30; i++)); do
+    state=$(probe "systemctl is-active firedancer")
+    [[ "$state" == "active" || "$state" == "failed" ]] && break
+    sleep "$REBOOT_POLL_SECONDS"
+  done
+  if [[ "$state" != "active" ]]; then
+    log_error "firedancer.service is '${state:-unknown}' after the reboot. Look at:"
+    log_error "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo journalctl -u firedancer -n 50'"
+    log_error "Or go back to Agave: $0 rollback --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
+    return 1
+  fi
+  log_info "firedancer.service started after the reboot"
+}
+
+# required_gigantic_pages <firedancer mem output>
+required_gigantic_pages() { sed -n 's/.*Required Gigantic Pages *\([0-9][0-9]*\).*/\1/p' <<<"$1" | head -1; }
 
 # fd_prefetch_snapshot <agave snapshot dir or ""> — before the validator stops,
 # fetch the current full snapshot from the mirror into Firedancer's snapshot
@@ -384,7 +440,7 @@ mem_check() {
     probe "$script"
   else
     # The log directory belongs to the Firedancer user, which sol cannot write
-    ssh $SSH_OPTS "$SOL_HOST" "echo '${SUDO_PASS:-}' | sudo -S -p '' bash -c \"$script\"" 2>/dev/null || true
+    printf '%s\n' "$script" | admin_root_exec "bash -s" 2>/dev/null || true
   fi
 }
 
@@ -400,13 +456,16 @@ fi
 
 # The heredoc is expanded here on purpose: it carries this script's paths.
 # shellcheck disable=SC2087
-FACTS=$(ssh $SSH_OPTS "$SOL_HOST" "bash -s -- host-facts" 2>/dev/null <<FACTSEOF || true
+FACTS=$(ssh "${SSH_OPTS[@]}" "$SOL_HOST" "bash -s -- host-facts" 2>/dev/null <<FACTSEOF || true
 echo "vendor=\$(awk -F': ' '/^vendor_id/{print \$2; exit}' /proc/cpuinfo)"
 echo "family=\$(awk -F': ' '/^cpu family/{print \$2; exit}' /proc/cpuinfo)"
 echo "model=\$(awk -F': ' '/^model name/{print \$2; exit}' /proc/cpuinfo)"
 echo "flags=\$(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx2|avx512f' | tr '\n' ' ')"
 echo "glibc=\$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\$')"
 echo "mem_gib=\$(awk '/^MemTotal/{printf "%d", \$2/1048576}' /proc/meminfo)"
+echo "hp1g_total=\$(cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages 2>/dev/null)"
+echo "uptime_days=\$(awk '{printf "%d", \$1/86400}' /proc/uptime)"
+echo "boot_id=\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 echo "ip=\$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="src") print \$(i+1)}' | head -1)"
 echo "doublezero=\$(ip link show doublezero0 >/dev/null 2>&1 && echo yes || echo no)"
 echo "ufw=\$(grep -qs '^ENABLED=yes' /etc/ufw/ufw.conf && echo active || echo inactive)"
@@ -483,7 +542,57 @@ if [[ "$MODE" == "status" ]]; then
   echo "  Firedancer:      firedancer.service $(fact fd_active) / $(fact fd_enabled)"
   echo "  Staged release:  ${FD_DIR}: $(fact fd_release) $(fact fd_version)"
   echo "  Staged config:   $(fact fd_config)   unit: $(fact fd_unit)   arb signer: $(fact fd_signer)"
+  if [[ "$(fact fd_config)" == "yes" ]]; then
+    # Read as the validator user; says nothing when the config is not readable to it
+    OUTLOOK=$(huge_page_outlook "$(required_gigantic_pages "$(probe "${FD_BIN} mem --config ${FD_CONFIG} 2>&1")")")
+    [[ -n "$OUTLOOK" ]] && echo "  Huge pages:      ${OUTLOOK}"
+  fi
   echo ""
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# unit — bring firedancer.service and its pre-start step up to date
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "unit" ]]; then
+  if [[ "$(fact fd_unit)" != "yes" || "$(fact fd_config)" != "yes" ]]; then
+    log_error "Firedancer is not staged on ${SOL_HOST} — run '$0 stage' first"
+    exit 1
+  fi
+  FD_CONFIG_TEXT=$(probe "cat ${FD_CONFIG}")
+  UNIT_SNAPS=$(fd_toml_get "$FD_CONFIG_TEXT" "snapshots")
+  UNIT_LOG=$(fd_toml_get "$FD_CONFIG_TEXT" "path")
+  UNIT_USER=$(fd_toml_get "$FD_CONFIG_TEXT" "user")
+  UNIT_MIRROR="${SNAPSHOT_MIRROR:-$FD_SNAPSHOT_MIRROR}"
+  UNIT_PREFETCH=on
+  $SNAPSHOT_PREFETCH || UNIT_PREFETCH=off
+  if [[ "$UNIT_PREFETCH" == on && ( -z "$UNIT_SNAPS" || -z "$UNIT_USER" ) ]]; then
+    log_error "Could not read [paths] snapshots and user from ${FD_CONFIG}"
+    exit 1
+  fi
+  UNIT_TEXT="$(fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE" "$UNIT_PREFETCH")"
+  if $DRY_RUN; then
+    if [[ "$UNIT_PREFETCH" == on ]]; then
+      echo "[DRY RUN] install ${FD_PREFETCH_SCRIPT}: before each start, fetch the full snapshot from ${UNIT_MIRROR} into ${UNIT_SNAPS} when the one on disk is too old"
+    else
+      echo "[DRY RUN] remove ${FD_PREFETCH_SCRIPT}"
+    fi
+    echo "[DRY RUN] ${FD_UNIT} would be:"
+    echo "$UNIT_TEXT"
+    echo "[DRY RUN] systemctl daemon-reload — Firedancer is not restarted"
+    exit 0
+  fi
+  need_sudo
+  log_info "Rewriting firedancer.service and its pre-start step on ${SOL_HOST} — nothing is restarted"
+  root_script <<SCRIPT
+set -e
+$(fd_render_prefetch_install "$UNIT_PREFETCH" "$UNIT_MIRROR" "$UNIT_SNAPS" "$UNIT_USER" "$FD_CONFIG" "$UNIT_LOG")
+cat > ${FD_UNIT} <<'UNITEOF'
+${UNIT_TEXT}
+UNITEOF
+systemctl daemon-reload
+echo "firedancer.service rewritten — it is \$(systemctl is-active firedancer 2>/dev/null || true) and was not restarted; the change applies from its next start"
+SCRIPT
   exit 0
 fi
 
@@ -530,11 +639,13 @@ fi"
     if $DRY_RUN; then
       $USES_JAG_SNAP && echo "[DRY RUN] stop the jag-snap container and close ${JAG_SNAP_PORT}/tcp, if still up"
       echo "[DRY RUN] drop this host's own RPC from perch's endpoints, if the host runs perch"
+      echo "[DRY RUN] point perch at Firedancer's metrics, if the host runs perch ${PERCH_FIREDANCER_MIN} or newer"
     else
       need_sudo
       root_script <<SCRIPT
 ${JAG_SNAP_RETIRE}
 $(perch_local_rpc_off_cmd "$SOL_USER")
+$(perch_firedancer_on_cmd "$SOL_USER" "$FD_CONFIG")
 SCRIPT
     fi
     exit 0
@@ -550,9 +661,12 @@ SCRIPT
     echo "[DRY RUN] systemctl stop ${AGAVE_SERVICE}; systemctl disable ${AGAVE_SERVICE}"
     echo "[DRY RUN] copy vote_history-${IDENTITY_PUBKEY:-<identity>}.bin from ${AGAVE_LEDGER} to ${FD_BASE}; move any other identity's aside"
     [[ -n "$FD_SNAPSHOTS_DIR" ]] && echo "[DRY RUN] seed ${FD_SNAPSHOTS_DIR} with the newest snapshot in ${AGAVE_SNAPSHOTS}"
-    echo "[DRY RUN] systemctl enable firedancer; systemctl start firedancer, identity ${IDENTITY_LABEL}"
     $USES_JAG_SNAP && echo "[DRY RUN] stop the jag-snap container and close ${JAG_SNAP_PORT}/tcp"
     echo "[DRY RUN] drop this host's own RPC from perch's endpoints, if the host runs perch"
+    echo "[DRY RUN] point perch at Firedancer's metrics, if the host runs perch ${PERCH_FIREDANCER_MIN} or newer"
+    echo "[DRY RUN] drop the page cache and compact memory, to make room for the 1 GiB pages"
+    echo "[DRY RUN] systemctl enable firedancer; systemctl start firedancer, identity ${IDENTITY_LABEL}"
+    echo "[DRY RUN] if the 1 GiB pages still cannot be reserved: offer to reboot, then wait for Firedancer to come up"
     exit 0
   fi
 
@@ -604,7 +718,8 @@ $(fd_render_snapshot_seed "$AGAVE_SNAPSHOTS" "$FD_SNAPSHOTS_DIR" "$FD_USER")"
   fi
 
   log_info "Stopping ${AGAVE_SERVICE}.service and starting firedancer.service"
-  root_script <<SCRIPT
+  # Not under set -e here: the status of the remote script decides what happens next
+  root_script <<SCRIPT && CUTOVER_RC=0 || CUTOVER_RC=$?
 set -e
 $(perch_maint_cmd "$SOL_USER" "$PERCH_DEADLINE_FIREDANCER" root)
 systemctl stop ${AGAVE_SERVICE}
@@ -641,6 +756,20 @@ done
 
 ${LOGROTATE_STEP}
 $(fd_render_nofile_sysctl)
+
+# Everything that follows Agave is done before Firedancer starts, so that a
+# start which needs a reboot leaves nothing to come back for. rollback undoes both.
+${JAG_SNAP_RETIRE}
+$(perch_local_rpc_off_cmd "$SOL_USER")
+$(perch_firedancer_on_cmd "$SOL_USER" "$FD_CONFIG")
+
+# Firedancer needs its 1 GiB pages as contiguous memory. With Agave gone, give
+# the page cache back and let the kernel compact what is free: on a host that
+# has been up for a while this is what can make the reboot unnecessary.
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+
 systemctl daemon-reload
 systemctl reset-failed firedancer 2>/dev/null || true
 systemctl enable firedancer >/dev/null 2>&1
@@ -648,25 +777,26 @@ if ! systemctl start firedancer; then
   echo "firedancer.service failed to start:"
   journalctl -u firedancer --no-pager -n 25
   if journalctl -u firedancer --no-pager -n 25 | grep -q "reserve gigantic pages"; then
-    echo "Memory is too fragmented for the 1 GiB pages. Reboot the host: firedancer.service is"
-    echo "enabled and takes its pages first thing. Then run cutover once more to finish."
+    exit ${EXIT_NEEDS_REBOOT}
   fi
   echo "${AGAVE_SERVICE}.service is stopped and disabled. Fix the cause and run cutover again, or run rollback."
   exit 1
 fi
 echo "firedancer.service started"
-
-${JAG_SNAP_RETIRE}
-$(perch_local_rpc_off_cmd "$SOL_USER")
 SCRIPT
+  if (( CUTOVER_RC == EXIT_NEEDS_REBOOT )); then
+    reboot_for_huge_pages || exit 1
+  elif (( CUTOVER_RC != 0 )); then
+    exit "$CUTOVER_RC"
+  fi
 
   echo ""
   log_info "============================================"
   log_info "cutover complete — Firedancer is booting"
   log_info "============================================"
   log_info "Watch it load the snapshot and catch up:"
-  log_info "  ${SSH_CMD} ${SOL_HOST} 'sudo journalctl -u firedancer -f'"
-  log_info "  ${SSH_CMD} ${SOL_HOST} 'sudo ${FD_BIN} ready --config ${FD_CONFIG}'"
+  log_info "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo journalctl -u firedancer -f'"
+  log_info "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo ${FD_BIN} ready --config ${FD_CONFIG}'"
   log_info "Then check the Control port and tell Hexis it is up:"
   log_info "  ${SSH_CMD} ${SOL_HOST} 'ss -lntp | grep ${FD_CONTROL_PORT}'"
   log_info ""
@@ -693,6 +823,7 @@ if [[ "$MODE" == "rollback" ]]; then
     echo "[DRY RUN] systemctl enable ${AGAVE_SERVICE}; systemctl start ${AGAVE_SERVICE}"
     $USES_JAG_SNAP && echo "[DRY RUN] start the jag-snap container and reopen ${JAG_SNAP_PORT}/tcp"
     echo "[DRY RUN] put perch's config from before Firedancer back, if there is one"
+    echo "[DRY RUN] stop perch reading Firedancer's metrics, if it was"
     exit 0
   fi
 
@@ -730,6 +861,7 @@ systemctl start ${AGAVE_SERVICE}
 echo "${AGAVE_SERVICE}.service started"
 
 $(perch_local_rpc_on_cmd "$SOL_USER")
+$(perch_firedancer_off_cmd "$SOL_USER")
 if ${USES_JAG_SNAP}; then
   if ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow ${JAG_SNAP_PORT}/tcp >/dev/null
@@ -819,7 +951,7 @@ SCRIPT
   log_info "============================================"
   log_info "upgrade complete — Firedancer is booting on ${label}"
   log_info "============================================"
-  log_info "  ${SSH_CMD} ${SOL_HOST} 'sudo journalctl -u firedancer -f'"
+  log_info "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo journalctl -u firedancer -f'"
   log_info "Back to the release that ran before:"
   log_info "  $0 upgrade --previous --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
 }
@@ -1081,7 +1213,7 @@ if $FD_ENABLE_RPC; then
 else
   log_warn "  RPC:            off — anything reading 127.0.0.1:8899 on this host (solana catchup) stops working"
 fi
-log_warn "  Snapshots:      none made or served. Cutover and upgrade fetch the full one before the restart"
+log_warn "  Snapshots:      none made or served. Cutover, upgrade and every start of the unit fetch the full one from the mirror when the one on disk is too old"
 if $USES_JAG_SNAP; then
   log_warn "  jag-snap:       retired at cutover (container stopped, ${JAG_SNAP_PORT}/tcp closed); rollback brings it back"
 fi
@@ -1092,7 +1224,12 @@ if $DRY_RUN; then
   echo "$CONFIG_TEXT"
   echo ""
   echo "[DRY RUN] ${FD_UNIT} would be:"
-  fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE"
+  if $SNAPSHOT_PREFETCH; then
+    fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE" on
+    echo "[DRY RUN] ${FD_PREFETCH_SCRIPT}: before each start, fetch the full snapshot from ${SNAPSHOT_MIRROR:-$FD_SNAPSHOT_MIRROR} into ${FDC_SNAPSHOTS} when the one on disk is too old"
+  else
+    fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE" off
+  fi
   echo ""
   [[ "$MODE" == "upgrade" ]] && fd_restart_onto "$OLD_RELEASE" "${FD_TAG:-$(basename "$FD_BINARY")}"
   echo "[DRY RUN] nothing was changed on ${SOL_HOST}"
@@ -1114,8 +1251,7 @@ fi
 
 if [[ -n "$FD_BINARY" ]]; then
   remote "mkdir -p ${FD_DIR}/releases && chmod 750 ${FD_DIR}"
-  scp -q $SSH_OPTS "$FD_BINARY" "$SOL_HOST:${FD_DIR}/firedancer.incoming"
-  remote "chmod +x ${FD_DIR}/firedancer.incoming"
+  sol_write_file "${FD_DIR}/firedancer.incoming" 755 < "$FD_BINARY"
 
   NEW_VERSION=$(probe "${FD_DIR}/firedancer.incoming version 2>/dev/null | head -1")
   if [[ -z "$NEW_VERSION" ]]; then
@@ -1157,8 +1293,8 @@ fi
 
 # --- Directories and the arb signer --------------------------------------------
 if [[ "$SIGNER_FROM" == "upload" ]]; then
-  scp -q $SSH_OPTS "$FD_SIGNER" "$SOL_HOST:${FD_SIGNER_PATH}.incoming"
-  remote "chmod 600 ${FD_SIGNER_PATH}.incoming"
+  # Streamed over SSH and created mode 600 — never readable by anyone else
+  sol_write_file "${FD_SIGNER_PATH}.incoming" 600 < "$FD_SIGNER"
 fi
 
 case "$SIGNER_FROM" in
@@ -1185,11 +1321,7 @@ echo "arb signer: \$(${FD_BIN} keys pubkey ${FD_SIGNER_PATH} 2>/dev/null || echo
 SCRIPT
 
 # --- Config: write, check against the real binary, then install -----------------
-CONFIG_TMP=$(mktemp)
-printf '%s\n' "$CONFIG_TEXT" > "$CONFIG_TMP"
-scp -q $SSH_OPTS "$CONFIG_TMP" "$SOL_HOST:${FD_CONFIG}.new"
-rm -f "$CONFIG_TMP"
-remote "chmod 640 ${FD_CONFIG}.new"
+printf '%s\n' "$CONFIG_TEXT" | sol_write_file "${FD_CONFIG}.new" 640
 
 log_info "Checking the config with 'firedancer mem'"
 CHECK=$(mem_check "${FD_CONFIG}.new")
@@ -1201,6 +1333,7 @@ if ! grep -q "Total Memory Locked" <<<"$CHECK"; then
 fi
 while IFS= read -r line; do log_info "  $(sed -E 's/^ +//; s/ +/ /g' <<<"$line")"; done < <(grep -E "Total|Required" <<<"$CHECK")
 
+HUGE_PAGE_OUTLOOK=$(huge_page_outlook "$(required_gigantic_pages "$CHECK")")
 LOCKED_GIB=$(grep -m1 "Total Memory Locked" <<<"$CHECK" | grep -oE '[0-9]+ GiB' | head -1 | grep -oE '[0-9]+' || true)
 MEM_GIB=$(fact mem_gib)
 if [[ -n "$LOCKED_GIB" && -n "$MEM_GIB" ]]; then
@@ -1235,7 +1368,9 @@ else
 fi
 
 # --- systemd unit and firewall -----------------------------------------------
-UNIT_TEXT="$(fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE")"
+UNIT_PREFETCH=on
+$SNAPSHOT_PREFETCH || UNIT_PREFETCH=off
+UNIT_TEXT="$(fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE" "$UNIT_PREFETCH")"
 UFW_RULES=""
 for src in $FD_CONTROL_ALLOW; do
   UFW_RULES+="ufw allow from ${src} to any port ${FD_CONTROL_PORT} proto tcp >/dev/null
@@ -1251,6 +1386,7 @@ done
 log_info "Installing firedancer.service (not enabled), log rotation and the firewall rules"
 root_script <<SCRIPT
 set -e
+$(fd_render_prefetch_install "$UNIT_PREFETCH" "${SNAPSHOT_MIRROR:-$FD_SNAPSHOT_MIRROR}" "$FDC_SNAPSHOTS" "$FD_USER" "$FD_CONFIG" "$FDC_LOG")
 cat > ${FD_UNIT} <<'UNITEOF'
 ${UNIT_TEXT}
 UNITEOF
@@ -1288,6 +1424,7 @@ log_info "============================================"
 log_info "Staged:  ${FD_BIN} -> $(probe "readlink ${FD_BIN}")"
 log_info "         ${FD_CONFIG}, ${FD_SIGNER_PATH}, ${FD_UNIT}"
 log_info ""
+[[ -n "${HUGE_PAGE_OUTLOOK:-}" ]] && log_info "Huge pages: ${HUGE_PAGE_OUTLOOK}"
 log_info "Nothing was stopped or started. When you are ready:"
 log_info "  $0 cutover --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
 log_info "and to go back to Agave afterwards:"

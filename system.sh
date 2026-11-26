@@ -40,6 +40,8 @@ GOAL=""
 SSH_HOST=""
 SSH_KEY=""
 SOL_USER="sol"
+ADMIN_USER="monarch"
+ADMIN_USER_SET=false         # true when --admin-user was given: then it is not second-guessed
 AGAVE_SERVICE="sol"
 TAG=""
 PRINT_ONLY=false
@@ -56,11 +58,17 @@ Goals:
   hexis        Onto the Hexis Agave client (from Jito or plain Agave)
   firedancer   Onto Firedancer with the Hexis Concorde: stages it, and on the
                next call, once it is staged, cuts over
-  agave        Back from Firedancer to the Agave client it ran before
+  agave        Back from Firedancer to the Agave client validator.sh describes
+
+Moving between Jito and Agave, leaving Hexis, or upgrading a Jito or Agave build
+is done by arise.sh: run it again with the flags the host was set up with, the
+new --client / --client-version, and --restart. It needs your keys, so it is not
+run from here.
 
 Options:
   --tag <tag>          Release to use instead of the newest
   --user <name>        Validator user (default: ${SOL_USER})
+  --admin-user <name>  Admin user that holds sudo (default: ${ADMIN_USER})
   --agave-service <n>  Agave systemd unit (default: ${AGAVE_SERVICE})
   --print              Show the command for the goal, do not run it
   -h, --help           Show this help
@@ -79,6 +87,7 @@ while [[ $# -gt 0 ]]; do
     --host)          SSH_HOST="$2"; shift 2 ;;
     --ssh-key)       SSH_KEY="$2"; shift 2 ;;
     --user)          SOL_USER="$2"; shift 2 ;;
+    --admin-user)    ADMIN_USER="$2"; ADMIN_USER_SET=true; shift 2 ;;
     --agave-service) AGAVE_SERVICE="$2"; shift 2 ;;
     --tag)           TAG="$2"; shift 2 ;;
     --print)         PRINT_ONLY=true; shift ;;
@@ -97,8 +106,17 @@ SOL_HOST="${SOL_USER}@${SSH_HOST}"
 VALIDATOR_SH="/home/${SOL_USER}/validator.sh"
 FD_DIR="/home/${SOL_USER}/firedancer"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $SSH_KEY"
-HOST_ARGS="--host ${SSH_HOST} --ssh-key ${SSH_KEY}"
-[[ "$SOL_USER" != "sol" ]] && HOST_ARGS+=" --user ${SOL_USER}"
+# Builds the arguments every printed command carries. Called again when the
+# admin user turns out to be someone other than the default.
+set_host_args() {
+  HOST_ARGS="--host ${SSH_HOST} --ssh-key ${SSH_KEY}"
+  [[ "$SOL_USER" != "sol" ]] && HOST_ARGS+=" --user ${SOL_USER}"
+  [[ "$ADMIN_USER" != "monarch" ]] && HOST_ARGS+=" --admin-user ${ADMIN_USER}"
+  # What arise.sh needs to change the client or version of a host it set up
+  ARISE_HINT="./arise.sh ${HOST_ARGS} --identity <staked_identity.json> --vote-account <pubkey> --network <net> --client <jito|agave> --client-version <tag> --restart"
+  return 0
+}
+set_host_args
 
 # shellcheck disable=SC2086
 probe() { ssh -n $SSH_OPTS "$SOL_HOST" "$@" 2>/dev/null || true; }
@@ -154,6 +172,11 @@ echo \"fd_config=\$(test -f ${FD_DIR}/config.toml && echo yes || echo no)\"
 echo \"fd_previous=\$(cat ${FD_DIR}/.previous-release 2>/dev/null)\"
 echo \"jag_snap=\$(ss -lnt 2>/dev/null | grep -q ':18899 ' && echo up || echo down)\"
 echo \"perch_local=\$($(perch_local_rpc_dead_cmd "$SOL_USER"))\"
+echo \"chk_root_owner=\$(stat -c %U / 2>/dev/null)\"
+echo \"chk_groups=\$(id -nG 2>/dev/null)\"
+echo \"chk_sudo=\$(sudo -k -n true 2>/dev/null && echo nopass || echo no)\"
+echo \"chk_ufw=\$(grep -qs '^ENABLED=yes' /etc/ufw/ufw.conf && echo active || echo inactive)\"
+echo \"chk_keys=\$(find /home/${SOL_USER} -maxdepth 1 -type f -name '*.json' -perm /077 2>/dev/null | tr '\\n' ' ')\"
 echo \"agave_release=\$(readlink ${HEXIS_DIR:-/nonexistent}/agave-validator 2>/dev/null | sed -e 's|^releases/||' -e 's|/agave-validator\$||')\"")
   if [[ "$(fact fd_enabled)" == "enabled" ]]; then
     STATE="firedancer"
@@ -161,6 +184,84 @@ echo \"agave_release=\$(readlink ${HEXIS_DIR:-/nonexistent}/agave-validator 2>/d
     STATE="$SOURCE"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# Who holds sudo here
+#
+# The scripts this one hands over to do their root work through the admin user.
+# A host set up before that user existed has no such login. When the default
+# does not take this key, the host's other login accounts are tried with it, and
+# the first that gets in and holds sudo goes into the commands printed below.
+# An --admin-user given on the command line is taken as is.
+# ---------------------------------------------------------------------------
+# shellcheck disable=SC2086
+admin_login() { ssh -n $SSH_OPTS -o BatchMode=yes "$1@${SSH_HOST}" "$2" 2>/dev/null; }
+
+ADMIN_NOTE=""
+ADMIN_MISSING=false
+if [[ -n "$FACTS" ]] && ! $ADMIN_USER_SET && ! admin_login "$ADMIN_USER" true; then
+  ADMIN_FOUND=""
+  ADMIN_SUDO=""
+  for candidate in $(probe ": admin-candidates
+awk -F: -v me='${SOL_USER}' '\$3 >= 1000 && \$3 < 60000 && \$1 != me && \$7 !~ /(nologin|false)\$/ { print \$1 }' /etc/passwd | head -4"); do
+    [[ "$candidate" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || continue
+    ADMIN_SUDO=$(admin_login "$candidate" ": admin-sudo
+if sudo -k -n true 2>/dev/null; then echo nopass; elif id -nG | tr ' ' '\n' | grep -qxE 'sudo|admin|wheel'; then echo pass; fi" || true)
+    if [[ "$ADMIN_SUDO" == "nopass" || "$ADMIN_SUDO" == "pass" ]]; then ADMIN_FOUND="$candidate"; break; fi
+  done
+  if [[ -n "$ADMIN_FOUND" ]]; then
+    ADMIN_NOTE="${ADMIN_FOUND}, with $([[ "$ADMIN_SUDO" == "nopass" ]] && echo "passwordless sudo" || echo "sudo by password") — there is no '${ADMIN_USER}' login for this key"
+    ADMIN_USER="$ADMIN_FOUND"
+    set_host_args
+  else
+    ADMIN_MISSING=true
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Host checks: things about the machine itself that are wrong whatever client
+# runs on it. Read as the validator user, changed by nobody. A value that could
+# not be read is not reported on.
+# ---------------------------------------------------------------------------
+HOST_FINDINGS=()
+HOST_CHECKED=false
+[[ -n "$(fact chk_root_owner)$(fact chk_groups)$(fact chk_ufw)" ]] && HOST_CHECKED=true
+ADMIN_SSH="ssh -o IdentitiesOnly=yes -i ${SSH_KEY} ${ADMIN_USER}@${SSH_HOST}"
+if [[ -n "$(fact chk_root_owner)" && "$(fact chk_root_owner)" != "root" ]]; then
+  HOST_FINDINGS+=("/ is owned by $(fact chk_root_owner), not root: its owner can swap out /etc or /usr and become root|${ADMIN_SSH} 'sudo chown root:root /'")
+fi
+if grep -qw docker <<<"$(fact chk_groups)"; then
+  HOST_FINDINGS+=("${SOL_USER} is in the docker group, which is root in all but name|${ADMIN_SSH} 'sudo gpasswd -d ${SOL_USER} docker'   (jag-snap is then managed through sudo)")
+fi
+if [[ "$(fact chk_sudo)" == "nopass" ]] || grep -qwE 'sudo|admin|wheel' <<<"$(fact chk_groups)"; then
+  HOST_FINDINGS+=("${SOL_USER}, the user the validator runs as, holds sudo|run arise.sh once with --root-user ${SOL_USER}: it moves sudo to a separate admin user")
+fi
+if [[ "$(fact chk_ufw)" == "inactive" ]]; then
+  HOST_FINDINGS+=("the firewall (ufw) is not enabled|arise.sh sets it up; or by hand: ${ADMIN_SSH} 'sudo ufw status'")
+fi
+if [[ -n "$(fact chk_keys | tr -d ' ')" ]]; then
+  HOST_FINDINGS+=("readable by other users: $(fact chk_keys | sed 's/ *$//')|ssh -o IdentitiesOnly=yes -i ${SSH_KEY} ${SOL_HOST} 'chmod 600 $(fact chk_keys | sed 's/ *$//')'")
+fi
+
+report_host() {
+  [[ -n "$ADMIN_NOTE" ]] && echo "  Admin user:      ${ADMIN_NOTE}"
+  if $ADMIN_MISSING; then
+    echo "  Admin user:      none found — '${ADMIN_USER}' does not take this key and no other login with sudo does."
+    echo "                   The commands below need one: pass --admin-user <name>, or run arise.sh"
+    echo "                   with --root-user <a user that has sudo> to create '${ADMIN_USER}'."
+  fi
+  if [[ ${#HOST_FINDINGS[@]} -gt 0 ]]; then
+    echo "  Host checks:"
+    local finding
+    for finding in "${HOST_FINDINGS[@]}"; do
+      echo "    !  ${finding%%|*}"
+      echo "       fix: ${finding#*|}"
+    done
+  elif $HOST_CHECKED; then
+    echo "  Host checks:     nothing found (owner of /, ${SOL_USER}'s privileges, firewall, key file modes)"
+  fi
+  return 0
+}
 
 case "$SOURCE" in
   hexis) SOURCE_LABEL="Hexis Agave" ;;
@@ -206,7 +307,7 @@ route() {
           if [[ -z "$NEW_AGAVE" ]]; then NOTE="could not read the release list — pass --tag"
           elif [[ "$NEW_AGAVE" == "$(fact agave_release)" ]]; then NOTE="already on ${NEW_AGAVE}"
           else CMD="./ascend.sh upgrade ${HOST_ARGS} --hexis-tag '${NEW_AGAVE}' --restart"; fi ;;
-        *) NOTE="these scripts upgrade the Hexis builds only — '${SOURCE_LABEL}' has to move to one first (goal: hexis or firedancer)" ;;
+        *) NOTE="${SOURCE_LABEL} is built on the host, so arise.sh upgrades it: run it again with the flags the host was set up with, plus --client-version <tag> --restart" ;;
       esac ;;
     hexis)
       case "$STATE" in
@@ -302,6 +403,7 @@ else
 fi
 echo "  Firedancer:      $(describe_fd)"
 echo "  Newest releases: Hexis Agave ${NEW_AGAVE:-unknown}   Firedancer ${NEW_FD:-unknown}"
+report_host
 echo ""
 
 if [[ -z "$GOAL" ]] && $NOT_MAINNET; then
@@ -323,6 +425,13 @@ if [[ -z "$GOAL" ]]; then
   [[ -z "$CMD" && "$NOTE" == already* ]] && echo "    upgrade     nothing to do: ${NOTE}"
   echo ""
   echo "  Run one of them:  $0 <goal> ${HOST_ARGS}"
+  echo ""
+  echo "  Jito <-> Agave, leaving Hexis, or a new Jito/Agave version — arise.sh, with"
+  echo "  the flags this host was set up with:"
+  echo "    ${ARISE_HINT}"
+  if [[ "$STATE" == "firedancer" ]]; then
+    echo "  Here that installs the client beside Firedancer; 'agave' above then switches to it."
+  fi
   echo ""
   exit 0
 fi

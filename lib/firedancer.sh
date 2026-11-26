@@ -48,6 +48,17 @@ FD_LOGROTATE_FILE="/etc/logrotate.d/firedancer"
 # redirect to the real file name, the way an Agave RPC port does.
 FD_SNAPSHOT_MIRROR="https://snapshots.avorio.network/mainnet-beta"
 FD_SNAPSHOT_STREAMS="8"
+# The file is fetched in pieces of this size, each retried on its own, so one
+# dropped connection costs a piece and not the whole download.
+FD_SNAPSHOT_CHUNK_MB="1024"
+# The download gives up after this many seconds and Firedancer starts anyway.
+FD_SNAPSHOT_DEADLINE="900"
+# Run by firedancer.service before each start. Root's file, outside the
+# validator user's reach, because the unit runs it as root.
+FD_PREFETCH_SCRIPT="/usr/local/sbin/firedancer-snapshot-prefetch"
+# Asked for the trusted validators' RPC addresses when neither Firedancer's log
+# nor a local Agave knows them: a host that has never run a validator.
+FD_CLUSTER_RPC="https://api.mainnet-beta.solana.com"
 
 # DoubleZero edge multicast group. Publishing to it needs simple RSS queues
 # because the tunnel is GRE.
@@ -382,16 +393,26 @@ EOF
 }
 
 # fd_render_snapshot_prefetch <mirror url> <firedancer snapshot dir> <user>
-#                             <config> <log> <agave snapshot dir or ""> <agave rpc port>
-# Root shell text that downloads the current full snapshot from an HTTP mirror
-# into Firedancer's snapshot directory, in parallel ranges, while the validator
-# is still running. The next start then loads it from disk and fetches only the
-# incremental. The mirror is a third party, so its file is taken only when a
+#                             <config> <log> <agave snapshot dir or ""> <agave rpc port or "none">
+# Shell text for root that downloads the current full snapshot from an HTTP
+# mirror into Firedancer's snapshot directory. The start that follows then loads
+# it from disk and fetches only the incremental. It is used two ways: run by
+# cutover and upgrade while the validator is still up, and installed as the
+# unit's pre-start step (fd_render_prefetch_install), where it is what a crash
+# or a reboot goes through.
+#
+# It downloads only when it has to: Firedancer makes no snapshots of its own, so
+# the one on disk is usable exactly when it is the full snapshot the cluster is
+# on now. The mirror is a third party, so its file is taken only when a
 # validator on the config's snapshot allow list serves a full snapshot with the
 # same slot and hash; that also means those peers have incrementals built on it,
 # which is what makes Firedancer use the local file. The check is on the name:
-# the bytes are not verified here. Any failure leaves things as they were and
-# Firedancer downloads from its peers as before; the step never fails the run.
+# the bytes are not verified here.
+#
+# The file comes in pieces, several at a time, each written straight to its
+# place and retried by itself. Any failure, or running past the deadline, leaves
+# things as they were and Firedancer downloads from its peers as before; the
+# step never fails the run.
 fd_render_snapshot_prefetch() {
   cat <<EOF
 PF_MIRROR="$1"
@@ -401,12 +422,58 @@ PF_CONFIG="$4"
 PF_LOG="$5"
 PF_AGAVE="$6"
 PF_RPC_PORT="${7:-8899}"
-PF_STREAMS="${FD_SNAPSHOT_STREAMS}"
+PF_CLUSTER_RPC="${FD_CLUSTER_RPC}"
+PF_STREAMS="\${PF_STREAMS:-${FD_SNAPSHOT_STREAMS}}"
+PF_CHUNK_MB="\${PF_CHUNK_MB:-${FD_SNAPSHOT_CHUNK_MB}}"
+PF_DEADLINE="\${PF_DEADLINE:-${FD_SNAPSHOT_DEADLINE}}"
 EOF
   cat <<'EOF'
+# pf_resolve <name or ""> — the mirror's download URL, which is signed and
+# short-lived. With a name, only when the mirror still serves that file.
+pf_resolve() {
+  local u n
+  u=$(curl -sS --connect-timeout 5 -m 20 -A curl -o /dev/null -w '%{redirect_url}' "${PF_MIRROR}/snapshot.tar.bz2" 2>/dev/null || true)
+  n=${u%%\?*}; n=${n##*/}
+  [ -n "$u" ] || return 1
+  [ -z "$1" ] || [ "$n" = "$1" ] || return 1
+  printf '%s' "$u"
+}
+
+# pf_worker <n> — fetches pieces n, n+streams, n+2*streams, ... one after the
+# other, each into its place in the file. A piece that comes up short is asked
+# for again, with a fresh URL, three times before the worker gives up.
+pf_worker() {
+  local i="$1" url="" born=0 start len got try now
+  while [ "$i" -lt "$PF_NCHUNKS" ]; do
+    start=$((i * PF_CHUNK)); len=$PF_CHUNK
+    [ $((start + len)) -gt "$PF_SIZE" ] && len=$((PF_SIZE - start))
+    try=0; got=""
+    while [ "$try" -lt 3 ]; do
+      now=$(date +%s)
+      [ "$now" -ge "$PF_DEADLINE_AT" ] && return 1
+      if [ -z "$url" ] || [ $((now - born)) -ge 240 ]; then
+        if ! url=$(pf_resolve "$PF_NAME"); then
+          url=""; try=$((try + 1)); sleep "${PF_RETRY_SECONDS:-2}"; continue
+        fi
+        born=$now
+      fi
+      got=$(curl -fsS -A curl -m $((PF_DEADLINE_AT - now)) --speed-limit 1048576 --speed-time 30 \
+              -r "${start}-$((start + len - 1))" -o - "$url" 2>/dev/null \
+            | LC_ALL=C dd of="$PF_FILE" bs=1048576 seek=$((i * PF_CHUNK_MB)) conv=notrunc 2>&1 | awk '/bytes/ { print $1; exit }')
+      [ "$got" = "$len" ] && break
+      url=""; try=$((try + 1)); sleep "${PF_RETRY_SECONDS:-2}"
+    done
+    [ "$got" = "$len" ] || return 1
+    i=$((i + PF_STREAMS))
+  done
+}
+
 pf_main() {
-  local url name slot have allow peers k a got asked=0 agree=0 size avail part i start end stage pid ok=true
-  url=$(curl -sS -m 20 -A curl -o /dev/null -w '%{redirect_url}' "${PF_MIRROR}/snapshot.tar.bz2" 2>/dev/null || true)
+  local url name slot have allow peers k a rpc got asked=0 agree=0 avail stage w pid pids="" ok=true keep f b s
+  if ! url=$(pf_resolve ""); then
+    echo "snapshot pre-download: ${PF_MIRROR} did not answer — skipped"
+    return 0
+  fi
   name=${url%%\?*}; name=${name##*/}
   if ! printf '%s' "$name" | grep -Eq '^snapshot-[0-9]+-[1-9A-HJ-NP-Za-km-z]{32,44}\.tar\.zst$'; then
     echo "snapshot pre-download: ${PF_MIRROR} named no snapshot — skipped"
@@ -424,27 +491,30 @@ pf_main() {
   fi
 
   # Where the trusted validators serve snapshots: Firedancer logs each one's RPC
-  # address; before its first run, Agave's own RPC knows them.
+  # address. Before its first run, Agave's own RPC knows them; on a host that
+  # has run neither, a public RPC endpoint does.
   allow=$(sed -n '/allow_list = \[/,/\]/p' "$PF_CONFIG" 2>/dev/null | grep -oE '[1-9A-HJ-NP-Za-km-z]{32,44}' || true)
   peers=""
   for k in $allow; do
     a=$(grep -a "allowed gossip peer added with public key \`$k\`" "$PF_LOG" 2>/dev/null | tail -1 | sed -nE 's/.*RPC address `([0-9.]+:[0-9]+)`.*/\1/p')
     [ -n "$a" ] && peers="$peers $a"
   done
-  if [ -z "$peers" ] && [ -n "$allow" ]; then
-    peers=$(curl -s -m 5 -X POST -H 'content-type: application/json' \
-      -d '{"jsonrpc":"2.0","id":1,"method":"getClusterNodes"}' "http://127.0.0.1:${PF_RPC_PORT}" 2>/dev/null \
+  for rpc in "http://127.0.0.1:${PF_RPC_PORT}" "$PF_CLUSTER_RPC"; do
+    [ -z "$peers" ] && [ -n "$allow" ] || break
+    case "$rpc" in ""|*:none) continue ;; esac
+    peers=$(curl -s --connect-timeout 5 -m 20 -X POST -H 'content-type: application/json' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"getClusterNodes"}' "$rpc" 2>/dev/null \
       | PF_ALLOW="$allow" python3 -c '
-import json, os, sys
+import json, os, re, sys
 allow = set(os.environ["PF_ALLOW"].split())
 try:
     nodes = json.load(sys.stdin)["result"]
 except Exception:
     nodes = []
-print(" ".join(n["rpc"] for n in nodes if n.get("pubkey") in allow and n.get("rpc")))' 2>/dev/null || true)
-  fi
+print(" ".join(n["rpc"] for n in nodes if n.get("pubkey") in allow and re.fullmatch(r"[0-9.]+:[0-9]+", n.get("rpc") or "")))' 2>/dev/null || true)
+  done
   for a in $peers; do
-    got=$(curl -sS -m 6 -o /dev/null -r 0-0 -w '%{redirect_url}' "http://${a}/snapshot.tar.bz2" 2>/dev/null || true)
+    got=$(curl -sS --connect-timeout 5 -m 6 -o /dev/null -r 0-0 -w '%{redirect_url}' "http://${a}/snapshot.tar.bz2" 2>/dev/null || true)
     got=${got##*/}
     [ -n "$got" ] && asked=$((asked + 1))
     [ "$got" = "$name" ] && agree=$((agree + 1))
@@ -455,51 +525,94 @@ print(" ".join(n["rpc"] for n in nodes if n.get("pubkey") in allow and n.get("rp
   fi
   echo "snapshot pre-download: ${agree} of ${asked} trusted validators serve ${name}"
 
-  size=$(curl -sS -m 20 -A curl -r 0-0 -o /dev/null -D - "$url" 2>/dev/null | tr -d '\r' | sed -nE 's/^[Cc]ontent-[Rr]ange: bytes 0-0\/([0-9]+)$/\1/p')
-  if [ -z "$size" ]; then
+  PF_NAME="$name"
+  PF_SIZE=$(curl -sS --connect-timeout 5 -m 20 -A curl -r 0-0 -o /dev/null -D - "$url" 2>/dev/null | tr -d '\r' | sed -nE 's/^[Cc]ontent-[Rr]ange: bytes 0-0\/([0-9]+)$/\1/p')
+  if [ -z "$PF_SIZE" ]; then
     echo "snapshot pre-download: the mirror does not serve byte ranges — skipped"
     return 0
   fi
   avail=$(df -Pk "$PF_TO" | awk 'NR==2 {print $4}')
-  # The parts and the joined file exist side by side for a moment
-  if [ "$avail" -lt $((size / 1024 * 22 / 10)) ]; then
-    echo "snapshot pre-download: not enough room beside ${PF_TO} for $((size / 1073741824)) GiB twice over — skipped"
+  if [ "$avail" -lt $((PF_SIZE / 1024 * 11 / 10)) ]; then
+    echo "snapshot pre-download: not enough room in ${PF_TO} for $((PF_SIZE / 1073741824)) GiB — skipped"
     return 0
   fi
 
   stage="${PF_TO}.fetch"
   rm -rf "$stage"; mkdir -p "$stage"
-  part=$(( (size + PF_STREAMS - 1) / PF_STREAMS ))
-  i=0
-  while [ "$i" -lt "$PF_STREAMS" ]; do
-    start=$((i * part)); end=$((start + part - 1))
-    [ "$end" -ge "$size" ] && end=$((size - 1))
-    [ "$start" -le "$end" ] && curl -sS -A curl -r "${start}-${end}" -o "${stage}/part.$(printf %02d "$i")" "$url" &
-    i=$((i + 1))
+  PF_FILE="${stage}/${name}"
+  PF_CHUNK=$((PF_CHUNK_MB * 1048576))
+  PF_NCHUNKS=$(( (PF_SIZE + PF_CHUNK - 1) / PF_CHUNK ))
+  PF_DEADLINE_AT=$(( $(date +%s) + PF_DEADLINE ))
+  : > "$PF_FILE"
+  trap 'kill $pids 2>/dev/null; rm -rf "$stage"; exit 0' TERM INT
+  w=0
+  while [ "$w" -lt "$PF_STREAMS" ] && [ "$w" -lt "$PF_NCHUNKS" ]; do
+    pf_worker "$w" &
+    pids="$pids $!"
+    w=$((w + 1))
   done
-  echo "snapshot pre-download: fetching $((size / 1048576)) MB in ${PF_STREAMS} streams"
+  echo "snapshot pre-download: fetching $((PF_SIZE / 1048576)) MB in ${PF_NCHUNKS} pieces, ${w} at a time"
   while [ -n "$(jobs -rp)" ]; do
     sleep "${PF_PROGRESS_SECONDS:-15}"
-    [ -n "$(jobs -rp)" ] && echo "  $(du -sm "$stage" | cut -f1) of $((size / 1048576)) MB"
+    [ -n "$(jobs -rp)" ] && echo "  $(du -sm "$stage" | cut -f1) of $((PF_SIZE / 1048576)) MB"
   done
-  for pid in $(jobs -p); do wait "$pid" || ok=false; done
+  for pid in $pids; do wait "$pid" || ok=false; done
+  trap - TERM INT
   if $ok; then
-    for a in "$stage"/part.*; do cat "$a" >> "${stage}/${name}" && rm -f "$a"; done
-    [ "$(wc -c < "${stage}/${name}" | tr -d ' ')" = "$size" ] || ok=false
-    [ "$(head -c 4 "${stage}/${name}" | od -An -tx1 | tr -d ' \n')" = "28b52ffd" ] || ok=false
+    [ "$(wc -c < "$PF_FILE" | tr -d ' ')" = "$PF_SIZE" ] || ok=false
+    [ "$(head -c 4 "$PF_FILE" | od -An -tx1 | tr -d ' \n')" = "28b52ffd" ] || ok=false
   fi
   if ! $ok; then
     rm -rf "$stage"
     echo "snapshot pre-download: the download did not complete — discarded, Firedancer downloads from its peers"
     return 0
   fi
-  chmod 600 "${stage}/${name}"
-  chown "${PF_USER}:$(id -gn "${PF_USER}")" "${stage}/${name}"
-  mv "${stage}/${name}" "${PF_TO}/${name}"
+  chmod 600 "$PF_FILE"
+  chown "${PF_USER}:$(id -gn "${PF_USER}")" "$PF_FILE"
+  mv "$PF_FILE" "${PF_TO}/${name}"
   rm -rf "$stage"
   echo "snapshot pre-download: ${name} is in ${PF_TO}"
+
+  # Each full snapshot is over 100 GB and nothing else clears them out. Keep
+  # this one and the one before it; older ones go, with their incrementals.
+  keep=" $(cd "$PF_TO" && ls snapshot-*.tar.zst 2>/dev/null | sort -t- -k2,2n | tail -2 | cut -d- -f2 | tr '\n' ' ')"
+  for f in "$PF_TO"/snapshot-*.tar.zst "$PF_TO"/incremental-snapshot-*.tar.zst; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f"); s=$(printf '%s' "${b#incremental-}" | cut -d- -f2)
+    case "$keep" in
+      *" $s "*) ;;
+      *) rm -f "$f" && echo "snapshot pre-download: removed ${b}, older than the last two full snapshots" ;;
+    esac
+  done
 }
 pf_main || echo "snapshot pre-download: failed — Firedancer downloads from its peers"
+EOF
+}
+
+# fd_render_prefetch_install <on|off> <mirror url> <firedancer snapshot dir>
+#                            <user> <config> <log>
+# Root shell text that installs the pre-download as the script the unit runs
+# before each start, or takes it away. The script is root's: the unit runs it
+# as root, so the validator user must not be able to change it.
+fd_render_prefetch_install() {
+  if [[ "$1" != "on" ]]; then
+    echo "rm -f ${FD_PREFETCH_SCRIPT}"
+    return 0
+  fi
+  cat <<EOF
+cat > ${FD_PREFETCH_SCRIPT}.new <<'FDPREFETCHEOF'
+#!/bin/bash
+# Written by reawaken.sh. firedancer.service runs this before each start: when
+# the full snapshot on disk is no longer the one the cluster is on, it is
+# fetched from a mirror first, which takes minutes where Firedancer's own
+# download from its peers takes about an hour. It never stops a start.
+$(fd_render_snapshot_prefetch "$2" "$3" "$4" "$5" "$6" "" none)
+exit 0
+FDPREFETCHEOF
+chown root:root ${FD_PREFETCH_SCRIPT}.new
+chmod 755 ${FD_PREFETCH_SCRIPT}.new
+mv ${FD_PREFETCH_SCRIPT}.new ${FD_PREFETCH_SCRIPT}
+echo "pre-start snapshot download installed: ${FD_PREFETCH_SCRIPT} (mirror $2)"
 EOF
 }
 
@@ -509,11 +622,20 @@ EOF
 # directory with the wrong gid.
 fd_chown_cmd() { printf 'chown %s:$(id -gn %s)' "$1" "$1"; }
 
-# fd_render_unit <binary> <config> <agave service>
+# fd_render_unit <binary> <config> <agave service> [pre-start snapshot download: on|off]
 # Conflicts= makes systemd stop the Agave unit when this one starts and the
 # other way round, so the two can never run the same identity at once.
 fd_render_unit() {
-  local bin="$1" config="$2" agave_service="$3"
+  local bin="$1" config="$2" agave_service="$3" prefetch=""
+  if [[ "${4:-off}" == "on" ]]; then
+    # After configure: the huge pages are taken before the download fills the
+    # page cache. "-" lets the start go ahead whatever the script does, and the
+    # start timeout has to outlast the download's own deadline.
+    prefetch="# Fetch the full snapshot from the mirror when the one on disk is too old.
+ExecStartPre=-${FD_PREFETCH_SCRIPT}
+TimeoutStartSec=$((FD_SNAPSHOT_DEADLINE * 2))
+"
+  fi
   cat <<EOF
 [Unit]
 Description=Firedancer with the Hexis Concorde
@@ -528,7 +650,7 @@ Type=simple
 User=root
 # Huge page mounts do not survive a reboot, so configure runs before each start.
 ExecStartPre=${bin} configure init all --config ${config}
-ExecStart=${bin} run --config ${config}
+${prefetch}ExecStart=${bin} run --config ${config}
 LimitNOFILE=${FD_NOFILE}
 LimitMEMLOCK=infinity
 TimeoutStopSec=120
