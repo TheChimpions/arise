@@ -2661,6 +2661,31 @@ if grep -q 'YOUR_IDENTITY_PUBKEY' "$CFG"; then
       "$NEW"
   fi
 
+  # This machine's own [[hosts]] entry: perch reads its disks from
+  # node_exporter, and after a cutover to Firedancer reawaken.sh adds
+  # firedancer_url to the same entry. node_exporter answers on loopback only.
+  # Its absence costs the disk checks, not the install.
+  HOSTS_NOTE="no [[hosts]] entry (node_exporter could not be installed) — disk checks and Firedancer's metrics are off until you add one"
+  if ! grep -q '^\[\[hosts\]\]' "$NEW"; then
+    if ! command -v prometheus-node-exporter >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends prometheus-node-exporter >/dev/null 2>&1 || true
+    fi
+    if command -v prometheus-node-exporter >/dev/null 2>&1; then
+      NE_DEFAULTS=/etc/default/prometheus-node-exporter
+      if ! grep -q '^ARGS=.*--web.listen-address=127\.0\.0\.1:9100' "$NE_DEFAULTS" 2>/dev/null; then
+        [ -f "$NE_DEFAULTS" ] && sed -i '/^ARGS=/d' "$NE_DEFAULTS"
+        echo 'ARGS="--web.listen-address=127.0.0.1:9100"' >> "$NE_DEFAULTS"
+        systemctl restart prometheus-node-exporter || true
+      fi
+      systemctl enable prometheus-node-exporter >/dev/null 2>&1 || true
+      printf '\n# This machine: its disks, from node_exporter on loopback.\n[[hosts]]\nname = "%s-hw"\nurl = "http://127.0.0.1:9100/metrics"\nvalidator = "%s"\n' \
+        "$PERCH_LABEL" "$PERCH_LABEL" >> "$NEW"
+      HOSTS_NOTE="disks read from node_exporter on 127.0.0.1:9100"
+    fi
+  else
+    HOSTS_NOTE="[[hosts]] entry in the starter config kept"
+  fi
+
   # The edits depend on the shape of the installer's starter config.
   # Check the result rather than trust it.
   for want in "identity = \"$IDENTITY_PUBKEY\"" "vote_account = \"$VOTE_ACCOUNT\"" "label = \"$PERCH_LABEL\"" "cluster = \"$WANT_CLUSTER\""; do
@@ -2680,6 +2705,7 @@ if grep -q 'YOUR_IDENTITY_PUBKEY' "$CFG"; then
   # cat keeps the installed file's owner and mode (root:perch 0640)
   cat "$NEW" > "$CFG"
   echo "perch configured for $PERCH_LABEL ($WANT_CLUSTER): identity $IDENTITY_PUBKEY, vote account $VOTE_ACCOUNT"
+  echo "perch hosts: $HOSTS_NOTE"
 else
   echo "Existing $CFG kept unchanged"
 fi

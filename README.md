@@ -363,7 +363,7 @@ sudo systemctl enable --now perch
 perch maint restart                                             # before a planned restart, so it does not page
 ```
 
-`sol` is deliberately not in the `perch` group: the validator account cannot silence the watchtower. The config uses perch's standalone layout with free public RPC endpoints. Disk and kernel-advisory checks need `node_exporter` and a `[[hosts]]` block, which this script does not set up.
+`sol` is deliberately not in the `perch` group: the validator account cannot silence the watchtower. The config uses perch's standalone layout with free public RPC endpoints. The script also installs `node_exporter` (answering on `127.0.0.1:9100` only) and gives perch a `[[hosts]]` entry for this machine, which turns on its disk and kernel-advisory checks. On a Firedancer host, `reawaken.sh cutover` adds Firedancer's own metrics to that same entry (perch 1.6.0 or newer). An existing perch config is never changed.
 
 ### Verifying XDP (unless `--no-xdp` was used)
 
@@ -518,7 +518,9 @@ firewall change is needed: perch is on the same machine. An older perch refuses 
 with that key, so it is left alone and you are told to upgrade it; run `cutover` again
 afterwards (on a host already on Firedancer it only does the leftover steps, this one
 included). The new config is checked with perch itself before it replaces the old one,
-and `rollback` takes the line out again.
+and `rollback` takes the line out again. A fresh `arise.sh --client firedancer` install
+gets this too: `arise.sh` writes the `[[hosts]]` entry and the cutover that first starts
+Firedancer fills it in.
 
 Neither enables the arb, and neither restarts the validator unless you pass `--restart`
 — which runs `exit` (wait for the restart window, then stop; systemd brings it back), and
@@ -816,7 +818,7 @@ sudo ~/firedancer/firedancer wait --config ~/firedancer/config.toml --min-idle-s
 - Vote account creation (do this yourself with `solana create-vote-account`)
 - Stake delegation
 - Identity hot-swap (documented under [Swapping to staked identity](#swapping-to-staked-identity), not automated)
-- Prometheus / Grafana, and perch's alert secrets and disk checks (perch itself is installed by `arise.sh`)
+- Prometheus / Grafana, and perch's alert secrets (perch itself and the node_exporter it reads are installed by `arise.sh`)
 - Snapshot serving — jag-snap is no longer set up; `reawaken.sh` still retires it on hosts that have it
 - DoubleZero: `reawaken.sh` carries the shred receiver over and sets the queue mode a GRE tunnel needs, but installing and connecting DoubleZero is yours
 - Backup of tower files and identity keys

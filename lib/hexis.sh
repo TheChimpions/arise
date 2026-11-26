@@ -549,8 +549,10 @@ if [ -f "$perch_cfg" ] && [ -n "$perch_bin" ]; then
       cur && cur == pick && $0 ~ /^[[:space:]]*firedancer_url[[:space:]]*=/ { next }
       { print }
       cur && cur == pick && !done && $0 ~ /^[[:space:]]*url[[:space:]]*=/ { print "firedancer_url = \"" fd "\""; done = 1 }
-      END { exit done ? 0 : 3 }' "$perch_cfg" "$perch_cfg" > "$perch_cfg.new" && perch_fd_set=yes || perch_fd_set=no
-    if [ "$perch_fd_set" = no ]; then
+      END { exit done ? 0 : (n ? 3 : 4) }' "$perch_cfg" "$perch_cfg" > "$perch_cfg.new" && perch_fd_set=yes || perch_fd_set=$?
+    if [ "$perch_fd_set" = 4 ]; then
+      echo "perch: $perch_cfg has no [[hosts]] entry for this machine, which is where Firedancer's metrics go. Add one (name, node_exporter url) with: firedancer_url = \"${perch_fd_url}\""
+    elif [ "$perch_fd_set" != yes ]; then
       echo "perch: no [[hosts]] entry in $perch_cfg is clearly this machine — add this line to the right one yourself: firedancer_url = \"${perch_fd_url}\""
     elif perch_run --config "$perch_cfg" --check-config >/dev/null 2>&1 && ! perch_run --config "$perch_cfg.new" --check-config >/dev/null 2>&1; then
       echo "perch: it turned down the config with firedancer_url in it — left as it was"

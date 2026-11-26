@@ -355,6 +355,60 @@ group "clients and security model"
   it "perch is installed by default"
   assert_contains "$out" "Installing perch watchtower"
 
+  # The part of the perch step that gives it this machine's [[hosts]] entry,
+  # lifted from the script a dry run prints and run against scratch files.
+  ne_dir="$(mktemp -d)"; mkdir "$ne_dir/bin"
+  ne_block="$(printf '%s\n' "$out" | sed -n '/^  HOSTS_NOTE="no \[\[hosts\]\]/,/^    HOSTS_NOTE="\[\[hosts\]\] entry in the starter/p' \
+    | sed "s|/etc/default/prometheus-node-exporter|$ne_dir/defaults|")"
+  printf '#!/bin/sh\nif [ "$1" = "-i" ]; then shift; exec /usr/bin/sed -i "" "$@"; fi\nexec /usr/bin/sed "$@"\n' > "$ne_dir/bin/sed"
+  printf '#!/bin/sh\necho "$@" >> "%s/systemctl.calls"\n' "$ne_dir" > "$ne_dir/bin/systemctl"
+  printf '#!/bin/sh\necho "$@" >> "%s/apt.calls"\n[ -n "$APT_FAILS" ] && exit 100\nprintf "#!/bin/sh\\n" > "%s/bin/prometheus-node-exporter"; chmod +x "%s/bin/prometheus-node-exporter"\n' \
+    "$ne_dir" "$ne_dir" "$ne_dir" > "$ne_dir/bin/apt-get"
+  chmod +x "$ne_dir/bin/sed" "$ne_dir/bin/systemctl" "$ne_dir/bin/apt-get"
+  ne_starter() { printf '%s\n' '[[validators]]' 'label = "val-1"' '' '[digest]' 'enabled = false' > "$ne_dir/new.toml"; }
+  # shellcheck disable=SC2034  # NEW and PERCH_LABEL are read by the lifted script
+  ne_run() { ( PATH="$ne_dir/bin:$PATH"; NEW="$ne_dir/new.toml"; PERCH_LABEL="val-1"; eval "$ne_block
+  fi"; echo "$HOSTS_NOTE" ); }
+
+  it "the dry run shows the step that gives perch this machine's [[hosts]] entry"
+  assert_contains "$ne_block" "prometheus-node-exporter"
+
+  ne_starter; printf '%s\n' '# defaults' 'ARGS=""' > "$ne_dir/defaults"
+  ne_out="$(ne_run)"
+  it "a fresh install gets node_exporter, answering on loopback only"
+  assert_contains "$(cat "$ne_dir/apt.calls")" "install -y --no-install-recommends prometheus-node-exporter"
+  assert_eq "$(grep '^ARGS=' "$ne_dir/defaults")" 'ARGS="--web.listen-address=127.0.0.1:9100"'
+  assert_contains "$(cat "$ne_dir/systemctl.calls")" "restart prometheus-node-exporter"
+
+  it "and perch gets a [[hosts]] entry for this machine, tied to its validator"
+  assert_eq "$(sed -n '/^\[\[hosts\]\]/,$p' "$ne_dir/new.toml")" "$(printf '%s\n' '[[hosts]]' 'name = "val-1-hw"' 'url = "http://127.0.0.1:9100/metrics"' 'validator = "val-1"')"
+  assert_contains "$ne_out" "disks read from node_exporter on 127.0.0.1:9100"
+
+  it "that entry is the one a later cutover adds Firedancer's metrics to"
+  printf '%s\n' '[tiles.metric]' '    prometheus_listen_address = "10.1.2.3"' > "$ne_dir/fd.toml"
+  printf '#!/bin/sh\ncase "$*" in *--version*) echo "perch 1.6.0 (abc)" ;; esac\n' > "$ne_dir/bin/perch"; chmod +x "$ne_dir/bin/perch"
+  ( PATH="$ne_dir/bin:$PATH"; eval "$(perch_firedancer_on_cmd nobody-here "$ne_dir/fd.toml" | sed "1s|.*|perch_cfg=\"$ne_dir/new.toml\"|")" ) >/dev/null
+  assert_eq "$(grep -A1 '^url = "http://127.0.0.1:9100/metrics"' "$ne_dir/new.toml" | tail -1)" 'firedancer_url = "http://10.1.2.3:7999/metrics"'
+
+  ne_starter; rm -f "$ne_dir/apt.calls" "$ne_dir/systemctl.calls"
+  ne_run >/dev/null
+  it "node_exporter already there and already on loopback is not reinstalled or restarted"
+  assert_file_missing "$ne_dir/apt.calls"
+  assert_not_contains "$(cat "$ne_dir/systemctl.calls")" "restart"
+
+  ne_starter; rm -f "$ne_dir/bin/prometheus-node-exporter"
+  ne_out="$(APT_FAILS=1 ne_run)"
+  it "node_exporter that cannot be installed costs the entry, not the install"
+  assert_contains "$ne_out" "node_exporter could not be installed"
+  assert_not_contains "$(cat "$ne_dir/new.toml")" "[[hosts]]"
+
+  printf '%s\n' '[[hosts]]' 'name = "theirs"' 'url = "http://10.0.0.5:9100/metrics"' > "$ne_dir/new.toml"; rm -f "$ne_dir/apt.calls"
+  ne_out="$(ne_run)"
+  it "a starter config that already has a [[hosts]] entry is not given a second"
+  assert_eq "$(grep -c '^\[\[hosts\]\]' "$ne_dir/new.toml")" "1"
+  assert_file_missing "$ne_dir/apt.calls"
+  rm -rf "$ne_dir"
+
   it "--no-perch skips it"
   assert_contains "$(arise "${cl_base[@]}" --no-xdp --no-perch)" "Skipping perch watchtower"
 
@@ -923,8 +977,12 @@ FAKE
   assert_not_contains "$(cat "$pc_dir/config.toml")" "firedancer_url"
 
   printf '%s\n' '[[endpoints]]' 'url = "https://rpc.example"' > "$pc_dir/config.toml"
-  it "a perch that watches no host is left alone"
-  assert_contains "$(PERCH_VER=1.6.0 pf_on)" "no [[hosts]] entry"
+  out="$(PERCH_VER=1.6.0 pf_on)"
+  it "a perch that watches no host is left alone, and told what is missing"
+  assert_contains "$out" "has no [[hosts]] entry for this machine"
+  assert_contains "$out" "$fd_url"
+  assert_not_contains "$(cat "$pc_dir/config.toml")" "firedancer_url"
+  assert_file_missing "$pc_dir/config.toml.new"
 
   pf_write
   printf '%s\n' '[tiles.metric]' '    prometheus_listen_address = "0.0.0.0"' > "$pc_dir/fd-any.toml"
