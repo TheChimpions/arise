@@ -417,7 +417,8 @@ done
 # Validation
 #
 # Every value below ends up inside a script that runs as root on the server,
-# so each one is checked against a strict pattern before it is used.
+# so each one is checked against a strict pattern before it is used. The Hexis
+# addresses, key and metrics string are checked by hexis_validate_settings.
 # ---------------------------------------------------------------------------
 [[ -z "$SSH_HOST" ]]      && { log_error "--host is required";         usage; }
 [[ -z "$SSH_KEY" ]]       && { log_error "--ssh-key is required";      usage; }
@@ -473,7 +474,7 @@ if [[ "$CLIENT" == "firedancer" ]]; then
   [[ -x "$REAWAKEN" ]] || die "Missing $REAWAKEN — run this from a checkout"
   [[ -n "$FD_TAG" && -n "$FD_BINARY" ]] && die "Pass either --fd-tag or --fd-binary, not both"
   if [[ -n "$FD_TAG" ]]; then
-    [[ "$FD_TAG" =~ $RE_REF ]] || die "--fd-tag is not a valid tag: $FD_TAG"
+    [[ "$FD_TAG" =~ $RE_RELEASE_TAG ]] || die "--fd-tag is not a valid tag: $FD_TAG"
   fi
   [[ -n "$FD_BINARY" && ! -f "$FD_BINARY" ]] && die "File not found: $FD_BINARY"
   [[ -n "$FD_CONCORDE_TABLES" && ! -f "$FD_CONCORDE_TABLES" ]] && die "File not found: $FD_CONCORDE_TABLES"
@@ -552,7 +553,7 @@ if $ENABLE_HEXIS; then
     die "Pass either --hexis-tag or --hexis-binary, not both"
   fi
   if [[ -n "$HEXIS_TAG" ]]; then
-    [[ "$HEXIS_TAG" =~ $RE_REF ]] || die "--hexis-tag is not a valid tag: $HEXIS_TAG"
+    [[ "$HEXIS_TAG" =~ $RE_RELEASE_TAG ]] || die "--hexis-tag is not a valid tag: $HEXIS_TAG"
     if ! command -v gh &>/dev/null; then
       die "--hexis-tag needs the gh CLI locally. Install it, or download the release yourself and pass --hexis-binary"
     fi
@@ -566,8 +567,13 @@ if $ENABLE_HEXIS; then
     [[ -n "$f" && ! -f "$f" ]] && die "File not found: $f"
   done
   [[ "$HEXIS_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "--hexis-dir must be an absolute path without spaces: $HEXIS_DIR"
-  [[ "$HEXIS_CONTROL_BIND" =~ ^[0-9A-Za-z.:-]+:[0-9]{1,5}$ ]] || die "--hexis-control-bind must look like 0.0.0.0:18082: $HEXIS_CONTROL_BIND"
-  [[ "$HEXIS_CONTROL_ALLOW" =~ ^[0-9A-Fa-f.:]+(/[0-9]{1,3})?$ ]] || die "--hexis-control-allow must be an IP or CIDR: $HEXIS_CONTROL_ALLOW"
+  [[ -z "$HEXIS_SETUP_TAG" || "$HEXIS_SETUP_TAG" =~ $RE_RELEASE_TAG ]] || die "--hexis-setup-tag is not a valid tag: $HEXIS_SETUP_TAG"
+  # The addresses, the key and the metrics string that go into arb-config.toml,
+  # arb-enable.sh and validator.sh
+  hexis_validate_settings || exit 1
+  if $DRY_RUN && [[ -n "${HEXIS_JUP_KEY}${HEXIS_METRICS_CONFIG}" ]]; then
+    log_warn "A dry run prints the files it would write, the two Hexis credentials included. Do not paste its output anywhere public."
+  fi
   if [[ "$HEXIS_CONTROL_BIND" == 127.0.0.1:* || "$HEXIS_CONTROL_BIND" == localhost:* ]]; then
     die "--hexis-control-bind must not be loopback — Hexis dials the host directly"
   fi
@@ -637,6 +643,7 @@ if ! $METRICS_CONFIG_SET && [[ -z "$METRICS_CONFIG" ]]; then
     METRICS_CONFIG="$SFDP_METRICS_TESTNET"
   fi
 fi
+hexis_check_metrics "--metrics-config" "$METRICS_CONFIG" || exit 1
 if [[ -z "$METRICS_CONFIG" ]]; then
   log_warn "No SOLANA_METRICS_CONFIG — this validator will not publish cluster metrics, which the SFDP requires"
 fi
@@ -1521,9 +1528,20 @@ fi
 # --- Directories and ownership (all layouts) ---
 # ext4 root inodes default to root:root, so ownership is always re-applied.
 { emit_vars SOL_USER SOL_HOME LEDGER_PATH ACCOUNTS_PATH SNAPSHOTS_PATH; cat <<'SCRIPT'
+# Root only takes ownership of a directory whose parent the validator user does
+# not control (a mount point under /mnt). Anything inside a directory that user
+# owns is made by that user: there a path can be a symlink they put in place,
+# and a root chown through it would hand them whatever it points at.
 for dir in "$LEDGER_PATH" "$ACCOUNTS_PATH" "$SNAPSHOTS_PATH" "$SOL_HOME/logs"; do
-  mkdir -p "$dir"
-  chown "$SOL_USER:$SOL_USER" "$dir"
+  if [ "$(stat -c %U "$(dirname "$dir")" 2>/dev/null)" = "$SOL_USER" ]; then
+    runuser -u "$SOL_USER" -- mkdir -p "$dir"
+    if [ "$(stat -L -c %U "$dir")" != "$SOL_USER" ]; then
+      echo "ARISE-WARN: $dir is owned by $(stat -L -c %U "$dir"), not $SOL_USER, and was left that way. If the validator cannot write to it, check what it is before changing its owner."
+    fi
+  else
+    mkdir -p "$dir"
+    chown "$SOL_USER:$SOL_USER" "$dir"
+  fi
 done
 echo "Directories ready: ledger=$LEDGER_PATH accounts=$ACCOUNTS_PATH snapshots=$SNAPSHOTS_PATH"
 SCRIPT
@@ -2390,6 +2408,28 @@ log_info "Step 9: Creating systemd service"
 # Fix mount ownership service — runs before sol.service on every boot.
 # If a data directory is missing (e.g. a disk failed to mount) this fails and
 # the validator does not start, rather than filling the root disk.
+#
+# It runs as root, so it only changes the owner of a directory whose parent the
+# validator user does not control: a mount point. A path inside a directory
+# that user owns could be a symlink they put there, and chown would follow it.
+# Those are only checked for being there.
+cat > /usr/local/sbin/sol-fix-mounts <<FIXEOF
+#!/bin/sh
+# Written by arise.sh. Run as root by sol-fix-mounts.service before sol.service.
+set -u
+for dir in ${LEDGER_PATH} ${SNAPSHOTS_PATH} ${ACCOUNTS_PATH} ${SOL_HOME}/logs; do
+  if [ ! -d "\$dir" ]; then
+    echo "\$dir is missing (did a disk fail to mount?) - not starting the validator" >&2
+    exit 1
+  fi
+  if [ "\$(stat -c %U "\$(dirname "\$dir")")" != "${SOL_USER}" ]; then
+    chown ${SOL_USER}:${SOL_USER} "\$dir" || exit 1
+  fi
+done
+FIXEOF
+chown root:root /usr/local/sbin/sol-fix-mounts
+chmod 755 /usr/local/sbin/sol-fix-mounts
+
 cat > /etc/systemd/system/sol-fix-mounts.service <<EOF
 [Unit]
 Description=Fix Solana mount ownership
@@ -2398,7 +2438,7 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/chown ${SOL_USER}:${SOL_USER} ${LEDGER_PATH} ${SNAPSHOTS_PATH} ${ACCOUNTS_PATH} ${SOL_HOME}/logs
+ExecStart=/usr/local/sbin/sol-fix-mounts
 RemainAfterExit=yes
 
 [Install]

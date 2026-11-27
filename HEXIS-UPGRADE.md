@@ -40,8 +40,8 @@ sudo you are not asked for a password.
 **Credentials.** `migrate` writes the Jupiter API key and the arb metrics string to the
 host. Neither is in this repository. Run at a terminal, `migrate` asks for whichever is
 missing and offers to save it to `hexis.env` (git-ignored, mode 600); otherwise give them
-with `--hexis-jup-key` / `--hexis-metrics-config`, the environment, or that file. See the
-README. `upgrade` and `promote` need neither.
+with `--hexis-jup-key` / `--hexis-metrics-config`, the environment, or that file. See
+[docs/hexis.md](docs/hexis.md). `upgrade` and `promote` need neither.
 
 Nothing is restarted unless you pass `--restart`, which waits for a restart window and
 then runs `exit` (`Restart=always` brings the validator back):
@@ -115,7 +115,8 @@ gh release download "$TAG" --repo hexishq/hexis-validator-docs \
 cd ~/hexis-"$TAG" && shasum -a 256 -c ./*checksums.txt
 ```
 
-`shasum` must print `agave-validator-linux-amd64: OK`. Stop here if it doesn't.
+`shasum` must print `agave-validator-linux-amd64: OK`. Stop here if it doesn't, or if the
+release has no checksum file at all: `ascend.sh` refuses both.
 
 ---
 
@@ -268,12 +269,13 @@ ssh "$HOST" 'chmod +x /home/sol/hexis/hexis-setup'
 ## Re-running `arise.sh` instead
 
 `arise.sh --hexis --hexis-tag <new-tag>` will download, verify and install the new
-binary, and it is idempotent — the existing signer and profit-wallet keypairs are kept.
+binary, and it is idempotent — the existing arb signer keypair is kept.
 It is not a lighter option than the steps above, though:
 
-- It **regenerates `arb-config.toml` from the flags**, so any manual edit is lost, and
-  omitting `--hexis-marginfi-account` silently drops `[flash_loan]` and turns flash
-  loans off. Pass every flag you passed the first time.
+- It **regenerates `arb-config.toml` from the flags**, so any manual edit is lost, and a
+  flag you leave out goes back to its default: without `--hexis-marginfi-account` the
+  `[flash_loan]` table names the account from the Hexis config again, not yours. Pass
+  every flag you passed the first time.
 - It re-runs the rest of the setup — firewall, sshd hardening, sysctl, swap, perch.
   Idempotent, but a lot of surface for a version bump.
 - It regenerates `validator.sh`, which is what you want if the new release needs a new
@@ -290,4 +292,4 @@ switch a host between clients (Jito, Agave, Hexis). Overkill for a plain binary 
 
 None of this file applies to a host running Firedancer with the Hexis Concorde: there the
 release is upgraded with `./reawaken.sh upgrade --fd-tag <tag>`, and the arb is part of
-the build. See "Moving to Firedancer" in the README.
+the build. See [docs/firedancer.md](docs/firedancer.md).

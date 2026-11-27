@@ -221,9 +221,23 @@ done
 [[ ! -f "$SSH_KEY" ]] && { log_error "SSH key not found: $SSH_KEY"; exit 1; }
 
 SSH_HOST="${SSH_HOST##*@}"
+# Every value below is put into a command that runs on the host, so each is
+# checked against a strict pattern before anything connects.
+RE_NAME='^[a-z_][a-z0-9_-]{0,31}$'
+RE_PATH='^/[A-Za-z0-9._/+-]+$'
+bad_value() { log_error "$1"; exit 1; }
+[[ "$SSH_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*$ ]] || bad_value "--host is not a hostname or IP: $SSH_HOST"
+[[ "$SOL_USER" =~ $RE_NAME ]]   || bad_value "--user is not a valid user name: $SOL_USER"
+[[ "$ADMIN_USER" =~ $RE_NAME ]] || bad_value "--admin-user is not a valid user name: $ADMIN_USER"
 SOL_HOST="${SOL_USER}@${SSH_HOST}"
 HEXIS_DIR="${HEXIS_DIR:-/home/${SOL_USER}/hexis}"
 VALIDATOR_SH="${VALIDATOR_SH:-/home/${SOL_USER}/validator.sh}"
+[[ "$HEXIS_DIR" =~ $RE_PATH ]]    || bad_value "--hexis-dir must be an absolute path without spaces: $HEXIS_DIR"
+[[ "$VALIDATOR_SH" =~ $RE_PATH ]] || bad_value "--validator-script must be an absolute path without spaces: $VALIDATOR_SH"
+[[ -z "$LEDGER_PATH" || "$LEDGER_PATH" =~ $RE_PATH ]] || bad_value "--ledger must be an absolute path without spaces: $LEDGER_PATH"
+[[ -z "$HEXIS_TAG" || "$HEXIS_TAG" =~ $RE_RELEASE_TAG ]] || bad_value "--hexis-tag is not a valid tag: $HEXIS_TAG"
+[[ -z "$HEXIS_SETUP_TAG" || "$HEXIS_SETUP_TAG" =~ $RE_RELEASE_TAG ]] || bad_value "--hexis-setup-tag is not a valid tag: $HEXIS_SETUP_TAG"
+[[ -z "$PROMOTE_RELEASE" || "$PROMOTE_RELEASE" =~ $RE_RELEASE_TAG ]] || bad_value "--release is not a valid release name: $PROMOTE_RELEASE"
 
 if [[ "$MODE" != "promote" && -z "$HEXIS_TAG" && -z "$HEXIS_BINARY" ]]; then
   log_error "One of --hexis-tag or --hexis-binary is required"
@@ -253,6 +267,12 @@ if [[ "$MODE" == "migrate" ]]; then
   else
     hexis_require_credentials yes || exit 1
   fi
+  # The addresses, the key and the metrics string that go into arb-config.toml,
+  # arb-enable.sh and validator.sh
+  hexis_validate_settings || exit 1
+  if $DRY_RUN && [[ -n "${HEXIS_JUP_KEY}${HEXIS_METRICS_CONFIG}" ]]; then
+    log_warn "A dry run prints the files it would write, the two Hexis credentials included. Do not paste its output anywhere public."
+  fi
 fi
 
 # SFDP requires cluster metrics. Only defaulted when --metrics-config was not
@@ -260,6 +280,7 @@ fi
 if ! $METRICS_CONFIG_SET && [[ -z "$METRICS_CONFIG" ]]; then
   METRICS_CONFIG="$SFDP_METRICS_MAINNET"
 fi
+hexis_check_metrics "--metrics-config" "$METRICS_CONFIG" || exit 1
 
 # Connection settings, and the helpers that use them (root_script, sol_script,
 # remote, sol_write_file), come from lib/remote.sh. Root work goes through the
@@ -401,6 +422,7 @@ refresh_arb_enable() {
   local arb_enable
   arb_enable="$(hexis_render_arb_enable "$HEXIS_DIR" "$LEDGER_PATH")"
   sol_script <<SCRIPT
+set -e
 cat > $f <<'ARBENEOF'
 ${arb_enable}
 ARBENEOF
@@ -437,6 +459,8 @@ if [[ -n "$ORIG_EXEC" && "$ORIG_EXEC" != /* ]]; then
   # A bare name resolves against the PATH that validator.sh itself sets
   ORIG_EXEC=$(probe "p=\$(grep -m1 '^PATH=' ${VALIDATOR_SH} | sed 's/^PATH=//'); PATH=\"\${p:-\$PATH}\" command -v ${ORIG_EXEC} || true")
 fi
+# Read from a file on the host and used in commands below: a plain path or nothing
+[[ "$ORIG_EXEC" =~ ^/[A-Za-z0-9._/+-]+$ ]] || ORIG_EXEC=""
 [[ -n "$ORIG_EXEC" ]] && log_info "Currently executing: ${ORIG_EXEC}"
 PATCH_APPLIED=false
 
@@ -463,6 +487,10 @@ if [[ -z "$LEDGER_PATH" ]]; then
   LEDGER_PATH=$(probe "grep -oE -- '--ledger[[:space:]]+[^[:space:]\\\\]+' ${VALIDATOR_SH} | head -1 | awk '{print \$2}'")
   if [[ -z "$LEDGER_PATH" ]]; then
     log_error "Could not find --ledger in ${VALIDATOR_SH} — pass --ledger"
+    exit 1
+  fi
+  if [[ ! "$LEDGER_PATH" =~ $RE_PATH ]]; then
+    log_error "The --ledger value in ${VALIDATOR_SH} is not a plain path (${LEDGER_PATH}) — pass --ledger"
     exit 1
   fi
   log_info "Ledger (from ${VALIDATOR_SH}): ${LEDGER_PATH}"
@@ -691,6 +719,7 @@ elif [[ "$MODE" == "migrate" ]]; then
 
     if [[ -z "$HEXIS_SIGNER" ]]; then
       sol_script <<SCRIPT
+set -e
 if [ -f ${SIGNER_PATH} ]; then
   echo "arb signer already exists — keeping ${SIGNER_PATH}"
 else
@@ -714,6 +743,7 @@ SCRIPT
 "
 
   sol_script <<SCRIPT
+set -e
 if [ -f ${HEXIS_DIR}/arb-config.toml ]; then
   cp -a ${HEXIS_DIR}/arb-config.toml ${HEXIS_DIR}/arb-config.toml.bak
   echo "backed up existing arb-config.toml"
@@ -734,9 +764,9 @@ has_path=$(grep -c '^PATH=' "$VALIDATOR_SH" || true)
 # Matches SOLANA_METRICS_CONFIG= but not SOLANA_METRICS_CONFIG_ARB=
 has_metrics=$(grep -cE '^[[:space:]]*(export[[:space:]]+)?SOLANA_METRICS_CONFIG=' "$VALIDATOR_SH" || true)
 
-awk -v hexis_dir="$HEXIS_DIR" \
-    -v metrics="$METRICS" \
-    -v sfdp="$SFDP_METRICS" \
+# The two metrics strings go to awk through its environment, not its arguments:
+# one of them carries a password, and arguments show in the process list.
+METRICS="$METRICS" SFDP_METRICS="$SFDP_METRICS" awk -v hexis_dir="$HEXIS_DIR" \
     -v sigverify="$SIGVERIFY" \
     -v has_path="$has_path" \
     -v has_metrics="$has_metrics" '
@@ -745,7 +775,7 @@ function emit_env() {
   if (metrics != "") print "export SOLANA_METRICS_CONFIG_ARB=\"" metrics "\""
   env_done = 1
 }
-BEGIN { env_done = 0; exec_done = 0 }
+BEGIN { env_done = 0; exec_done = 0; metrics = ENVIRON["METRICS"]; sfdp = ENVIRON["SFDP_METRICS"] }
 {
   if (NR == 1 && $0 ~ /^#!/) { print; if (has_path == 0) { print "export PATH=\"" hexis_dir ":$PATH\""; emit_env() } next }
 
@@ -846,8 +876,15 @@ SCRIPT
       log_info "Opening the Control port needs sudo"
       ask_sudo_pass || exit 1
       root_script <<SCRIPT
+set -e
 ufw allow from ${HEXIS_CONTROL_ALLOW} to any port ${CONTROL_PORT} proto tcp
 echo "Allowed ${CONTROL_PORT}/tcp from ${HEXIS_CONTROL_ALLOW} (Hexis Control)"
+# A rule in a firewall that is switched off restricts nothing
+if ! ufw status | grep -q '^Status: active'; then
+  echo "WARNING: ufw is not enabled on this host, so the rule above has no effect and"
+  echo "WARNING: ${CONTROL_PORT}/tcp answers to anyone once the validator restarts. Enable the"
+  echo "WARNING: firewall (arise.sh sets it up) or pass --no-hexis-control."
+fi
 SCRIPT
     fi
   fi
