@@ -1,9 +1,14 @@
-# Firedancer with the Hexis Concorde
+# Firedancer
 
-`reawaken.sh` moves a validator onto Firedancer with the Hexis Concorde, upgrades it there,
-and takes it back to Agave. The build is released privately by Hexis, so this page needs a
-GitHub account Hexis has given access to and the arb signer Hexis issues. It runs on mainnet
-only.
+`reawaken.sh` moves a validator onto Firedancer, upgrades it there, and takes it back to
+Agave. It handles two builds:
+
+- **Firedancer with the Hexis Concorde**, which has the Hexis arb built in. It is released
+  privately by Hexis, so it needs a GitHub account Hexis has given access to and the arb
+  signer Hexis issues. Mainnet only. Most of this page describes it.
+- **Vanilla Firedancer**, from [firedancer-io/firedancer](https://github.com/firedancer-io/firedancer).
+  It needs nothing from Hexis, and runs on any cluster. The project publishes source only, so
+  you build the binary yourself: see [Vanilla Firedancer](#vanilla-firedancer).
 
 **The validator user is as good as root on a Firedancer host.** Firedancer starts as root,
 and `firedancer.service` runs the binary and the config in `/home/sol/firedancer`, which
@@ -11,7 +16,70 @@ the validator user owns. Anyone who can log in as `sol` can replace either and h
 the next start. Guard that SSH key the way you guard the admin's. See the
 [security model](../README.md#security-model).
 
-## A new server
+## Vanilla Firedancer
+
+The Firedancer project has no prebuilt releases. Build it on the server it will run on, or on a machine
+with the same CPU, since the build targets the CPU it runs on. It needs about 32 GiB of
+free memory, so do not build beside a running validator that cannot spare it.
+
+```bash
+git clone https://github.com/firedancer-io/firedancer.git && cd firedancer
+git checkout v26.11.1          # the release tag you want
+./deps.sh                      # installs what the build needs
+make -j                        # MACHINE=linux_gcc_x86_64 make -j for a build any x86-64 runs
+ls build/native/gcc/*/bin/firedancer
+```
+
+These are the project's own steps, from its [getting started guide](https://docs.firedancer.io/guide/getting-started.html);
+check there for the release you build. Nothing verifies the tag or what `deps.sh` fetches:
+that trust is yours to extend. Copy the binary to the machine you run these scripts from,
+then pass it with `--fd-binary` and say `--vanilla`:
+
+```bash
+# A new server (any --network)
+./arise.sh --host <ip> --ssh-key ~/.ssh/<key> --identity <staked_identity.json> \
+    --vote-account <pubkey> --network mainnet --commission-bps <bps> \
+    --client firedancer --fd-vanilla --fd-binary ./firedancer
+
+# A server that already runs Jito or Agave
+./reawaken.sh stage   --host <ip> --ssh-key ~/.ssh/<key> --vanilla --fd-binary ./firedancer
+./reawaken.sh cutover --host <ip> --ssh-key ~/.ssh/<key>
+
+# Later: a newer build, the one before, or back to Agave
+./reawaken.sh upgrade  --host <ip> --ssh-key ~/.ssh/<key> --fd-binary ./firedancer-new
+./reawaken.sh upgrade  --host <ip> --ssh-key ~/.ssh/<key> --previous
+./reawaken.sh rollback --host <ip> --ssh-key ~/.ssh/<key>
+```
+
+`--vanilla` is only needed the first time. After that the host is recognised by its
+config, which has no `[arb]` table. Naming a Hexis release with `--fd-tag` on such a host
+moves it to the Concorde instead.
+
+What is different from the Concorde, which the rest of this page describes:
+
+- **No arb.** No signer, no Concorde config tables, no Control port, and nothing is fetched
+  from Hexis, so `gh` is not needed.
+- **Nothing is opened to Hexis.** The firewall gets Firedancer's own p2p UDP ports and
+  nothing else. Metrics listen on `127.0.0.1` (`--metrics-address` changes that, and adds
+  no firewall rule), which is where perch on the same host reads them.
+- **Any cluster.** On mainnet everything below applies. On another cluster the snapshot
+  pre-download is left out, because the default mirror is mainnet's (`--snapshot-mirror`
+  names one for that cluster), and Jito's tip programs and upload authority must be in
+  `validator.sh`, as `arise.sh` writes them, since the built-in defaults are mainnet's.
+  `--no-block-engine` runs without bundles.
+- **RPC is off unless you pass `--enable-rpc`.** Firedancer runs it by default; these scripts
+  turn it off, as on the Concorde, so `cutover` treats both the same way.
+- **The release name** is the version the binary reports, or `build-<checksum>` when that
+  is not a plain version. It is the directory under `/home/sol/firedancer/releases/`.
+- **`system.sh upgrade`** prints the command and runs nothing: there is no release for it
+  to fetch.
+
+The config written is the same one the Concorde gets, minus its arb tables. It was checked
+key by key against the project's `v26.11.1`, and `stage` checks it with the binary's own
+`firedancer mem` before installing it. A vanilla build has not been run through these
+scripts on a real host: stage it and read the plan on a testnet or spare machine first.
+
+## A new server (Hexis Concorde)
 
 ```bash
 ./arise.sh --host <ip> --ssh-key ~/.ssh/<key> --identity <staked_identity.json> \

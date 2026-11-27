@@ -83,6 +83,8 @@ JITO_REGION=""
 #   firedancer — Firedancer with the Hexis Concorde. The host is provisioned
 #                here and Firedancer is then staged by reawaken.sh; its binary
 #                comes from a private release (--fd-tag / --fd-binary).
+#                With --fd-vanilla it is vanilla Firedancer instead, from a
+#                binary the operator built (--fd-binary).
 # --hexis layers the Hexis arb client on top of jito: its binary comes from a
 # private release (--hexis-tag / --hexis-binary), so nothing is built from source.
 CLIENT="jito"
@@ -93,6 +95,7 @@ AGAVE_DEFAULT_REPO="https://github.com/anza-xyz/agave.git"
 BUILD_FORCED=false           # --build-client: build from source even with --hexis
 FD_TAG=""                    # Firedancer release tag (private repo, fetched locally with gh)
 FD_BINARY=""                 # pre-downloaded Firedancer binary (instead of --fd-tag)
+FD_VANILLA=false            # --fd-vanilla: vanilla Firedancer, not the Hexis Concorde
 FD_CONCORDE_TABLES=""        # local copy of the Concorde config tables (instead of fetching them)
 # Run against a host that already has a validator, a different --client is a
 # client switch. --restart finishes it: wait for a restart window, then move
@@ -215,6 +218,10 @@ Validator client:
   --fd-tag <tag>                Firedancer release to stage, fetched with the local
                                 gh CLI from the private ${HEXIS_REPO}
   --fd-binary <path>            Pre-downloaded Firedancer binary (instead of --fd-tag)
+  --fd-vanilla                 Vanilla Firedancer (firedancer-io/firedancer) instead
+                                of the Hexis Concorde. It is published as source only:
+                                build it for the server's CPU and pass --fd-binary.
+                                Any network; no arb, nothing opened to Hexis
   --concorde-tables <path>      Local copy of the Concorde config tables, instead of
                                 fetching them with gh (passed on to reawaken.sh)
   --client-version <tag>        Release tag to build (e.g. v4.4.1-jito, v4.4.1).
@@ -357,6 +364,7 @@ while [[ $# -gt 0 ]]; do
     --client)         need_arg "$@"; CLIENT="$2";         shift 2 ;;
     --fd-tag)         need_arg "$@"; FD_TAG="$2";         shift 2 ;;
     --fd-binary)      need_arg "$@"; FD_BINARY="$2";      shift 2 ;;
+    --fd-vanilla)    FD_VANILLA=true;                   shift ;;
     --concorde-tables) need_arg "$@"; FD_CONCORDE_TABLES="$2"; shift 2 ;;
     --client-version|--jito-version) need_arg "$@"; CLIENT_VERSION="$2"; shift 2 ;;
     --client-repo|--jito-repo)       need_arg "$@"; CLIENT_REPO="$2";    shift 2 ;;
@@ -470,7 +478,13 @@ IS_FIREDANCER=false
 REAWAKEN="$(dirname "$LIB_DIR")/reawaken.sh"
 if [[ "$CLIENT" == "firedancer" ]]; then
   IS_FIREDANCER=true
-  [[ "$NETWORK" == "mainnet" ]] || die "--client firedancer requires --network mainnet (the Hexis Concorde build is mainnet-only)"
+  if $FD_VANILLA; then
+    [[ -n "$FD_TAG" ]] && die "--fd-tag names a Hexis release. Vanilla Firedancer has no prebuilt releases: build it and pass --fd-binary <path>"
+    [[ -n "$FD_BINARY" ]] || die "--fd-vanilla needs --fd-binary <path>: vanilla Firedancer is published as source only, so build it for the server's CPU first"
+    [[ -n "$FD_CONCORDE_TABLES" || -n "$HEXIS_SIGNER" ]] && die "--concorde-tables and --hexis-signer belong to the Hexis Concorde, not to --fd-vanilla"
+  else
+    [[ "$NETWORK" == "mainnet" ]] || die "--client firedancer requires --network mainnet (the Hexis Concorde build is mainnet-only; vanilla Firedancer is not: --fd-vanilla --fd-binary <path>)"
+  fi
   [[ -x "$REAWAKEN" ]] || die "Missing $REAWAKEN — run this from a checkout"
   [[ -n "$FD_TAG" && -n "$FD_BINARY" ]] && die "Pass either --fd-tag or --fd-binary, not both"
   if [[ -n "$FD_TAG" ]]; then
@@ -479,7 +493,9 @@ if [[ "$CLIENT" == "firedancer" ]]; then
   [[ -n "$FD_BINARY" && ! -f "$FD_BINARY" ]] && die "File not found: $FD_BINARY"
   [[ -n "$FD_CONCORDE_TABLES" && ! -f "$FD_CONCORDE_TABLES" ]] && die "File not found: $FD_CONCORDE_TABLES"
   [[ -n "$HEXIS_SIGNER" && ! -f "$HEXIS_SIGNER" ]] && die "File not found: $HEXIS_SIGNER"
-  if $ENABLE_HEXIS; then
+  if $ENABLE_HEXIS && $FD_VANILLA; then
+    die "--hexis does not go with --fd-vanilla: vanilla Firedancer has no arb client"
+  elif $ENABLE_HEXIS; then
     log_info "--client firedancer is the Hexis Concorde build, so the arb client comes with it — --hexis adds nothing here"
     ENABLE_HEXIS=false
   fi
@@ -487,8 +503,8 @@ if [[ "$CLIENT" == "firedancer" ]]; then
     # The Agave XDP flags and capabilities do not apply; Firedancer drives the NIC itself
     ENABLE_XDP=false
   fi
-elif [[ -n "$FD_TAG" || -n "$FD_BINARY" || -n "$FD_CONCORDE_TABLES" ]]; then
-  die "--fd-tag, --fd-binary and --concorde-tables only go with --client firedancer"
+elif [[ -n "$FD_TAG" || -n "$FD_BINARY" || -n "$FD_CONCORDE_TABLES" ]] || $FD_VANILLA; then
+  die "--fd-tag, --fd-binary, --fd-vanilla and --concorde-tables only go with --client firedancer"
 fi
 
 if [[ -n "$ROOT_USER" ]]; then
@@ -2863,7 +2879,11 @@ if $IS_FIREDANCER; then
   [[ -n "$FD_TAG" ]]    && STAGE_ARGS+=(--fd-tag "$FD_TAG")
   [[ -n "$FD_BINARY" ]] && STAGE_ARGS+=(--fd-binary "$FD_BINARY")
   [[ -n "$FD_CONCORDE_TABLES" ]] && STAGE_ARGS+=(--concorde-tables "$FD_CONCORDE_TABLES")
-  if [[ -n "$HEXIS_SIGNER" ]]; then
+  if $FD_VANILLA; then
+    # No arb, so no signer. On testnet nothing here names Jito's tip programs
+    # for reawaken.sh to guess at: validator.sh carries them.
+    STAGE_ARGS+=(--vanilla)
+  elif [[ -n "$HEXIS_SIGNER" ]]; then
     STAGE_ARGS+=(--hexis-signer "$HEXIS_SIGNER")
   else
     STAGE_ARGS+=(--generate-signer)
