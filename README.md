@@ -336,6 +336,22 @@ It shows the client and release the host runs, whether Firedancer is installed, 
 or running, the newest Hexis Agave and Firedancer releases, and the command for each
 move that is possible from there.
 
+**How the validator is doing.** The report asks the validator's own RPC on the host
+(`127.0.0.1`, the `--rpc-port` in `validator.sh`) and shows:
+
+- which key file `identity.json` points at, its pubkey, and whether the vote account
+  votes through it, which is what tells the voting node from a spare
+- whether the node is caught up or how many slots behind, and how long the service has run
+- the vote account: voting or delinquent, slots since its last vote, active stake
+- time to this identity's next leader slot and how many are left this epoch
+- how full the ledger, accounts and root disks are
+- clock sync, a pending reboot, and whether perch is running
+
+Sync, vote and leader lines are the node's own view: a node that is far behind is also
+behind on who is delinquent. A line whose value could not be read is left out. On a
+Firedancer host nothing answers on the RPC port unless it was staged with
+`--enable-rpc`, and the report says so; the identity, disk and host lines are still shown.
+
 **Admin user.** The other scripts do their root work through an admin user, `monarch` by
 default. On a host where that login does not take your key (one set up before the admin
 user existed, say), `system.sh` tries the host's other login accounts with the same key

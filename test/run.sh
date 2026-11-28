@@ -2864,6 +2864,170 @@ group "client switch (arise.sh on a live host)"
   assert_contains "$(arise "${sw_base[@]}" --dry-run --restart)" "[DRY RUN] --restart: if a validator is running, would wait for a restart window"
 fi
 
+if should_run "health"; then
+group "validator health in system.sh"
+  # shellcheck source=../lib/hexis.sh
+  source "${ROOT}/lib/hexis.sh"
+  # shellcheck source=../lib/firedancer.sh
+  source "${ROOT}/lib/firedancer.sh"
+
+  # Run the generated host lines here. curl is a stub that answers each RPC
+  # method with the file of that name, and nothing when there is none.
+  hc="$(mktemp -d)"; mkdir "$hc/bin" "$hc/rpc"
+  cat > "$hc/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+while [[ $# -gt 0 ]]; do [[ "$1" == "-d" ]] && body="$2"; shift; done
+method=$(sed -n 's/.*"method":"\([A-Za-z]*\)".*/\1/p' <<<"$body")
+printf '%s\n' "$body" >> "$HC_RPC/requests"
+[[ -f "$HC_RPC/$method" ]] && cat "$HC_RPC/$method"
+exit 0
+STUB
+  chmod +x "$hc/bin/curl"
+  HC_ID="DenT1ty111111111111111111111111111111111111"
+  HC_VOTE="7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2"
+  hc_run() { ( export HC_RPC="$hc/rpc"; PATH="$hc/bin:$PATH"; eval "$(host_health_cmd 8899 "${1-$HC_ID}" "${2-$HC_VOTE}")" ) 2>&1; }
+  hc_set() { printf '%s\n' "$2" > "$hc/rpc/$1"; }
+  hc_healthy() {
+    rm -f "$hc/rpc/"*
+    hc_set getHealth '{"jsonrpc":"2.0","result":"ok","id":1}'
+    hc_set getEpochInfo '{"jsonrpc":"2.0","result":{"absoluteSlot":300001000,"epoch":700,"slotIndex":1000,"slotsInEpoch":432000},"id":1}'
+    hc_set getLeaderSchedule "{\"jsonrpc\":\"2.0\",\"result\":{\"$HC_ID\":[100,101,102,103,2500,2501,2502,2503]},\"id\":1}"
+    hc_set getVoteAccounts "{\"jsonrpc\":\"2.0\",\"result\":{\"current\":[{\"votePubkey\":\"$HC_VOTE\",\"nodePubkey\":\"$HC_ID\",\"activatedStake\":123456789000000,\"lastVote\":300000998}],\"delinquent\":[]},\"id\":1}"
+  }
+
+  hc_healthy
+  out=$(hc_run)
+  it "a healthy node is caught up"
+  assert_contains "$out" "behind=0"
+  it "the next leader slot is counted from where the epoch is now"
+  assert_contains "$out" "leader_in=1500"
+  it "leader slots already past are not counted as left"
+  assert_eq "$(grep -E '^leader_(total|left)=' <<<"$out" | paste -sd' ' -)" "leader_total=8 leader_left=4"
+  it "the vote account is voting, with its lag and stake"
+  assert_eq "$(grep -E '^(vote|vote_lag|stake_sol|vote_here)=' <<<"$out" | paste -sd' ' -)" "vote=current vote_lag=2 stake_sol=123456 vote_here=yes"
+  it "the epoch and how far through it is are given"
+  assert_eq "$(grep -E '^epoch' <<<"$out" | paste -sd' ' -)" "epoch=700 epoch_pct=0"
+  it "the leader schedule is asked for this identity only"
+  assert_contains "$(cat "$hc/rpc/requests")" "\"method\":\"getLeaderSchedule\",\"params\":[null,{\"identity\":\"$HC_ID\"}]"
+  it "and the vote accounts for this vote account only"
+  assert_contains "$(cat "$hc/rpc/requests")" "\"votePubkey\":\"$HC_VOTE\""
+
+  hc_set getHealth '{"jsonrpc":"2.0","error":{"code":-32005,"message":"Node is behind by 42 slots","data":{"numSlotsBehind":42}},"id":1}'
+  it "a node that is behind says by how many slots"
+  assert_contains "$(hc_run)" "behind=42"
+
+  hc_set getHealth '{"jsonrpc":"2.0","error":{"code":-32005,"message":"Node is unhealthy","data":{}},"id":1}'
+  it "a node that is unhealthy without a number says so"
+  assert_contains "$(hc_run)" "behind=unknown"
+
+  hc_healthy
+  hc_set getVoteAccounts "{\"jsonrpc\":\"2.0\",\"result\":{\"current\":[],\"delinquent\":[{\"votePubkey\":\"$HC_VOTE\",\"nodePubkey\":\"0therNode1111111111111111111111111111111111\",\"activatedStake\":5000000000,\"lastVote\":299990000}]},\"id\":1}"
+  out=$(hc_run)
+  it "a delinquent vote account is reported as that"
+  assert_contains "$out" "vote=delinquent"
+  it "a vote account that votes through another identity is told apart"
+  assert_contains "$out" "vote_here=no"
+
+  hc_set getVoteAccounts '{"jsonrpc":"2.0","result":{"current":[],"delinquent":[]},"id":1}'
+  it "a vote account the node does not know is absent"
+  assert_contains "$(hc_run)" "vote=absent"
+
+  hc_set getLeaderSchedule '{"jsonrpc":"2.0","result":{},"id":1}'
+  out=$(hc_run)
+  it "an identity with no leader slots has none"
+  assert_contains "$out" "leader_total=0"
+  it "and no next one"
+  assert_not_contains "$out" "leader_in="
+
+  hc_healthy
+  out=$(hc_run "" "")
+  it "with no identity or vote account, sync is still read"
+  assert_contains "$out" "behind=0"
+  it "and nothing is said about leader slots or votes"
+  assert_not_contains "$out" "leader_total"
+  assert_not_contains "$out" "vote="
+
+  rm -f "$hc/rpc/"*
+  it "an RPC that does not answer is down, and nothing else is said"
+  assert_eq "$(hc_run)" "rpc=down"
+
+  hc_set getHealth '<html>502 Bad Gateway</html>'
+  it "an answer that is not JSON counts as down"
+  assert_eq "$(hc_run)" "rpc=down"
+
+  hc_healthy
+  hc_set getEpochInfo '{"result":{"slotIndex":"$(reboot)","slotsInEpoch":[],"epoch":"x"}}'
+  hc_set getVoteAccounts '{"result":{"current":["junk",{"lastVote":"x","activatedStake":null,"nodePubkey":7}]}}'
+  out=$(hc_run)
+  it "answers of the wrong shape are left out, not printed"
+  assert_not_contains "$out" "reboot"
+  it "and do not stop what could be read"
+  assert_contains "$out" "behind=0"
+
+  # system.sh, with the host's answers stubbed
+  hl_host() {   # <health answer> <extra facts>
+    printf '%s\n' '*echo ok*|ok' \
+      "*system-facts*|agave_active=active\\nfd_enabled=disabled\\nfd_release=\\nfd_config=no$2" \
+      "*key-info*|/home/sol/identity.json|/home/sol/staked_identity.json|$HC_ID" \
+      "*host-health*|$1" \
+      "*cat /home/sol/validator.sh*|#!/bin/bash\\nexec agave-validator \\\\\\\\\\n    --identity /home/sol/identity.json \\\\\\\\\\n    --vote-account $HC_VOTE \\\\\\\\\\n    --rpc-port 8899 \\\\\\\\\\n    --accounts /mnt/accounts \\\\\\\\\\n    --block-engine-url https://ny.mainnet.block-engine.jito.wtf \\\\\\\\\\n    --ledger /mnt/ledger"
+  }
+  hl=(--host 1.2.3.4 --ssh-key "$WORK/key")
+  hl_host 'rpc=up\nbehind=0\nepoch=700\nepoch_pct=61\nleader_total=1200\nleader_left=340\nleader_in=1800\nvote=current\nvote_lag=2\nstake_sol=123456\nvote_here=yes' \
+    '\nagave_since=273600\ndisk_ledger=61% 1.2T\ndisk_accounts=40% 800G\ndisk_root=20% 150G\nclock_synced=yes\nreboot_required=yes\nperch_active=active' > "$WORK/hl-ok.responses"
+  out=$(STUB_RESPONSES="$WORK/hl-ok.responses" STUB_LOG="$WORK/hl-ok.log" system "${hl[@]}")
+
+  it "system.sh shows which key the identity link points at, and its pubkey"
+  assert_contains "$out" "Identity:        /home/sol/identity.json -> /home/sol/staked_identity.json  $HC_ID"
+  it "and that this is the node the vote account votes through"
+  assert_contains "$out" "this is the voting node"
+  it "system.sh says the node is caught up and for how long it has run"
+  assert_contains "$out" "Sync:            caught up, running for 3d 4h"
+  it "system.sh shows the vote account's state, lag and stake"
+  assert_contains "$out" "Vote account:    voting ($HC_VOTE), last vote 2 slots back, 123456 SOL active stake"
+  it "system.sh turns slots until the next leader slot into time"
+  assert_contains "$out" "Leader slots:    next in about 12m; 340 left of 1200 this epoch   (epoch 700, 61% through)"
+  it "system.sh shows how full the ledger, accounts and root disks are"
+  assert_contains "$out" "Disks:           ledger 61% used, 1.2T free   accounts 40% used, 800G free   / 20% used, 150G free"
+  it "system.sh shows clock sync, a pending reboot and perch"
+  assert_contains "$out" "Host:            clock synchronised, a reboot is pending (package updates), perch is watching"
+  it "the health check asks the RPC port validator.sh names, for this identity and vote account"
+  assert_contains "$(cat "$WORK/hl-ok.log")" "port='8899'; identity='$HC_ID'; vote='$HC_VOTE'"
+  it "the moves offered are still there below the health lines"
+  assert_order "$out" "Leader slots:" "From here:"
+
+  hl_host 'rpc=up\nbehind=42\nvote=delinquent\nvote_lag=9000\nvote_here=no\nleader_total=0\nleader_left=0' \
+    '\nclock_synced=no\nreboot_required=no\nperch_active=inactive' > "$WORK/hl-bad.responses"
+  out=$(STUB_RESPONSES="$WORK/hl-bad.responses" system "${hl[@]}")
+  it "system.sh says how many slots behind the node is"
+  assert_contains "$out" "Sync:            42 slots behind"
+  it "system.sh makes a delinquent vote account stand out"
+  assert_contains "$out" "Vote account:    DELINQUENT ($HC_VOTE), last vote 9000 slots back, as this node sees it"
+  it "system.sh says when this host is not the voting node"
+  assert_contains "$out" "this host is not the voting node"
+  it "system.sh says an identity has no leader slots this epoch"
+  assert_contains "$out" "Leader slots:    none this epoch for this identity"
+  it "system.sh says when the clock is not synchronised and perch is not running"
+  assert_contains "$out" "Host:            clock NOT synchronised, perch is not running"
+
+  hl_host 'rpc=down' '' > "$WORK/hl-down.responses"
+  out=$(STUB_RESPONSES="$WORK/hl-down.responses" system "${hl[@]}")
+  it "system.sh says when the RPC does not answer"
+  assert_contains "$out" "Sync:            not read — the RPC on 127.0.0.1:8899 does not answer"
+  it "and prints no disk or host line it has no facts for"
+  assert_not_contains "$out" "Disks:"
+
+  hl_host 'rpc=up\nbehind=$(reboot)\nvote=current\nstake_sol=1;id\nleader_total=`id`' \
+    '\ndisk_ledger=$(reboot) 1T\nagave_since=1;reboot\nclock_synced=$(id)' > "$WORK/hl-hostile.responses"
+  out=$(STUB_RESPONSES="$WORK/hl-hostile.responses" system "${hl[@]}")
+  it "values that are not plain numbers or words are not shown"
+  assert_not_contains "$out" "reboot"
+  it "nor anything else the host put in their place"
+  assert_not_contains "$out" "id\`"
+  it "while the plain ones beside them still are"
+  assert_contains "$out" "Vote account:    voting ($HC_VOTE)"
+fi
+
 if should_run "flags"; then
 group "recorded arise.sh flags"
   # shellcheck source=../lib/hexis.sh
