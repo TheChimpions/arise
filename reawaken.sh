@@ -247,6 +247,28 @@ done
 [[ ! -f "$SSH_KEY" ]] && { log_error "SSH key not found: $SSH_KEY"; exit 1; }
 
 SSH_HOST="${SSH_HOST##*@}"
+# Every value below is put into a command that runs on the host, much of it as
+# root, or into Firedancer's config. Each is checked before anything connects.
+RE_NAME='^[a-z_][a-z0-9_-]{0,31}$'
+RE_PATH='^/[A-Za-z0-9._/+-]+$'
+bad_value() { log_error "$1"; exit 1; }
+[[ "$SSH_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*$ ]] || bad_value "--host is not a hostname or IP: $SSH_HOST"
+[[ "$SOL_USER" =~ $RE_NAME ]]   || bad_value "--user is not a valid user name: $SOL_USER"
+[[ "$ADMIN_USER" =~ $RE_NAME ]] || bad_value "--admin-user is not a valid user name: $ADMIN_USER"
+[[ -z "$FD_USER" || "$FD_USER" =~ $RE_NAME ]] || bad_value "--fd-user is not a valid user name: $FD_USER"
+[[ "$AGAVE_SERVICE" =~ ^[A-Za-z0-9_][A-Za-z0-9_.@-]{0,63}$ ]] || bad_value "--agave-service is not a valid unit name: $AGAVE_SERVICE"
+for path_check in "--validator-script|$VALIDATOR_SH" "--fd-dir|$FD_DIR" "--fd-base|$FD_BASE" "--fd-accounts|$FD_ACCOUNTS"; do
+  [[ -z "${path_check#*|}" || "${path_check#*|}" =~ $RE_PATH ]] || bad_value "${path_check%%|*} must be an absolute path without spaces: ${path_check#*|}"
+done
+[[ -z "$FD_TAG" || "$FD_TAG" =~ $RE_RELEASE_TAG ]] || bad_value "--fd-tag is not a valid tag: $FD_TAG"
+[[ -z "$MIN_IDLE_TIME" || "$MIN_IDLE_TIME" =~ ^[0-9]{1,4}$ ]] || bad_value "--min-idle-time must be a number of minutes: $MIN_IDLE_TIME"
+[[ "$MAX_DELINQUENT_STAKE" =~ ^[0-9]{1,3}$ ]] || bad_value "--max-delinquent-stake must be a number: $MAX_DELINQUENT_STAKE"
+[[ -z "$FD_COMMISSION_BPS" || "$FD_COMMISSION_BPS" =~ ^[0-9]{1,5}$ ]] || bad_value "--commission-bps must be a number: $FD_COMMISSION_BPS"
+for plain_check in "--fd-asset|$FD_ASSET" "--interface|$FD_INTERFACE" "--metrics-address|$FD_METRICS_ADDR" \
+    "--snapshot-mirror|$SNAPSHOT_MIRROR" "--block-engine-url|$FD_BUNDLE_URL" "--shred-destinations|$FD_SHRED_DESTS" \
+    "--jupiter-token-ledger|$FD_JUPITER_LEDGER" "--okx-token-ledger|$FD_OKX_LEDGER"; do
+  [[ "${plain_check#*|}" =~ ^[A-Za-z0-9._/:,@+=%-]*$ ]] || bad_value "${plain_check%%|*} has characters that are not accepted: ${plain_check#*|}"
+done
 SOL_HOST="${SOL_USER}@${SSH_HOST}"
 VALIDATOR_SH="${VALIDATOR_SH:-/home/${SOL_USER}/validator.sh}"
 FD_DIR="${FD_DIR:-/home/${SOL_USER}/firedancer}"
@@ -512,12 +534,15 @@ AGAVE_VOTERS=$(fd_vsh_flag_all "$VSH" "--authorized-voter" | grep -vxF "$AGAVE_I
 KEY_INFO=$(probe "$(fd_key_info_cmd "$AGAVE_IDENTITY" $AGAVE_VOTERS)")
 IDENTITY_LABEL=$(fd_key_label "$KEY_INFO" "$AGAVE_IDENTITY")
 IDENTITY_PUBKEY=$(grep -m1 -F "${AGAVE_IDENTITY}|" <<<"$KEY_INFO" | cut -d'|' -f3 || true)
+# Worked out on the host and used in file names below: letters and digits, or nothing
+[[ "$IDENTITY_PUBKEY" =~ ^[A-Za-z0-9]{1,64}$ ]] || IDENTITY_PUBKEY=""
 
 # The binary systemd is running right now, for admin-RPC calls against it
 AGAVE_EXEC=$(grep -m1 -E '^[[:space:]]*exec[[:space:]]' <<<"$VSH" | awk '{print $2}' || true)
 if [[ -n "$AGAVE_EXEC" && "$AGAVE_EXEC" != /* ]]; then
   AGAVE_EXEC=$(probe "p=\$(grep -m1 '^PATH=' ${VALIDATOR_SH} | sed 's/^PATH=//'); PATH=\"\${p:-\$PATH}\" command -v ${AGAVE_EXEC} || true")
 fi
+[[ "$AGAVE_EXEC" =~ $RE_PATH ]] || AGAVE_EXEC=""
 
 # jag-snap fronts Agave's RPC on 18899 to serve snapshots. Firedancer makes no
 # snapshots and does not advertise an RPC address, so the proxy has nothing to
@@ -721,6 +746,23 @@ $(fd_render_snapshot_seed "$AGAVE_SNAPSHOTS" "$FD_SNAPSHOTS_DIR" "$FD_USER")"
   # Not under set -e here: the status of the remote script decides what happens next
   root_script <<SCRIPT && CUTOVER_RC=0 || CUTOVER_RC=$?
 set -e
+# Conflicts= in the unit keeps Firedancer and ${AGAVE_SERVICE}.service apart. It does
+# nothing about an Agave validator started some other way: under another unit,
+# or by hand. Starting Firedancer beside one would put two validators on one
+# identity, so this stops here, before anything has been changed.
+other_validators=""
+for pid in \$(pgrep -x 'agave-validator|solana-validator' 2>/dev/null); do
+  case "\$(cat /proc/\$pid/cgroup 2>/dev/null)" in
+    */${AGAVE_SERVICE}.service*) ;;
+    *) other_validators="\$other_validators \$pid" ;;
+  esac
+done
+if [ -n "\$other_validators" ]; then
+  echo "A validator is running outside ${AGAVE_SERVICE}.service (pid\$other_validators):"
+  ps -o pid=,unit=,args= -p "\$(echo \$other_validators | tr ' ' ',')" 2>/dev/null | cut -c1-160 || true
+  echo "Nothing has been changed. Stop it, or pass --agave-service <its unit> to stage and cutover."
+  exit 1
+fi
 $(perch_maint_cmd "$SOL_USER" "$PERCH_DEADLINE_FIREDANCER" root)
 systemctl stop ${AGAVE_SERVICE}
 systemctl disable ${AGAVE_SERVICE} >/dev/null 2>&1 || true
@@ -737,7 +779,13 @@ for f in ${FD_BASE}/vote_history-*.bin ${FD_BASE}/tower-1_9-*.bin; do
   echo "moved aside \$(basename "\$f") (not the identity Firedancer starts as)"
 done
 rmdir "${FD_BASE}/other-identities" 2>/dev/null || true
-if [ -f "${AGAVE_LEDGER}/vote_history-${IDENTITY_PUBKEY}.bin" ]; then
+# The newer record wins. Firedancer's own is newer than Agave's when it has
+# voted since the last hand-over, e.g. when cutover is run again after a start
+# that failed part-way: an older record must never replace it.
+if [ -f "${AGAVE_LEDGER}/vote_history-${IDENTITY_PUBKEY}.bin" ] \\
+   && [ "${FD_BASE}/vote_history-${IDENTITY_PUBKEY}.bin" -nt "${AGAVE_LEDGER}/vote_history-${IDENTITY_PUBKEY}.bin" ]; then
+  echo "kept Firedancer's vote_history-${IDENTITY_PUBKEY}.bin: it is newer than the one in ${AGAVE_LEDGER}"
+elif [ -f "${AGAVE_LEDGER}/vote_history-${IDENTITY_PUBKEY}.bin" ]; then
   cp -a "${AGAVE_LEDGER}/vote_history-${IDENTITY_PUBKEY}.bin" "${FD_BASE}/"
   $(fd_chown_cmd "$FD_USER") "${FD_BASE}/vote_history-${IDENTITY_PUBKEY}.bin"
   echo "carried over vote_history-${IDENTITY_PUBKEY}.bin"
@@ -851,6 +899,11 @@ ${FD_BIN} configure fini all --config ${FD_CONFIG} >/dev/null 2>&1 || echo "conf
 
 for f in ${FD_BASE}/vote_history-*.bin; do
   [ -f "\$f" ] || continue
+  # The newer record wins, as in cutover
+  if [ "${AGAVE_LEDGER}/\$(basename "\$f")" -nt "\$f" ]; then
+    echo "kept Agave's \$(basename "\$f"): it is newer than Firedancer's"
+    continue
+  fi
   cp -a "\$f" "${AGAVE_LEDGER}/"
   $(fd_chown_cmd "$SOL_USER") "${AGAVE_LEDGER}/\$(basename "\$f")"
   echo "carried back \$(basename "\$f")"
@@ -967,6 +1020,8 @@ if [[ "$MODE" == "upgrade" ]]; then
     exit 1
   fi
   OLD_RELEASE="$(fact fd_release)"
+  # A symlink target read from the host, used in the path of a binary below
+  [[ "$OLD_RELEASE" =~ $RE_RELEASE_TAG ]] || bad_value "${FD_BIN} points at a release with an unexpected name: ${OLD_RELEASE}"
   log_info "Firedancer release now: ${OLD_RELEASE} ($(fact fd_version))"
 fi
 
@@ -976,6 +1031,7 @@ if [[ "$MODE" == "upgrade" ]] && $FD_PREVIOUS; then
     log_error "No earlier release is recorded in ${FD_PREVIOUS_FILE} — nothing to go back to"
     exit 1
   fi
+  [[ "$PREV_RELEASE" =~ $RE_RELEASE_TAG ]] || bad_value "${FD_PREVIOUS_FILE} does not hold a release name: ${PREV_RELEASE}"
   if [[ "$PREV_RELEASE" == "$OLD_RELEASE" ]]; then
     log_info "${PREV_RELEASE} is already the staged release"
     exit 0

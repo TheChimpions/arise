@@ -187,6 +187,76 @@ HEXIS_MARGINFI_BANKS="CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD6LYGh,2s37akK2eyBbp
 HEXIS_MARGINFI_PROGRAM_ID="MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA"
 
 # ---------------------------------------------------------------------------
+# Validation
+#
+# These values are written into files on the host — arb-config.toml,
+# arb-enable.sh, validator.sh — or handed to gh, so each is checked before use.
+# ---------------------------------------------------------------------------
+# A release tag, e.g. v4.2.1+concorde.3. Never starts with '-'.
+RE_RELEASE_TAG='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
+RE_HEXIS_PUBKEY='^[1-9A-HJ-NP-Za-km-z]{32,44}$'
+
+# hexis_check_pubkeys <flag> <value> [list] — a base58 address, or with "list" a
+# comma-separated run of them. Empty is allowed: it means "not set".
+hexis_check_pubkeys() {
+  local flag="$1" value="$2" item
+  [[ -z "$value" ]] && return 0
+  if [[ "${3:-}" == "list" ]]; then
+    local IFS=,
+    for item in $value; do
+      item="${item//[[:space:]]/}"
+      [[ -z "$item" || "$item" =~ $RE_HEXIS_PUBKEY ]] && continue
+      log_error "${flag}: not a base58 address: ${item}"
+      return 1
+    done
+    return 0
+  fi
+  [[ "$value" =~ $RE_HEXIS_PUBKEY ]] && return 0
+  log_error "${flag}: not a base58 address: ${value}"
+  return 1
+}
+
+# hexis_check_metrics <flag> <value> — a metrics string goes inside double
+# quotes on an export line of validator.sh, which the shell reads on every
+# start. The characters that would end the quotes or run something are refused.
+hexis_check_metrics() {
+  [[ -z "$2" ]] && return 0
+  case "$2" in
+    *'"'*|*"'"*|*'$'*|*'`'*|*'\'*|*$'\n'*|*$'\r'*)
+      log_error "$1 contains a character that cannot go into validator.sh (a quote, \$ \` \\ or a line break)"
+      return 1 ;;
+  esac
+  return 0
+}
+
+# hexis_validate_settings — everything arb-config.toml and arb-enable.sh are
+# rendered from. Run before anything touches the host.
+hexis_validate_settings() {
+  local ok=true
+  hexis_check_pubkeys --hexis-program-id           "$HEXIS_PROGRAM_ID"           || ok=false
+  hexis_check_pubkeys --hexis-profit-wallet        "$HEXIS_PROFIT_WALLET"        || ok=false
+  hexis_check_pubkeys --hexis-jupiter-token-ledger "$HEXIS_JUPITER_TOKEN_LEDGER" || ok=false
+  hexis_check_pubkeys --hexis-okx-token-ledger     "$HEXIS_OKX_TOKEN_LEDGER"     || ok=false
+  hexis_check_pubkeys --hexis-marginfi-account     "$HEXIS_MARGINFI_ACCOUNT"     || ok=false
+  hexis_check_pubkeys --hexis-marginfi-program-id  "$HEXIS_MARGINFI_PROGRAM_ID"  || ok=false
+  hexis_check_pubkeys --hexis-lookup-tables        "$HEXIS_LOOKUP_TABLES" list   || ok=false
+  hexis_check_pubkeys --hexis-base-mints           "$HEXIS_BASE_MINTS" list      || ok=false
+  hexis_check_pubkeys --hexis-marginfi-banks       "$HEXIS_MARGINFI_BANKS" list  || ok=false
+  if [[ -n "$HEXIS_JUP_KEY" && ! "$HEXIS_JUP_KEY" =~ ^[A-Za-z0-9._~+/=:-]+$ ]]; then
+    log_error "The Jupiter API key has characters that cannot go into arb-config.toml (letters, digits and . _ ~ + / = : - are accepted)"
+    ok=false
+  fi
+  hexis_check_metrics "The arb metrics string" "$HEXIS_METRICS_CONFIG" || ok=false
+  if [[ ! "$HEXIS_CONTROL_BIND" =~ ^[0-9A-Za-z.:-]+:[0-9]{1,5}$ ]]; then
+    log_error "--hexis-control-bind must look like 0.0.0.0:18082: ${HEXIS_CONTROL_BIND}"; ok=false
+  fi
+  if [[ ! "$HEXIS_CONTROL_ALLOW" =~ ^[0-9A-Fa-f.:]+(/[0-9]{1,3})?$ || "$HEXIS_CONTROL_ALLOW" == */0 ]]; then
+    log_error "--hexis-control-allow must be one IP or a CIDR narrower than /0: ${HEXIS_CONTROL_ALLOW}"; ok=false
+  fi
+  $ok
+}
+
+# ---------------------------------------------------------------------------
 # XDP / PoH flag names
 #
 # Agave 4.3 renamed these and kept the old --experimental-* names as hidden
@@ -231,19 +301,26 @@ hexis_toml_list() {
   echo "${out%, }"
 }
 
-# Verify a downloaded asset against the release's checksums.txt, when there is one.
-# Exits non-zero on mismatch — the caller is expected to be running under set -e.
+# Verify a downloaded asset against the checksum file published with its
+# release. Fails closed: a release with no checksum file, no line for the asset,
+# or two files that disagree is refused, the same as a mismatch. A file you have
+# checked yourself can still be given with --hexis-binary / --fd-binary.
 hexis_verify_checksum() {
-  local dir="$1" file="$2" sums expected actual
-  sums=$(find "$dir" -name '*checksums.txt' -type f | head -1)
-  if [[ -z "$sums" ]]; then
-    log_warn "No checksums.txt in the release — cannot verify ${file}"
-    return 0
+  local dir="$1" file="$2" expected actual
+  if [[ -z "$(find "$dir" -name '*checksums.txt' -type f | head -1)" ]]; then
+    log_error "No checksums.txt in the release — ${file} cannot be verified, so it is not used"
+    return 1
   fi
-  expected=$(awk -v f="$file" '$2 == f { print $1 }' "$sums")
+  # sha256sum writes "hash  name", or "hash *name" in binary mode
+  expected=$(find "$dir" -name '*checksums.txt' -type f -exec cat {} + \
+    | awk -v f="$file" '{ n = $2; sub(/^\*/, "", n) } n == f { print tolower($1) }' | sort -u)
   if [[ -z "$expected" ]]; then
-    log_warn "checksums.txt has no entry for ${file} — skipping verification"
-    return 0
+    log_error "checksums.txt has no entry for ${file} — it cannot be verified, so it is not used"
+    return 1
+  fi
+  if [[ "$expected" == *$'\n'* ]]; then
+    log_error "The release's checksum files disagree about ${file}"
+    return 1
   fi
   actual=$(shasum -a 256 "${dir}/${file}" | awk '{print $1}')
   if [[ "$expected" != "$actual" ]]; then

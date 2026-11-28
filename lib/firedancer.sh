@@ -68,6 +68,33 @@ FD_DOUBLEZERO_GROUP="233.84.178.1"
 # Reading an Agave validator.sh
 # ---------------------------------------------------------------------------
 
+# fd_plain_values <what> — passes on, line by line, only values made of the
+# characters a path, an address, a URL or a pubkey is made of. What these
+# scripts read out of validator.sh and the TOML files on the host is written by
+# the validator user and later put into commands that run as root, so a value
+# carrying shell syntax is dropped here, with a warning, and never gets there.
+# One pair of quotes around a value is taken off first.
+fd_plain_values() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      \"*\") line="${line#\"}"; line="${line%\"}" ;;
+      \'*\') line="${line#\'}"; line="${line%\'}" ;;
+    esac
+    [[ -z "$line" ]] && continue
+    # arise.sh's <FILL_IN_...> placeholders go through without their brackets,
+    # so the caller can still say which value was never filled in.
+    while [[ "$line" =~ \<(FILL_IN_[A-Z_]+)\> ]]; do
+      line="${line/"<${BASH_REMATCH[1]}>"/${BASH_REMATCH[1]}}"
+    done
+    if [[ "$line" =~ ^[A-Za-z0-9._/:,@+=%-]+$ ]]; then
+      printf '%s\n' "$line"
+    else
+      printf '[WARN]  Ignoring %s: it is not a plain value\n' "$1" >&2
+    fi
+  done
+}
+
 # Every value given for <flag> in <validator.sh text>, one per line. Comment
 # lines are skipped; a trailing line-continuation backslash is not part of the
 # value, with or without a space before it.
@@ -75,7 +102,8 @@ fd_vsh_flag_all() {
   local text="$1" flag="$2"
   grep -v '^[[:space:]]*#' <<<"$text" \
     | grep -oE -- "(^|[[:space:]])${flag}([[:space:]]+|=)[^[:space:]\\\\]+" \
-    | sed -E "s/^[[:space:]]*${flag}[[:space:]=]+//" || true
+    | sed -E "s/^[[:space:]]*${flag}[[:space:]=]+//" \
+    | fd_plain_values "${flag} in validator.sh" || true
 }
 
 fd_vsh_flag() { fd_vsh_flag_all "$1" "$2" | head -1; }
@@ -126,7 +154,8 @@ fd_detect_source() {
 
 # Value of a string key in arb-config.toml text
 fd_toml_get() {
-  grep -m1 -E "^[[:space:]]*$2[[:space:]]*=" <<<"$1" | sed -e 's/^[^=]*=[[:space:]]*"//' -e 's/".*//' || true
+  grep -m1 -E "^[[:space:]]*$2[[:space:]]*=" <<<"$1" | sed -e 's/^[^=]*=[[:space:]]*"//' -e 's/".*//' \
+    | fd_plain_values "'$2' in the config on the host" || true
 }
 
 # ---------------------------------------------------------------------------

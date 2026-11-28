@@ -9,10 +9,11 @@
 # Security model
 #   - An admin user holds sudo (password required) and does all root work.
 #   - The service user (sol) runs the validator and has no sudo.
-#   - Scripts and the sudo password travel over SSH stdin only. Nothing is
-#     written to /tmp on either side and no secret appears in a process list.
-#   - Every remote script runs under `set -euo pipefail`, and its exit status
-#     is the exit status of the helper that ran it.
+#   - Scripts and the sudo password travel over SSH stdin only: never a file,
+#     never an argument, so neither shows in a process list on the server.
+#   - A remote script runs under `set -euo pipefail` unless the caller set
+#     REMOTE_STRICT (ascend.sh and reawaken.sh do, and set error handling in
+#     each script). Its exit status is that of the helper that ran it.
 #
 # The caller sets SSH_KEY, SSH_HOST, SOL_USER, ADMIN_USER and DRY_RUN, then
 # calls remote_init. SUDO_PASS is filled in by whoever asks for it.

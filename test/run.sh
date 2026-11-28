@@ -204,6 +204,31 @@ group "lib/hexis.sh checksum verification"
   it "reports what it expected and got"
   assert_contains "$out" "Checksum mismatch for asset"
 
+  printf '%s *asset\n' "$(shasum -a 256 "$d/asset" | awk '{print $1}')" > "$d/checksums.txt"
+  it "reads a binary-mode line (hash *name)"
+  out="$(hexis_verify_checksum "$d" asset 2>&1)"; rc=$?
+  assert_eq "$rc" "0"
+
+  printf '%s  something-else\n' "$(shasum -a 256 "$d/asset" | awk '{print $1}')" > "$d/checksums.txt"
+  it "refuses an asset the checksum file does not list"
+  out="$(hexis_verify_checksum "$d" asset 2>&1)"; rc=$?
+  assert_eq "$rc" "1"
+  assert_contains "$out" "has no entry for asset"
+
+  rm -f "$d/checksums.txt"
+  it "refuses an asset from a release with no checksum file"
+  out="$(hexis_verify_checksum "$d" asset 2>&1)"; rc=$?
+  assert_eq "$rc" "1"
+  assert_contains "$out" "No checksums.txt in the release"
+
+  printf '%s  asset\n' "$(shasum -a 256 "$d/asset" | awk '{print $1}')" > "$d/checksums.txt"
+  printf '%s  asset\n' "1111111111111111111111111111111111111111111111111111111111111111" > "$d/other-checksums.txt"
+  it "refuses when two checksum files disagree"
+  out="$(hexis_verify_checksum "$d" asset 2>&1)"; rc=$?
+  assert_eq "$rc" "1"
+  assert_contains "$out" "disagree about asset"
+  rm -f "$d/other-checksums.txt"
+
   # Regression: these echo a path for command substitution, so their logging
   # must go to stderr or the caller ends up with a corrupted path.
   it "hexis_download_validator emits only a path on stdout"
@@ -314,6 +339,46 @@ group "clients and security model"
   it "the shred receivers are the Jito region and DoubleZero, nothing else"
   assert_contains "$out" "--shred-receiver-address 64.130.50.14:1002,233.84.178.1:7733 \\"
 
+  it "jito on mainnet gets the tip programs and merkle authority Jito publishes"
+  assert_contains "$out" "--tip-payment-program-pubkey T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt \\"
+  assert_contains "$out" "--tip-distribution-program-pubkey 4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7 \\"
+  assert_contains "$out" "--merkle-root-upload-authority 8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt \\"
+
+  it "the Agave and Firedancer paths name the same merkle authority"
+  assert_eq "$(grep -c "JITO_MERKLE_AUTHORITY_MAINNET=\"$(sed -n 's/^FD_TIP_DISTRIBUTION_AUTHORITY="\(.*\)"$/\1/p' "$ROOT/lib/firedancer.sh")\"" "$ROOT/arise.sh")" "1"
+
+  tn_out="$(STUB_RESPONSES=$F/host-fresh.responses arise --host 1.2.3.4 --vote-account "$PK" --network testnet \
+        --jito-region dallas --no-auto-disks --no-xdp --dry-run --ssh-key "$WORK/key" --identity "$WORK/id.json")"
+  it "jito on testnet gets the testnet Block Engine and shred receiver"
+  assert_contains "$tn_out" "--block-engine-url https://dallas.testnet.block-engine.jito.wtf \\"
+  assert_contains "$tn_out" "--shred-receiver-address 141.98.218.12:1002 \\"
+
+  it "and the testnet tip programs and merkle authority, not the mainnet ones"
+  assert_contains "$tn_out" "--tip-payment-program-pubkey GJHtFqM9agxPmkeKjHny6qiRKrXZALvvFGiKf11QE7hy \\"
+  assert_contains "$tn_out" "--tip-distribution-program-pubkey DzvGET57TAgEDxvm3ERUM4GNcsAJdqjDLCne9sdfY4wf \\"
+  assert_contains "$tn_out" "--merkle-root-upload-authority 7T4inmPmtNBX3MhLwJ9hFsSMnGJYYkKioVABSNTWVRuS \\"
+  assert_not_contains "$tn_out" "T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt"
+
+  it "testnet takes no DoubleZero receiver and a commission of 0 unless one is given"
+  assert_not_contains "$tn_out" "233.84.178.1"
+  assert_contains "$tn_out" "--commission-bps 0 \\"
+
+  it "a testnet validator.sh still parses, with the Jito flags inside the one command"
+  tn_vsh="$(printf '%s\n' "$tn_out" | sed -n '/^#!\/bin\/bash$/,/--full-rpc-api$/p')"
+  assert_contains "$tn_vsh" "--full-rpc-api"
+  assert_eq "$(printf '%s\n' "$tn_vsh" | bash -n 2>&1 && echo parses)" "parses"
+  assert_eq "$(printf '%s\n' "$tn_vsh" | grep -c '^exec ')" "1"
+
+  it "agave on testnet gets no Jito flags"
+  assert_not_contains "$(STUB_RESPONSES=$F/host-fresh.responses arise --host 1.2.3.4 --vote-account "$PK" --network testnet --client agave \
+        --no-auto-disks --no-xdp --dry-run --ssh-key "$WORK/key" --identity "$WORK/id.json")" "--block-engine-url"
+
+  it "rustup is a pinned release checked against a recorded checksum, never piped into a shell"
+  assert_eq "$(grep -cE 'curl[^|]*\|[[:space:]]*(sh|bash)([[:space:]]|$)' "$ROOT/arise.sh" "$ROOT/ascend.sh" "$ROOT/reawaken.sh" "$ROOT/system.sh" "$ROOT"/lib/*.sh | awk -F: '{n+=$2} END {print n}')" "0"
+  assert_contains "$out" "static.rust-lang.org/rustup/archive/\${RUSTUP_VERSION}/"
+  assert_contains "$out" "sha256sum -c -"
+  assert_order "$out" "sha256sum -c -" '"$RUSTUP_TMP/rustup-init" -y'
+
   it "RPC stays on localhost and out of gossip"
   assert_contains "$out" "--private-rpc"
 
@@ -413,6 +478,32 @@ group "clients and security model"
   assert_eq "$(grep -c '^\[\[hosts\]\]' "$ne_dir/new.toml")" "1"
   assert_file_missing "$ne_dir/apt.calls"
   rm -rf "$ne_dir"
+
+  # perch's installer runs as root: the lines that check it first, lifted from
+  # the dry run and run against scratch files
+  pi_dir="$(mktemp -d)"; mkdir "$pi_dir/bin"
+  command -v sha256sum >/dev/null 2>&1 || { printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > "$pi_dir/bin/sha256sum"; chmod +x "$pi_dir/bin/sha256sum"; }
+  pi_check="$(printf '%s\n' "$out" | sed -n '/^if ! (cd "\$WORK" && grep -E .*install/,/^fi$/p')"
+  pi_run() { ( PATH="$pi_dir/bin:$PATH"; WORK="$pi_dir"; eval "$pi_check"; echo "ran the installer" ) 2>&1; }
+  printf '#!/bin/sh\necho perch installer\n' > "$pi_dir/install.sh"
+  pi_sum="$(PATH="$pi_dir/bin:$PATH" sha256sum "$pi_dir/install.sh" | cut -d' ' -f1)"
+
+  it "the dry run checks perch's installer against the release checksums before running it"
+  assert_order "$out" 'SHA256SUMS | sha256sum -c -' 'bash "$WORK/install.sh" --version'
+
+  printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "perch-x86_64-unknown-linux-musl.tar.gz" "$pi_sum" "install.sh" > "$pi_dir/SHA256SUMS"
+  it "an installer that matches its published checksum is run"
+  assert_eq "$(pi_run)" "ran the installer"
+
+  echo "echo tampered" >> "$pi_dir/install.sh"
+  it "an installer that does not match is not run"
+  assert_contains "$(pi_run)" "does not match the checksum published with the release"
+  assert_not_contains "$(pi_run)" "ran the installer"
+
+  printf '%s  %s\n' "$pi_sum" "perch-x86_64-unknown-linux-musl.tar.gz" > "$pi_dir/SHA256SUMS"
+  it "nor is one the checksum list does not mention at all"
+  assert_not_contains "$(pi_run)" "ran the installer"
+  rm -rf "$pi_dir"
 
   it "--no-perch skips it"
   assert_contains "$(arise "${cl_base[@]}" --no-xdp --no-perch)" "Skipping perch watchtower"
@@ -2059,10 +2150,11 @@ group "reawaken.sh"
 fi
 
 # === system.sh ===============================================================
+if should_run "system"; then
 group "system.sh"
-if [[ ! -f "$ROOT/system.sh" ]]; then
-  it "system.sh exists"; assert_eq "missing" "present"
-else
+  source "${ROOT}/lib/hexis.sh"
+  source "${ROOT}/lib/firedancer.sh"
+  T="$ROOT/test/fixtures/concorde-tables.toml"
   # st_host <file> <system-facts, \n separated> <validator.sh body lines>
   st_host() {
     {
@@ -2281,7 +2373,118 @@ else
   out="$(STUB_RESPONSES=$WORK/st-down.responses system upgrade "${st[@]}"; echo "rc=$?")"
   assert_contains "$out" "Cannot SSH to sol@1.2.3.4"
   assert_contains "$out" "rc=1"
+
+  it "a release whose tag carries shell syntax is not put into a command"
+  out="$(STUB_RELEASES="v9';touch $WORK/pwned;'|agave-validator-linux-amd64" STUB_RESPONSES=$WORK/st-hexis.responses system upgrade "${st[@]}" -- --dry-run; echo "rc=$?")"
+  assert_contains "$out" "Ignoring a release whose tag has unexpected characters"
+  assert_contains "$out" "rc=1"
+  assert_file_missing "$WORK/pwned"
+
+  it "--tag is checked the same way"
+  assert_contains "$(STUB_RESPONSES=$WORK/st-hexis.responses system upgrade "${st[@]}" --tag "v1';id;'" --print)" "--tag is not a valid release tag"
+
+  it "a host name with shell syntax is refused before anything connects"
+  assert_contains "$(system --host '1.2.3.4;id' --ssh-key "$WORK/key")" "--host is not a hostname or IP"
+
+  it "a key path with a space reaches the next script as one argument"
+  cp "$WORK/key" "$WORK/my key"
+  assert_contains "$(STUB_RESPONSES=$WORK/st-hexis.responses system upgrade --host 1.2.3.4 --ssh-key "$WORK/my key" --print)" "--ssh-key $WORK/my\\ key"
   unset STUB_RELEASES
+fi
+
+# === values that end up in files and commands on the host ====================
+if should_run "hardening"; then
+group "values checked before they reach the host"
+  source "${ROOT}/lib/hexis.sh"
+  source "${ROOT}/lib/firedancer.sh"
+  hd=("${arise_base[@]}" --ssh-key "$WORK/key" --identity "$WORK/id.json")
+  HT=$(printf '\t')
+
+  it "a metrics string that would run a command from validator.sh is refused"
+  assert_contains "$(arise "${hd[@]}" --metrics-config 'host=h,db=d,u=u,p=x$(id)')" "--metrics-config contains a character that cannot go into validator.sh"
+
+  it "so is an arb metrics string that would close its quotes"
+  assert_contains "$(arise "${hd[@]}" --hexis --hexis-binary "$WORK/binary" --hexis-metrics-config 'host=h,db=d,u=u,p=a"b')" "The arb metrics string contains a character"
+
+  it "an ordinary metrics string is accepted"
+  assert_not_contains "$(arise "${hd[@]}" --metrics-config 'host=https://m.example:8086,db=d,u=u_w,p=Pa-ss_1')" "cannot go into validator.sh"
+
+  it "a Hexis address that is not base58 is refused"
+  assert_contains "$(arise "${hd[@]}" --hexis --hexis-binary "$WORK/binary" --hexis-okx-token-ledger 'x; id')" "--hexis-okx-token-ledger: not a base58 address"
+  assert_contains "$(arise "${hd[@]}" --hexis --hexis-binary "$WORK/binary" --hexis-profit-wallet 'FevX9jr7HQ43anpFpUA88M8eA1Xk22fLVqPG6YEERr4O')" "--hexis-profit-wallet: not a base58 address"
+  assert_contains "$(arise "${hd[@]}" --hexis --hexis-binary "$WORK/binary" --hexis-base-mints 'So11111111111111111111111111111111111111112,nope')" "--hexis-base-mints: not a base58 address: nope"
+
+  it "the Control port cannot be opened to every address"
+  assert_contains "$(arise "${hd[@]}" --hexis --hexis-binary "$WORK/binary" --hexis-control-allow 0.0.0.0/0)" "--hexis-control-allow must be one IP or a CIDR narrower than /0"
+
+  it "a Hexis release tag with a + in it is a valid tag"
+  assert_not_contains "$(arise "${hd[@]}" --hexis --hexis-tag 'v4.2.1+concorde.3')" "is not a valid tag"
+  assert_not_contains "$(arise "${hd[@]}" --client firedancer --fd-tag 'v26.10.8+concorde.4' --concorde-tables "$ROOT/test/fixtures/concorde-tables.toml")" "is not a valid tag"
+
+  it "a tag that starts with a dash is not"
+  assert_contains "$(arise "${hd[@]}" --hexis --hexis-tag '--repo')" "--hexis-tag is not a valid tag"
+  assert_contains "$(arise "${hd[@]}" --hexis --hexis-binary "$WORK/binary" --hexis-setup-tag '-x')" "--hexis-setup-tag is not a valid tag"
+
+  it "ascend.sh checks its paths, names and tags"
+  assert_contains "$(ascend upgrade --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary" --hexis-dir '/home/sol/hexis; id')" "--hexis-dir must be an absolute path without spaces"
+  assert_contains "$(ascend upgrade --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary" --user 'sol;id')" "--user is not a valid user name"
+  assert_contains "$(ascend promote --host 1.2.3.4 --ssh-key "$WORK/key" --release 'v1;id')" "--release is not a valid release name"
+  assert_contains "$(ascend migrate --host 1.2.3.4 --ssh-key "$WORK/key" --hexis-binary "$WORK/binary" --hexis-profit-wallet 'not-a-wallet')" "--hexis-profit-wallet: not a base58 address"
+
+  it "reawaken.sh checks its paths, names and tags"
+  rw() { ( cd "$ROOT" && ./reawaken.sh "$@" ) 2>&1; }
+  assert_contains "$(rw status --host 1.2.3.4 --ssh-key "$WORK/key" --fd-dir '/home/sol/fd $(id)')" "--fd-dir must be an absolute path without spaces"
+  assert_contains "$(rw status --host 1.2.3.4 --ssh-key "$WORK/key" --agave-service 'sol;id')" "--agave-service is not a valid unit name"
+  assert_contains "$(rw stage --host 1.2.3.4 --ssh-key "$WORK/key" --fd-tag 'v1;id')" "--fd-tag is not a valid tag"
+  assert_contains "$(rw cutover --host 1.2.3.4 --ssh-key "$WORK/key" --min-idle-time soon)" "--min-idle-time must be a number of minutes"
+
+  it "a value read from validator.sh that carries shell syntax is dropped, with a warning"
+  vsh="exec agave-validator \\
+    --ledger /x\$(touch${HT}/tmp/pwned) \\
+    --identity \"/home/sol/identity.json\" \\
+    --block-engine-url https://ny.mainnet.block-engine.jito.wtf"
+  out="$(fd_vsh_flag "$vsh" "--ledger" 2>&1)"
+  assert_contains "$out" "Ignoring --ledger in validator.sh: it is not a plain value"
+  assert_not_contains "$out" "touch"
+
+  it "a quoted path loses its quotes and a URL comes through whole"
+  assert_eq "$(fd_vsh_flag "$vsh" "--identity")" "/home/sol/identity.json"
+  assert_eq "$(fd_vsh_flag "$vsh" "--block-engine-url")" "https://ny.mainnet.block-engine.jito.wtf"
+
+  it "the same goes for a value read from a TOML file on the host"
+  out="$(fd_toml_get 'base = "/mnt/ledger/fd$(id)"' base 2>&1)"
+  assert_contains "$out" "it is not a plain value"
+  assert_eq "$(fd_toml_get 'base = "/mnt/ledger/firedancer"' base)" "/mnt/ledger/firedancer"
+
+  it "root does not change the owner of a path inside the validator user's own directories"
+  out="$(arise "${hd[@]}")"
+  assert_contains "$out" 'runuser -u "$SOL_USER" -- mkdir -p "$dir"'
+  assert_contains "$out" "ExecStart=/usr/local/sbin/sol-fix-mounts"
+  assert_not_contains "$out" "ExecStart=/bin/chown"
+
+  it "the boot-time ownership fix leaves alone what the validator user could have swapped"
+  # Run the generated helper against a scratch tree, with stat and chown stood
+  # in for: the mount point's parent is root's, everything under it is sol's.
+  fx="$WORK/fixmounts"; mkdir -p "$fx/bin" "$fx/mnt/ledger/snapshots" "$fx/home/logs"
+  printf '%s\n' '#!/bin/sh' 'case "$3" in */mnt) echo root ;; *) echo sol ;; esac' > "$fx/bin/stat"
+  printf '%s\n' '#!/bin/sh' 'shift; echo "$@" >> "'"$fx"'/chowned"' > "$fx/bin/chown"
+  chmod +x "$fx/bin/stat" "$fx/bin/chown"
+  sed -n '/^cat > \/usr\/local\/sbin\/sol-fix-mounts <<FIXEOF$/,/^FIXEOF$/p' "$ROOT/arise.sh" | sed '1d;$d' > "$fx/template"
+  # shellcheck disable=SC2034  # read by the eval'd template below
+  ( LEDGER_PATH="$fx/mnt/ledger" SNAPSHOTS_PATH="$fx/mnt/ledger/snapshots" ACCOUNTS_PATH="$fx/mnt/ledger" SOL_HOME="$fx/home" SOL_USER=sol
+    eval "cat <<FIXEOF
+$(cat "$fx/template")
+FIXEOF" ) > "$fx/sol-fix-mounts"
+  ( PATH="$fx/bin:$PATH" sh "$fx/sol-fix-mounts" ); rc=$?
+  assert_eq "$rc" "0"
+  assert_contains "$(cat "$fx/chowned")" "$fx/mnt/ledger"
+  assert_not_contains "$(cat "$fx/chowned")" "snapshots"
+  assert_not_contains "$(cat "$fx/chowned")" "logs"
+
+  it "and still stops the validator from starting when a data directory is missing"
+  rmdir "$fx/home/logs"
+  ( PATH="$fx/bin:$PATH" sh "$fx/sol-fix-mounts" ) >/dev/null 2>&1; rc=$?
+  assert_eq "$rc" "1"
 fi
 
 # === arise.sh on a host that already runs a validator =======================

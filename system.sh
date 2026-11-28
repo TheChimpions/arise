@@ -102,14 +102,33 @@ done
 [[ ! -f "$SSH_KEY" ]] && { log_error "SSH key not found: $SSH_KEY"; exit 1; }
 
 SSH_HOST="${SSH_HOST##*@}"
+# These go into commands run on the host and into the command this script
+# hands over to, so each is checked before it is used anywhere.
+[[ "$SSH_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*$ ]] || { log_error "--host is not a hostname or IP: $SSH_HOST"; exit 1; }
+for name_check in "--user|$SOL_USER" "--admin-user|$ADMIN_USER" "--agave-service|$AGAVE_SERVICE"; do
+  [[ "${name_check#*|}" =~ ^[A-Za-z_][A-Za-z0-9_.@-]{0,63}$ ]] || { log_error "${name_check%%|*} is not a valid name: ${name_check#*|}"; exit 1; }
+done
+[[ -z "$TAG" || "$TAG" =~ $RE_RELEASE_TAG ]] || { log_error "--tag is not a valid release tag: $TAG"; exit 1; }
 SOL_HOST="${SOL_USER}@${SSH_HOST}"
 VALIDATOR_SH="/home/${SOL_USER}/validator.sh"
 FD_DIR="/home/${SOL_USER}/firedancer"
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $SSH_KEY"
+# Key login only, as in lib/remote.sh: a failed key never falls back to a
+# password prompt.
+SSH_OPTS=(
+  -o StrictHostKeyChecking=accept-new
+  -o ConnectTimeout=10
+  -o IdentitiesOnly=yes
+  -o BatchMode=yes
+  -o PasswordAuthentication=no
+  -o KbdInteractiveAuthentication=no
+  -i "$SSH_KEY"
+)
 # Builds the arguments every printed command carries. Called again when the
 # admin user turns out to be someone other than the default.
 set_host_args() {
-  HOST_ARGS="--host ${SSH_HOST} --ssh-key ${SSH_KEY}"
+  # %q: the key path is the one value here that is not pattern-checked, and
+  # the command built from this is handed to eval at the end.
+  HOST_ARGS="--host ${SSH_HOST} --ssh-key $(printf '%q' "$SSH_KEY")"
   [[ "$SOL_USER" != "sol" ]] && HOST_ARGS+=" --user ${SOL_USER}"
   [[ "$ADMIN_USER" != "monarch" ]] && HOST_ARGS+=" --admin-user ${ADMIN_USER}"
   # What arise.sh needs to change the client or version of a host it set up
@@ -118,8 +137,7 @@ set_host_args() {
 }
 set_host_args
 
-# shellcheck disable=SC2086
-probe() { ssh -n $SSH_OPTS "$SOL_HOST" "$@" 2>/dev/null || true; }
+probe() { ssh -n "${SSH_OPTS[@]}" "$SOL_HOST" "$@" 2>/dev/null || true; }
 fact() { sed -n "s/^$1=//p" <<<"$FACTS" | head -1; }
 
 # ---------------------------------------------------------------------------
@@ -144,7 +162,13 @@ OTHER_FD_KIND=""
 if [[ "$STATE" != "unreachable" ]]; then
   OTHER_FD=$(probe ": other-firedancer
 ps -eo args 2>/dev/null | awk '\$1 ~ /(^|\\/)(firedancer|fdctl)\$/ && \$2 == \"run\" { for (i = 3; i < NF; i++) if (\$i == \"--config\") { print \$(i + 1); exit } }'")
-  if [[ -n "$OTHER_FD" && "$OTHER_FD" != "${FD_DIR}/config.toml" ]]; then
+  if [[ -n "$OTHER_FD" && ! "$OTHER_FD" =~ ^/[A-Za-z0-9._/+-]+$ ]]; then
+    # The path is read from a process's command line, which any user on the
+    # host can write. One that is not a plain path is reported, never used.
+    OTHER_FD="(a config path with unusual characters)"
+    OTHER_FD_KIND="plain"
+    STATE="other-firedancer"
+  elif [[ -n "$OTHER_FD" && "$OTHER_FD" != "${FD_DIR}/config.toml" ]]; then
     OTHER_FD_KIND=$(probe ": other-firedancer-kind
 if grep -q '^\[arb\]' '${OTHER_FD}' 2>/dev/null; then echo hexis
 elif awk '/^[[:space:]]*\[/ { t = \$0 } t ~ /tiles\.bundle/ && /^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true/ { f = 1 } END { exit !f }' '${OTHER_FD}' 2>/dev/null; then echo jito
@@ -194,8 +218,7 @@ fi
 # the first that gets in and holds sudo goes into the commands printed below.
 # An --admin-user given on the command line is taken as is.
 # ---------------------------------------------------------------------------
-# shellcheck disable=SC2086
-admin_login() { ssh -n $SSH_OPTS -o BatchMode=yes "$1@${SSH_HOST}" "$2" 2>/dev/null; }
+admin_login() { ssh -n "${SSH_OPTS[@]}" "$1@${SSH_HOST}" "$2" 2>/dev/null; }
 
 ADMIN_NOTE=""
 ADMIN_MISSING=false
@@ -281,6 +304,14 @@ elif command -v gh &>/dev/null && gh auth status &>/dev/null; then
   RELEASES=$(hexis_release_lines 2>/dev/null || true)
   NEW_AGAVE=$(hexis_latest_tag "$RELEASES" "$AGAVE_ASSET" || true)
   NEW_FD=$(hexis_latest_tag "$RELEASES" "$FD_ASSET_GENERIC" || true)
+  # A tag name is whatever the publisher typed, and it ends up in the command
+  # run below. One that is not a plain tag is treated as not found.
+  for tag_var in NEW_AGAVE NEW_FD; do
+    if [[ -n "${!tag_var}" && ! "${!tag_var}" =~ $RE_RELEASE_TAG ]]; then
+      log_warn "Ignoring a release whose tag has unexpected characters — pass --tag to choose one"
+      printf -v "$tag_var" '%s' ""
+    fi
+  done
 fi
 
 # ---------------------------------------------------------------------------
