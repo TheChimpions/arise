@@ -29,8 +29,13 @@ SUDO_MODE=""
 # Password and keyboard-interactive auth are refused client-side, so a failed
 # key login can never fall back to typing a password into the wrong host.
 remote_init() {
+  local host_key_check="accept-new"
+  if [[ -n "${HOST_KEY_FP:-}" ]]; then
+    pin_host_key "$SSH_HOST" "$HOST_KEY_FP" || exit 1
+    host_key_check="yes"
+  fi
   SSH_OPTS=(
-    -o StrictHostKeyChecking=accept-new
+    -o "StrictHostKeyChecking=${host_key_check}"
     -o ConnectTimeout=10
     -o IdentitiesOnly=yes
     -o PasswordAuthentication=no
@@ -42,6 +47,66 @@ remote_init() {
   # Copy-pasteable form of the connection these scripts make themselves.
   # IdentitiesOnly stops ssh offering every agent key and tripping MaxAuthTries.
   SSH_CMD="ssh -o IdentitiesOnly=yes -i ${SSH_KEY}"
+  if [[ -n "${KNOWN_HOSTS_FILE:-}" ]]; then
+    SSH_OPTS+=(-o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}")
+  fi
+}
+
+# pin_host_key <host> <SHA256:fingerprint> — make sure the key this host is
+# known by is the one with that fingerprint, before anything connects to it.
+#
+# Without this the first connection takes whatever key it is shown
+# (accept-new), and arise.sh then sends the admin password and the validator
+# keypairs over it. The fingerprint comes from somewhere the network path to
+# the host cannot change: the provider's console, or the server's own
+#   ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+#
+# A key already in known_hosts with that fingerprint is enough. Otherwise the
+# host is asked for its keys, and the one that matches is added. The answer to
+# that question is not trusted: a key is only added when it has the fingerprint.
+# Returns 1, having connected to nothing else, when no key matches.
+# KNOWN_HOSTS_FILE names a file other than ~/.ssh/known_hosts.
+# Returns 0 if <host> already has a key in known_hosts
+host_key_known() {
+  local file="${KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}"
+  [[ -f "$file" ]] && ssh-keygen -F "$1" -f "$file" >/dev/null 2>&1
+}
+
+RE_HOST_KEY_FP='^SHA256:[A-Za-z0-9+/]{43}$'
+pin_host_key() {
+  local host="$1" want="${2%=}" file="${KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}"
+  local line fp seen=""
+  if [[ ! "$want" =~ $RE_HOST_KEY_FP ]]; then
+    log_error "--host-key-fingerprint must look like SHA256:<43 characters>, as 'ssh-keygen -lf' prints it: $2"
+    return 1
+  fi
+  if [[ -f "$file" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      fp=$(printf '%s\n' "$line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')
+      [[ "$fp" == "$want" ]] && return 0
+    done < <(ssh-keygen -F "$host" -f "$file" 2>/dev/null)
+  fi
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    fp=$(printf '%s\n' "$line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')
+    [[ -z "$fp" ]] && continue
+    if [[ "$fp" == "$want" ]]; then
+      mkdir -p "$(dirname "$file")"
+      printf '%s\n' "$line" >> "$file"
+      log_info "Host key of ${host} matches ${want} — added to ${file}"
+      return 0
+    fi
+    seen+="${seen:+, }${fp}"
+  done < <(ssh-keyscan -T 10 "$host" 2>/dev/null)
+  if [[ -z "$seen" ]]; then
+    log_error "Could not read a host key from ${host} to compare with ${want} — not connecting"
+  else
+    log_error "${host} does not have the host key ${want} — not connecting."
+    log_error "It offers: ${seen}"
+    log_error "Either the fingerprint is another server's, or something sits between you and this one."
+  fi
+  return 1
 }
 
 # Emit shell assignments for the named local variables, safely quoted, so a

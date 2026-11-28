@@ -139,6 +139,70 @@ print("1"*(len(b)-len(b.lstrip(bytes(1))))+s)'
 
 # fd_key_label <key info text> <path> -> "<path> -> <target>  <pubkey>", with
 # whatever of the two the host could tell us.
+# host_health_cmd <rpc-port> <identity-pubkey> <vote-pubkey> — shell lines that
+# ask the validator's own RPC on the host how it is doing, and print the answer
+# as key=value lines: rpc, behind, epoch, epoch_pct, leader_total, leader_left,
+# leader_in (slots until this identity's next leader slot), vote
+# (current|delinquent|absent), vote_lag, stake_sol, vote_here (whether the vote
+# account votes through this identity). Either pubkey may be empty; what cannot
+# be read is left out. Everything asked is the node's own view, nothing leaves
+# the host, and python3 does the JSON so the host needs no jq.
+host_health_cmd() {
+  printf ": host-health\nport='%s'; identity='%s'; vote='%s'\n" "$1" "$2" "$3"
+  cat <<'EOF'
+rpc() {
+  curl -s -m 4 -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" "http://127.0.0.1:${port}" 2>/dev/null | tr -d '\n'
+  echo
+}
+{
+  rpc getHealth '[]'
+  rpc getEpochInfo '[]'
+  if [ -n "$identity" ]; then rpc getLeaderSchedule "[null,{\"identity\":\"$identity\"}]"; else echo; fi
+  if [ -n "$vote" ]; then rpc getVoteAccounts "[{\"votePubkey\":\"$vote\",\"keepUnstakedDelinquents\":true}]"; else echo; fi
+} | python3 -c 'import json,sys
+L=sys.stdin.read().split("\n")+["","","",""]
+def j(i):
+    try:
+        d=json.loads(L[i])
+        return d if isinstance(d,dict) else None
+    except Exception:
+        return None
+h,e,s,v=j(0),j(1),j(2),j(3)
+if h is None:
+    print("rpc=down"); sys.exit(0)
+print("rpc=up")
+if h.get("result")=="ok":
+    print("behind=0")
+else:
+    n=((h.get("error") or {}).get("data") or {}).get("numSlotsBehind")
+    print("behind=%d"%n if isinstance(n,int) else "behind=unknown")
+r=(e or {}).get("result") or {}
+idx=r.get("slotIndex"); tot=r.get("slotsInEpoch"); slot=r.get("absoluteSlot")
+if isinstance(idx,int) and isinstance(tot,int) and tot>0:
+    if isinstance(r.get("epoch"),int): print("epoch=%d"%r["epoch"])
+    print("epoch_pct=%d"%(100*idx//tot))
+    sched=(s or {}).get("result")
+    if isinstance(sched,dict):
+        mine=[i for l in sched.values() if isinstance(l,list) for i in l if isinstance(i,int)]
+        ahead=[i for i in mine if i>=idx]
+        print("leader_total=%d"%len(mine)); print("leader_left=%d"%len(ahead))
+        if ahead: print("leader_in=%d"%(min(ahead)-idx))
+vr=(v or {}).get("result")
+if isinstance(vr,dict):
+    found=False
+    for state in ("current","delinquent"):
+        for a in vr.get(state) or []:
+            if found or not isinstance(a,dict): continue
+            found=True
+            print("vote=%s"%state)
+            if isinstance(a.get("lastVote"),int) and isinstance(slot,int): print("vote_lag=%d"%max(0,slot-a["lastVote"]))
+            if isinstance(a.get("activatedStake"),int): print("stake_sol=%d"%(a["activatedStake"]//10**9))
+            if sys.argv[1] and a.get("nodePubkey"): print("vote_here=%s"%("yes" if a["nodePubkey"]==sys.argv[1] else "no"))
+    if not found: print("vote=absent")' "$identity"
+EOF
+}
+
 fd_key_label() {
   local line target pubkey out="$2"
   line=$(grep -m1 -F "$2|" <<<"$1" || true)

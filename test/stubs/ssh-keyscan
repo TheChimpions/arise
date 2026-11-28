@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Stub ssh-keyscan: prints the keys in $STUB_KEYSCAN, or nothing.
+[[ -n "${STUB_LOG:-}" ]] && printf 'ssh-keyscan %s\n' "$*" >> "$STUB_LOG"
+[[ -n "${STUB_KEYSCAN:-}" && -f "$STUB_KEYSCAN" ]] && cat "$STUB_KEYSCAN"
+exit 0

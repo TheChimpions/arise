@@ -132,6 +132,7 @@ claims depend on.
 | `--root-user` | Existing user with root or sudo access (e.g. `root`). First run only — used to create the admin user, never again. |
 | `--admin-user` | Name of the admin user that holds sudo (default: `monarch`) |
 | `--keep-root-login` | Keep key-based root SSH login enabled (default: disabled) |
+| `--host-key-fingerprint` | `SHA256:...` fingerprint of the server's SSH host key, from your provider's console. The host must have that key or nothing connects. Taken by all four scripts |
 
 **Client:**
 
@@ -227,7 +228,7 @@ Agave 4.3 renamed the validator's XDP flags (`--experimental-retransmit-xdp-cpu-
 - **A Firedancer host is different: there the `sol` login is as good as root.** Firedancer starts as root, and `firedancer.service` runs the binary and the config in `/home/sol/firedancer`, which `sol` owns. Anyone who can log in as `sol` can replace either and has root at the next start. On such a host, guard `sol`'s SSH key the way you guard the admin's. This holds from the first `reawaken.sh stage` on.
 - **XDP gives the validator process network capabilities.** With XDP on (the default) the process holds `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_BPF` and `CAP_PERFMON`, the four XDP needs and no others. `CAP_NET_ADMIN` is enough to change firewall rules, so the firewall does not contain a `sol` account that has been taken over. `--no-xdp` leaves them out.
 - **SSH is key-only, and it is checked.** The settings go in `/etc/ssh/sshd_config.d/00-arise.conf` so they win over cloud-init's defaults. The script then reads sshd's effective configuration and rolls back and stops if anything overrides them. A `Match` block that only applies to some users or addresses is not seen by that check.
-- **The first connection trusts the host key it is shown.** Check the fingerprint against your provider's console, or put the key in `known_hosts` before the first run. A key that changes later is refused.
+- **The first connection trusts the host key it is shown, unless you give its fingerprint.** With `--host-key-fingerprint SHA256:...` (from your provider's console, or `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server) the host's key is compared before anything connects, added to `known_hosts` when it matches, and the run stops when it does not. Without the flag `arise.sh` warns when the host is not in `known_hosts` yet. A key that changes later is refused either way.
 - **The firewall opens only SSH and the validator's port range** (8000–8026, the minimum width Agave 4 accepts), plus the Hexis Control port to one address with `--hexis`. RPC is bound to `127.0.0.1`, kept out of gossip with `--private-rpc`, and not opened. Rules that were already in `ufw` are left as they are, apart from the old 8000–10000 one.
 - **No secret is a file or an argument on the way to the server.** Scripts and the sudo password go over SSH stdin, no password appears in a process list on the server, and keypairs are created mode 600 from the first byte. This is `lib/remote.sh`, shared by `arise.sh`, `ascend.sh` and `reawaken.sh`. On your own machine, a Hexis credential given as a flag is in your shell history and process list (use `hexis.env`), and `--dry-run` prints the files it would write, credentials included.
 - **Nothing GitHub-related goes on the server.** Public clients are cloned over HTTPS. Private releases (Hexis, Firedancer) are downloaded on your machine with `gh` and streamed up after their SHA-256 matches the release's checksum file. A release with no checksum for the file is refused.
@@ -335,12 +336,40 @@ It shows the client and release the host runs, whether Firedancer is installed, 
 or running, the newest Hexis Agave and Firedancer releases, and the command for each
 move that is possible from there.
 
+**How the validator is doing.** The report asks the validator's own RPC on the host
+(`127.0.0.1`, the `--rpc-port` in `validator.sh`) and shows:
+
+- which key file `identity.json` points at, its pubkey, and whether the vote account
+  votes through it, which is what tells the voting node from a spare
+- whether the node is caught up or how many slots behind, and how long the service has run
+- the vote account: voting or delinquent, slots since its last vote, active stake
+- time to this identity's next leader slot and how many are left this epoch
+- how full the ledger, accounts and root disks are
+- clock sync, a pending reboot, and whether perch is running
+
+Sync, vote and leader lines are the node's own view: a node that is far behind is also
+behind on who is delinquent. A line whose value could not be read is left out. On a
+Firedancer host nothing answers on the RPC port unless it was staged with
+`--enable-rpc`, and the report says so; the identity, disk and host lines are still shown.
+
 **Admin user.** The other scripts do their root work through an admin user, `monarch` by
 default. On a host where that login does not take your key (one set up before the admin
 user existed, say), `system.sh` tries the host's other login accounts with the same key
 and uses the first that gets in and holds sudo. It says which one it found, and every
 command it prints or runs carries `--admin-user <name>`. An `--admin-user` you pass is
 used as given.
+
+**The flags the host was set up with.** `arise.sh` ends each run by writing its flags to
+`/home/sol/.arise-flags` (mode 600), and `system.sh` reads them back, so the `arise.sh`
+command it prints for a client or version change is the real one instead of one with
+placeholders. Never written: the Hexis credentials, `--metrics-config`, paths to files on
+your machine (`--identity`, `--ssh-key`, `--hexis-binary`, `--fd-binary`, `--hexis-signer`,
+`--hexis-config`, `--concorde-tables`), `--host` and the users, and what only applied to
+one run (`--restart`, `--dry-run`, `--confirm-format`, the restart window). Add those back
+yourself. A release picked from the list and a commission typed at the prompt are
+recorded as if they had been flags. A host set up before this has no such file until
+`arise.sh` runs on it again. The validator user owns the file, so `system.sh` takes only
+lines that are a plain flag and value, and prints the command without running it.
 
 **Host checks.** The report also looks at a few things that are wrong whatever client
 runs, each with the command that fixes it: a `/` not owned by root, the validator user
@@ -390,7 +419,8 @@ back to `cutover`, which then only does those steps.
 
 `arise.sh` describes what a host should be, so changing client is the same command
 with a different `--client`. Run it with the flags the host was set up with, the new
-client, and `--restart`:
+client, and `--restart`. `./system.sh --host <ip> --ssh-key <key>` prints that command
+with the flags recorded on the host:
 
 ```bash
 # Jito -> Agave

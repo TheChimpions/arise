@@ -23,6 +23,82 @@ NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+# need_arg "$@" — in a flag loop: the flag at $1 takes a value, and there is one.
+# Without it a flag given last dies on "$2: unbound variable" under set -u.
+need_arg() { [[ $# -ge 2 ]] || { log_error "$1 requires a value"; usage; }; }
+
+# ---------------------------------------------------------------------------
+# The flags a host was set up with
+#
+# arise.sh describes what a host should be, so changing its client or version
+# means running it again with the flags it was given before. It writes them to
+# ARISE_FLAGS_NAME in the validator user's home at the end of a run, one
+# "--flag [value]" per line, and system.sh reads them back to print the command.
+#
+# Left out, always: credentials, paths to files on the operator's machine, how
+# the host is reached (system.sh is told that itself), and what only applied to
+# the one run. The validator user owns the file and can change it, so what is
+# read back is checked line by line and is only ever printed, never run.
+# ---------------------------------------------------------------------------
+ARISE_FLAGS_NAME=".arise-flags"
+RE_ARISE_FLAG='^--[a-z][a-z0-9-]*$'
+RE_ARISE_FLAG_VALUE='^[A-Za-z0-9._:/@=,+-]+$'
+ARISE_FLAGS_NOT_KEPT=" --host --ssh-key --host-key-fingerprint --root-user --admin-user --identity \
+--restart --dry-run --confirm-format --min-idle-time --max-delinquent-stake --github-ssh-key \
+--metrics-config --hexis-jup-key --hexis-metrics-config \
+--hexis-binary --hexis-setup-binary --hexis-config --hexis-signer --fd-binary --concorde-tables "
+
+# arise_flags_record <arise.sh arguments...> — the lines of the flags file for
+# those arguments. A flag given twice is kept once, with its last value, which
+# is how arise.sh reads it; so a value settled during the run (a version picked
+# from the list, a commission typed at the prompt) is recorded by appending it.
+arise_flags_record() {
+  local flag value has_value
+  printf '# recorded %s\n' "$(date '+%Y-%m-%d %H:%M %Z')"
+  printf '%s\n' "# The flags of the last arise.sh run on this host. Not kept: credentials, paths to" \
+                "# files on the machine it was run from, and what only applied to that run."
+  while [[ $# -gt 0 ]]; do
+    flag="$1"; shift
+    value=""; has_value=false
+    if [[ $# -gt 0 && "$1" != --* ]]; then value="$1"; has_value=true; shift; fi
+    case "$flag" in
+      --jito-version) flag="--client-version" ;;
+      --jito-repo)    flag="--client-repo" ;;
+      --build-jito)   flag="--build-client" ;;
+    esac
+    [[ "$flag" =~ $RE_ARISE_FLAG ]] || continue
+    [[ "$ARISE_FLAGS_NOT_KEPT" == *" $flag "* ]] && continue
+    if $has_value; then
+      [[ "$value" =~ $RE_ARISE_FLAG_VALUE ]] || continue
+      printf '%s %s\n' "$flag" "$value"
+    else
+      printf '%s\n' "$flag"
+    fi
+  done | awk '{ f = $1; if (!(f in last)) order[++n] = f; last[f] = $0 } END { for (i = 1; i <= n; i++) print last[order[i]] }'
+}
+
+# arise_flags_command <content of the flags file> — the flags on one line, for a
+# printed command. A line that is not a plain "--flag [value]", or that names a
+# flag which is never kept, is dropped.
+arise_flags_command() {
+  local line flag out=""
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    flag="${line%% *}"
+    [[ "$flag" =~ $RE_ARISE_FLAG ]] || continue
+    [[ "$ARISE_FLAGS_NOT_KEPT" == *" $flag "* ]] && continue
+    if [[ "$line" == *" "* ]]; then
+      [[ "${line#* }" =~ $RE_ARISE_FLAG_VALUE ]] || continue
+    fi
+    out+="${out:+ }${line}"
+  done <<<"$1"
+  printf '%s' "$out"
+}
+
+# arise_flags_date <content of the flags file> — when it was written, or nothing
+arise_flags_date() {
+  sed -n 's/^# recorded \([0-9A-Za-z: +-]\{1,40\}\)$/\1/p' <<<"$1" | head -1
+}
 
 # ---------------------------------------------------------------------------
 # Hexis defaults

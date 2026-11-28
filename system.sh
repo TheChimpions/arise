@@ -22,7 +22,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-for lib in hexis.sh firedancer.sh; do
+for lib in hexis.sh firedancer.sh remote.sh; do
   if [[ ! -f "${ROOT}/lib/${lib}" ]]; then
     echo "Missing ${ROOT}/lib/${lib} — run this from a checkout, not as a lone copied file" >&2
     exit 1
@@ -32,6 +32,8 @@ done
 source "${ROOT}/lib/hexis.sh"
 # shellcheck source=lib/firedancer.sh
 source "${ROOT}/lib/firedancer.sh"
+# shellcheck source=lib/remote.sh
+source "${ROOT}/lib/remote.sh"
 
 AGAVE_ASSET="agave-validator-linux-amd64"
 FD_ASSET_GENERIC="firedancer-linux-amd64"
@@ -45,6 +47,7 @@ ADMIN_USER_SET=false         # true when --admin-user was given: then it is not 
 AGAVE_SERVICE="sol"
 TAG=""
 PRINT_ONLY=false
+HOST_KEY_FP=""
 PASS=()
 
 usage() {
@@ -66,6 +69,9 @@ new --client / --client-version, and --restart. It needs your keys, so it is not
 run from here.
 
 Options:
+  --host-key-fingerprint <fp>
+                       SHA256:... fingerprint of the server's SSH host key. The host
+                       must have that key or nothing connects
   --tag <tag>          Release to use instead of the newest
   --user <name>        Validator user (default: ${SOL_USER})
   --admin-user <name>  Admin user that holds sudo (default: ${ADMIN_USER})
@@ -75,7 +81,7 @@ Options:
 
 Everything after '--' goes to the script that is run, e.g. '-- --dry-run' or '-- --now'.
 EOF
-  exit 1
+  exit "${1:-1}"
 }
 
 case "${1:-}" in
@@ -84,15 +90,16 @@ esac
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --host)          SSH_HOST="$2"; shift 2 ;;
-    --ssh-key)       SSH_KEY="$2"; shift 2 ;;
-    --user)          SOL_USER="$2"; shift 2 ;;
-    --admin-user)    ADMIN_USER="$2"; ADMIN_USER_SET=true; shift 2 ;;
-    --agave-service) AGAVE_SERVICE="$2"; shift 2 ;;
-    --tag)           TAG="$2"; shift 2 ;;
+    --host)          need_arg "$@"; SSH_HOST="$2"; shift 2 ;;
+    --ssh-key)       need_arg "$@"; SSH_KEY="$2"; shift 2 ;;
+    --host-key-fingerprint) need_arg "$@"; HOST_KEY_FP="$2"; shift 2 ;;
+    --user)          need_arg "$@"; SOL_USER="$2"; shift 2 ;;
+    --admin-user)    need_arg "$@"; ADMIN_USER="$2"; ADMIN_USER_SET=true; shift 2 ;;
+    --agave-service) need_arg "$@"; AGAVE_SERVICE="$2"; shift 2 ;;
+    --tag)           need_arg "$@"; TAG="$2"; shift 2 ;;
     --print)         PRINT_ONLY=true; shift ;;
     --)              shift; PASS=("$@"); break ;;
-    -h|--help)       usage ;;
+    -h|--help)       usage 0 ;;
     *) log_error "Unknown option or goal: $1"; usage ;;
   esac
 done
@@ -112,10 +119,17 @@ done
 SOL_HOST="${SOL_USER}@${SSH_HOST}"
 VALIDATOR_SH="/home/${SOL_USER}/validator.sh"
 FD_DIR="/home/${SOL_USER}/firedancer"
+# With a fingerprint the host key is settled before the first connection. The
+# script handed over to then finds it in known_hosts.
+HOST_KEY_CHECK="accept-new"
+if [[ -n "$HOST_KEY_FP" ]]; then
+  pin_host_key "$SSH_HOST" "$HOST_KEY_FP" || exit 1
+  HOST_KEY_CHECK="yes"
+fi
 # Key login only, as in lib/remote.sh: a failed key never falls back to a
 # password prompt.
 SSH_OPTS=(
-  -o StrictHostKeyChecking=accept-new
+  -o "StrictHostKeyChecking=${HOST_KEY_CHECK}"
   -o ConnectTimeout=10
   -o IdentitiesOnly=yes
   -o BatchMode=yes
@@ -123,6 +137,7 @@ SSH_OPTS=(
   -o KbdInteractiveAuthentication=no
   -i "$SSH_KEY"
 )
+[[ -n "${KNOWN_HOSTS_FILE:-}" ]] && SSH_OPTS+=(-o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}")
 # Builds the arguments every printed command carries. Called again when the
 # admin user turns out to be someone other than the default.
 set_host_args() {
@@ -131,8 +146,13 @@ set_host_args() {
   HOST_ARGS="--host ${SSH_HOST} --ssh-key $(printf '%q' "$SSH_KEY")"
   [[ "$SOL_USER" != "sol" ]] && HOST_ARGS+=" --user ${SOL_USER}"
   [[ "$ADMIN_USER" != "monarch" ]] && HOST_ARGS+=" --admin-user ${ADMIN_USER}"
-  # What arise.sh needs to change the client or version of a host it set up
-  ARISE_HINT="./arise.sh ${HOST_ARGS} --identity <staked_identity.json> --vote-account <pubkey> --network <net> --client <jito|agave> --client-version <tag> --restart"
+  # What arise.sh needs to change the client or version of a host it set up:
+  # the flags it recorded there on its last run, or the ones to fill in.
+  if [[ -n "${ARISE_RECORDED:-}" ]]; then
+    ARISE_HINT="./arise.sh ${HOST_ARGS} --identity <staked_identity.json> ${ARISE_RECORDED} --restart"
+  else
+    ARISE_HINT="./arise.sh ${HOST_ARGS} --identity <staked_identity.json> --vote-account <pubkey> --network <net> --client <jito|agave> --client-version <tag> --restart"
+  fi
   return 0
 }
 set_host_args
@@ -152,6 +172,18 @@ if ! probe "echo ok" | grep -q ok; then
 else
   VSH=$(probe "cat ${VALIDATOR_SH}")
   [[ -z "$VSH" ]] && STATE="fresh"
+fi
+
+# The flags arise.sh recorded on its last run here. The validator user can
+# write that file, so only lines that are a plain flag and value are taken,
+# and they are printed, never run.
+ARISE_RECORDED=""
+ARISE_RECORDED_ON=""
+if [[ -z "$STATE" ]]; then
+  ARISE_FLAGS=$(probe "head -n 100 /home/${SOL_USER}/${ARISE_FLAGS_NAME}")
+  ARISE_RECORDED=$(arise_flags_command "$ARISE_FLAGS")
+  ARISE_RECORDED_ON=$(arise_flags_date "$ARISE_FLAGS")
+  set_host_args
 fi
 
 # A Firedancer that is running from somewhere other than ${FD_DIR}: one these
@@ -179,6 +211,17 @@ else echo plain; fi")
   fi
 fi
 
+# Paths and names read from validator.sh go into commands run on the host, so
+# each is checked first; one that is not plain is not used.
+RE_HOST_PATH='^/[A-Za-z0-9._/+-]+$'
+RE_PUBKEY='^[1-9A-HJ-NP-Za-km-z]{32,44}$'
+vsh_path() { local v; v=$(fd_vsh_flag "$VSH" "$1"); [[ "$v" =~ $RE_HOST_PATH ]] && printf '%s' "$v"; return 0; }
+LEDGER_PATH=$(vsh_path "--ledger")
+ACCOUNTS_PATH=$(vsh_path "--accounts")
+IDENTITY_PATH=$(vsh_path "--identity")
+RPC_PORT=$(fd_vsh_flag "$VSH" "--rpc-port")
+[[ "$RPC_PORT" =~ ^[0-9]{1,5}$ ]] || RPC_PORT="8899"
+
 FACTS=""
 CLUSTER_GENESIS=$(fd_vsh_flag "$VSH" "--expected-genesis-hash")
 NOT_MAINNET=false
@@ -202,6 +245,14 @@ echo \"chk_groups=\$(id -nG 2>/dev/null)\"
 echo \"chk_sudo=\$(sudo -k -n true 2>/dev/null && echo nopass || echo no)\"
 echo \"chk_ufw=\$(grep -qs '^ENABLED=yes' /etc/ufw/ufw.conf && echo active || echo inactive)\"
 echo \"chk_keys=\$(find /home/${SOL_USER} -maxdepth 1 -type f -name '*.json' -perm /077 2>/dev/null | tr '\\n' ' ')\"
+echo \"agave_since=\$(t=\$(systemctl show -p ActiveEnterTimestamp --value ${AGAVE_SERVICE} 2>/dev/null); [ -n \"\$t\" ] && echo \$(( \$(date +%s) - \$(date -d \"\$t\" +%s) )))\"
+echo \"fd_since=\$(t=\$(systemctl show -p ActiveEnterTimestamp --value firedancer 2>/dev/null); [ -n \"\$t\" ] && echo \$(( \$(date +%s) - \$(date -d \"\$t\" +%s) )))\"
+echo \"disk_ledger=\$(df -Ph ${LEDGER_PATH:-/nonexistent} 2>/dev/null | awk 'NR==2 { print \$5 \" \" \$4 }')\"
+echo \"disk_accounts=\$(df -Ph ${ACCOUNTS_PATH:-/nonexistent} 2>/dev/null | awk 'NR==2 { print \$5 \" \" \$4 }')\"
+echo \"disk_root=\$(df -Ph / 2>/dev/null | awk 'NR==2 { print \$5 \" \" \$4 }')\"
+echo \"clock_synced=\$(timedatectl show -p NTPSynchronized --value 2>/dev/null)\"
+echo \"reboot_required=\$(test -f /var/run/reboot-required && echo yes || echo no)\"
+echo \"perch_active=\$(systemctl is-active perch 2>/dev/null)\"
 echo \"agave_release=\$(readlink ${HEXIS_DIR:-/nonexistent}/agave-validator 2>/dev/null | sed -e 's|^releases/||' -e 's|/agave-validator\$||')\"")
   if [[ "$(fact fd_enabled)" == "enabled" ]]; then
     STATE="firedancer"
@@ -209,6 +260,118 @@ echo \"agave_release=\$(readlink ${HEXIS_DIR:-/nonexistent}/agave-validator 2>/d
     STATE="$SOURCE"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# How the validator is doing, asked of its own RPC on the host. Read-only, and
+# everything read back is checked before it is shown.
+# ---------------------------------------------------------------------------
+HEALTH=""
+ID_TARGET=""
+ID_PUBKEY=""
+VOTE_PUBKEY=""
+if [[ -n "$FACTS" ]]; then
+  VOTE_ARG=$(fd_vsh_flag "$VSH" "--vote-account")
+  VOTE_FILE=""
+  if [[ "$VOTE_ARG" =~ $RE_PUBKEY ]]; then VOTE_PUBKEY="$VOTE_ARG"
+  elif [[ "$VOTE_ARG" =~ $RE_HOST_PATH ]]; then VOTE_FILE="$VOTE_ARG"; fi
+  if [[ -n "$IDENTITY_PATH" ]]; then
+    # shellcheck disable=SC2086
+    KEY_INFO=$(probe "$(fd_key_info_cmd "$IDENTITY_PATH" $VOTE_FILE)")
+    ID_TARGET=$(grep -m1 -F "${IDENTITY_PATH}|" <<<"$KEY_INFO" | cut -d'|' -f2 || true)
+    ID_PUBKEY=$(grep -m1 -F "${IDENTITY_PATH}|" <<<"$KEY_INFO" | cut -d'|' -f3 || true)
+    [[ -n "$VOTE_FILE" ]] && VOTE_PUBKEY=$(grep -m1 -F "${VOTE_FILE}|" <<<"$KEY_INFO" | cut -d'|' -f3 || true)
+    [[ "$ID_TARGET" =~ $RE_HOST_PATH ]] || ID_TARGET=""
+    [[ "$ID_PUBKEY" =~ $RE_PUBKEY ]] || ID_PUBKEY=""
+    [[ "$VOTE_PUBKEY" =~ $RE_PUBKEY ]] || VOTE_PUBKEY=""
+  fi
+  HEALTH=$(probe "$(host_health_cmd "$RPC_PORT" "$ID_PUBKEY" "$VOTE_PUBKEY")")
+fi
+# health <key> — a number or a plain word from the health answer, or nothing
+health() { local v; v=$(sed -n "s/^$1=//p" <<<"$HEALTH" | head -1); [[ "$v" =~ ^[a-z0-9]{1,20}$ ]] && printf '%s' "$v"; return 0; }
+# num_fact <key> — a fact that must be a number, or nothing
+num_fact() { local v; v=$(fact "$1"); [[ "$v" =~ ^[0-9]{1,12}$ ]] && printf '%s' "$v"; return 0; }
+human_secs() {
+  local s="$1"
+  if (( s >= 86400 )); then echo "$((s / 86400))d $((s % 86400 / 3600))h"
+  elif (( s >= 3600 )); then echo "$((s / 3600))h $((s % 3600 / 60))m"
+  elif (( s >= 60 )); then echo "$((s / 60))m"
+  else echo "${s}s"; fi
+}
+# disk_line <label> <fact> — "label 61% used, 1.2T free", or nothing
+disk_line() {
+  local v; v=$(fact "$2")
+  [[ "$v" =~ ^([0-9]{1,3})%\ ([0-9.]+[KMGTP]?)$ ]] || return 0
+  printf '%s %s%% used, %s free' "$1" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+report_health() {
+  local line since unit_since pair part lag stake
+  if [[ -n "$IDENTITY_PATH" && ( -n "$ID_PUBKEY" || -n "$ID_TARGET" ) ]]; then
+    line="$IDENTITY_PATH"
+    [[ -n "$ID_TARGET" && "$ID_TARGET" != "$IDENTITY_PATH" ]] && line+=" -> ${ID_TARGET}"
+    echo "  Identity:        ${line}${ID_PUBKEY:+  ${ID_PUBKEY}}"
+    case "$(health vote_here)" in
+      yes) echo "                   the vote account votes through this identity: this is the voting node" ;;
+      no)  echo "                   the vote account votes through another identity: this host is not the voting node" ;;
+    esac
+  fi
+  unit_since=$(num_fact agave_since)
+  [[ "$STATE" == "firedancer" ]] && unit_since=$(num_fact fd_since)
+  since=""
+  [[ -n "$unit_since" ]] && since=", running for $(human_secs "$unit_since")"
+  case "$(health rpc)" in
+    up)
+      case "$(health behind)" in
+        0)       echo "  Sync:            caught up${since}" ;;
+        unknown) echo "  Sync:            not healthy yet — the node does not say how far behind it is${since}" ;;
+        "")      ;;
+        *)       echo "  Sync:            $(health behind) slots behind${since}" ;;
+      esac ;;
+    down)
+      if [[ "$STATE" == "firedancer" ]]; then
+        echo "  Sync:            not read — nothing answers on 127.0.0.1:${RPC_PORT} (Firedancer runs without an RPC unless staged with --enable-rpc)${since}"
+      else
+        echo "  Sync:            not read — the RPC on 127.0.0.1:${RPC_PORT} does not answer (not running, or still starting)${since}"
+      fi ;;
+  esac
+  lag=$(health vote_lag); [[ -n "$lag" ]] && lag=", last vote ${lag} slots back"
+  stake=$(health stake_sol); [[ -n "$stake" ]] && stake=", ${stake} SOL active stake"
+  case "$(health vote)" in
+    current)    echo "  Vote account:    voting${VOTE_PUBKEY:+ (${VOTE_PUBKEY})}${lag}${stake}" ;;
+    delinquent) echo "  Vote account:    DELINQUENT${VOTE_PUBKEY:+ (${VOTE_PUBKEY})}${lag}, as this node sees it" ;;
+    absent)     echo "  Vote account:    ${VOTE_PUBKEY} is not among the vote accounts this node knows" ;;
+  esac
+  if [[ -n "$(health leader_total)" ]]; then
+    if [[ -n "$(health leader_in)" ]]; then
+      line="next in about $(human_secs $(( $(health leader_in) * 2 / 5 ))); $(health leader_left) left of $(health leader_total) this epoch"
+    elif [[ "$(health leader_total)" == "0" ]]; then
+      line="none this epoch for this identity"
+    else
+      line="none left this epoch ($(health leader_total) done)"
+    fi
+    [[ -n "$(health epoch)" ]] && line+="   (epoch $(health epoch), $(health epoch_pct)% through)"
+    echo "  Leader slots:    ${line}"
+  fi
+  line=""
+  for pair in "ledger|disk_ledger" "accounts|disk_accounts" "/|disk_root"; do
+    part=$(disk_line "${pair%%|*}" "${pair#*|}")
+    [[ -n "$part" ]] && line+="${line:+   }${part}"
+  done
+  [[ -n "$line" ]] && echo "  Disks:           ${line}"
+  line=""
+  case "$(fact clock_synced)" in
+    yes) line="clock synchronised" ;;
+    no)  line="clock NOT synchronised" ;;
+  esac
+  [[ "$(fact reboot_required)" == "yes" ]] && line+="${line:+, }a reboot is pending (package updates)"
+  case "$(fact perch_active)" in
+    active) line+="${line:+, }perch is watching" ;;
+    "")     ;;
+    *)      line+="${line:+, }perch is not running" ;;
+  esac
+  [[ -n "$line" ]] && echo "  Host:            ${line}"
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Who holds sudo here
@@ -443,6 +606,7 @@ else
 fi
 echo "  Firedancer:      $(describe_fd)"
 echo "  Newest releases: Hexis Agave ${NEW_AGAVE:-unknown}   Firedancer ${NEW_FD:-unknown}"
+report_health
 report_host
 echo ""
 
@@ -467,9 +631,17 @@ if [[ -z "$GOAL" ]]; then
   echo ""
   echo "  Run one of them:  $0 <goal> ${HOST_ARGS}"
   echo ""
-  echo "  Jito <-> Agave, leaving Hexis, or a new Jito/Agave version — arise.sh, with"
-  echo "  the flags this host was set up with:"
-  echo "    ${ARISE_HINT}"
+  if [[ -n "$ARISE_RECORDED" ]]; then
+    echo "  Jito <-> Agave, leaving Hexis, or a new Jito/Agave version — arise.sh, with the"
+    echo "  flags of its last run here${ARISE_RECORDED_ON:+ (${ARISE_RECORDED_ON})} and --client / --client-version changed:"
+    echo "    ${ARISE_HINT}"
+    echo "  Credentials and local files (--hexis-binary, --fd-binary, ...) are not recorded: add back any you used."
+  else
+    echo "  Jito <-> Agave, leaving Hexis, or a new Jito/Agave version — arise.sh, with"
+    echo "  the flags this host was set up with:"
+    echo "    ${ARISE_HINT}"
+    echo "  (arise.sh records them on the host from its next run on, and they are then shown here.)"
+  fi
   if [[ "$STATE" == "firedancer" ]]; then
     echo "  Here that installs the client beside Firedancer; 'agave' above then switches to it."
   fi

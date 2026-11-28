@@ -34,6 +34,10 @@ The README's "Security model" section is the full list. In short:
 - Values that end up in a command or a file on the server are checked against a strict
   pattern first: flags, release tags, and what is read back from `validator.sh` and the
   config files on the host.
+- The flags `arise.sh` records on the host (`/home/sol/.arise-flags`) hold no credential
+  and no path on your machine. What `system.sh` reads back from that file is checked
+  line by line and only printed: read the command before you run it, as the validator
+  user can write the file.
 - No credential is stored in this repository. The two Hexis credentials are supplied at
   run time and can be kept in `hexis.env`, which git ignores.
 - `arise.sh` runs every script on the server under `set -euo pipefail` and stops at the
@@ -99,10 +103,11 @@ maintainer's GitHub profile, which also makes GitHub show the tag as Verified.
 
 - A compromised machine running the scripts. It holds your SSH key and, for a moment, the
   validator keypairs and the sudo password.
-- Someone in the path of the first connection. The first run accepts the host key it is
-  shown, and then sends the new admin password and the validator keypairs. Check the
-  fingerprint against your provider's console, or add the key to `known_hosts` first.
-  A key that changes on a later run is refused.
+- Someone in the path of the first connection, when you do not pass
+  `--host-key-fingerprint`. The first run then accepts the host key it is shown, and
+  sends the new admin password and the validator keypairs. Pass the fingerprint from
+  your provider's console and the key is compared before anything connects; a host that
+  does not have it is not connected to. A key that changes on a later run is refused.
 - Your own shell history and process list, for a Hexis credential given as a flag. Use
   `hexis.env`. `--dry-run` prints the files it would write, credentials included.
 - A compromised upstream: the client source, a private release, or a publisher whose
