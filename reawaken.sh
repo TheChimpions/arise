@@ -7,7 +7,8 @@
 #  ██║  ██║███████╗██║  ██║╚███╔███╔╝██║  ██║██║  ██╗███████╗██║ ╚████║
 #  ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝
 #
-# Move a running validator onto Firedancer with the Hexis Concorde.
+# Move a running validator onto Firedancer: the Hexis Concorde build, or with
+# --vanilla a build of vanilla Firedancer that you made yourself.
 #
 #   reawaken.sh stage     Put the binary, config, arb signer, unit and firewall rules in
 #                       place. Reads the existing validator.sh — Hexis Agave, Jito or
@@ -69,6 +70,7 @@ FD_TAG=""
 FD_BINARY=""
 FD_ASSET=""                  # picked from the host's CPU when empty
 FD_PREVIOUS=false
+FD_VANILLA=false            # --vanilla, or worked out from the config on the host
 FD_DIR=""                    # defaults to /home/$SOL_USER/firedancer
 FD_USER=""                   # defaults to $SOL_USER — see usage
 FD_BASE=""                   # defaults to <agave ledger>/firedancer
@@ -125,6 +127,13 @@ Binary (stage, upgrade):
                                 Fetched with your local gh CLI and verified against
                                 the release checksums
   --fd-binary <path>            Pre-downloaded binary instead
+  --vanilla                    Vanilla Firedancer (firedancer-io/firedancer), not the
+                                Hexis Concorde. It is published as source only: build it
+                                for this host's CPU and pass the result with --fd-binary.
+                                No arb signer, no Concorde tables, no port opened to
+                                Hexis; metrics on 127.0.0.1; any cluster, not only
+                                mainnet. A host staged this way is recognised by its
+                                config afterwards, so later runs need not repeat it
   --previous                    upgrade only: the release that was active before the
                                 current one, instead of a new one
   --fd-asset <name>             Build to take from the release. Default: picked from
@@ -209,6 +218,7 @@ while [[ $# -gt 0 ]]; do
     --fd-binary)        FD_BINARY="$2"; shift 2 ;;
     --fd-asset)         FD_ASSET="$2"; shift 2 ;;
     --previous)         FD_PREVIOUS=true; shift ;;
+    --vanilla)         FD_VANILLA=true; shift ;;
     --fd-dir)           FD_DIR="$2"; shift 2 ;;
     --fd-user)          FD_USER="$2"; shift 2 ;;
     --fd-base)          FD_BASE="$2"; shift 2 ;;
@@ -284,6 +294,17 @@ FD_UNIT="/etc/systemd/system/firedancer.service"
 
 FD_PREVIOUS_FILE="${FD_DIR}/.previous-release"
 
+if $FD_VANILLA; then
+  if [[ -n "$FD_TAG" ]]; then
+    log_error "--fd-tag names a Hexis release. Vanilla Firedancer has no prebuilt releases:"
+    log_error "  build it (git checkout <tag>; ./deps.sh; make -j) and pass --fd-binary <path>"
+    exit 1
+  fi
+  if [[ -n "$FD_SIGNER" || -n "$FD_CONCORDE_TABLES" ]] || $FD_GENERATE_SIGNER || $FD_JUPITER_LEDGER_SET || $FD_OKX_LEDGER_SET; then
+    log_error "--hexis-signer, --generate-signer, --concorde-tables and the token ledger flags belong to the Hexis Concorde, not to --vanilla"
+    exit 1
+  fi
+fi
 if $FD_PREVIOUS && [[ "$MODE" != "upgrade" ]]; then
   log_error "--previous only goes with 'upgrade'"
   exit 1
@@ -315,7 +336,10 @@ if [[ "$MODE" == "stage" ]] || { [[ "$MODE" == "upgrade" ]] && ! $FD_PREVIOUS; }
   for f in "$FD_BINARY" "$FD_SIGNER" "$FD_CONCORDE_TABLES"; do
     [[ -n "$f" && ! -f "$f" ]] && { log_error "File not found: $f"; exit 1; }
   done
-  if [[ -n "$FD_TAG" || -z "$FD_CONCORDE_TABLES" ]]; then
+  # A tag is a Hexis release, downloaded with gh. Whether the Concorde's config
+  # tables have to be fetched too is settled further down, once it is known
+  # which Firedancer this host has.
+  if [[ -n "$FD_TAG" ]]; then
     command -v gh &>/dev/null || { log_error "This needs the gh CLI locally (release download and the Concorde config tables)"; exit 1; }
     gh auth status &>/dev/null || { log_error "gh is not authenticated — run 'gh auth login' with an account that can see ${HEXIS_REPO}"; exit 1; }
   fi
@@ -499,6 +523,7 @@ echo "fd_unit=\$(test -f ${FD_UNIT} && echo yes || echo no)"
 echo "fd_release=\$(readlink ${FD_BIN} 2>/dev/null | sed -e 's|^releases/||' -e 's|/firedancer\$||')"
 echo "fd_version=\$(${FD_BIN} version 2>/dev/null | head -1)"
 echo "fd_config=\$(test -f ${FD_CONFIG} && echo yes || echo no)"
+echo "fd_arb=\$(if [ ! -r ${FD_CONFIG} ]; then echo unknown; elif grep -q '^\[arb\]' ${FD_CONFIG}; then echo yes; else echo no; fi)"
 echo "fd_signer=\$(test -e ${FD_SIGNER_PATH} && echo yes || echo no)"
 echo "vsh=\$(test -f ${VALIDATOR_SH} && echo yes || echo no)"
 FACTSEOF
@@ -517,6 +542,22 @@ case "$SOURCE" in
   *)     SOURCE_LABEL="plain Agave" ;;
 esac
 
+# Which Firedancer this is about. --vanilla says so outright; otherwise a
+# config already on the host with no [arb] table is a vanilla one, unless a
+# Hexis release was named, which is how such a host is moved to the Concorde.
+if ! $FD_VANILLA && [[ "$(fact fd_config)" == "yes" && "$(fact fd_arb)" == "no" && -z "$FD_TAG" \
+      && -z "$FD_SIGNER" && -z "$FD_CONCORDE_TABLES" ]] && ! $FD_GENERATE_SIGNER; then
+  FD_VANILLA=true
+  log_info "${FD_CONFIG} has no [arb] table: this host has vanilla Firedancer, and is treated that way"
+fi
+if $FD_VANILLA; then
+  FD_FLAVOR_LABEL="$FD_VANILLA_LABEL"
+elif [[ "$MODE" == "stage" || "$MODE" == "upgrade" ]] && ! $FD_PREVIOUS && [[ -z "$FD_CONCORDE_TABLES" ]]; then
+  # The Concorde's config tables are fetched with gh further down
+  command -v gh &>/dev/null || { log_error "This needs the gh CLI locally (the Concorde config tables), or --concorde-tables <path>. For vanilla Firedancer pass --vanilla"; exit 1; }
+  gh auth status &>/dev/null || { log_error "gh is not authenticated — run 'gh auth login' with an account that can see ${HEXIS_REPO}"; exit 1; }
+fi
+
 AGAVE_LEDGER=$(fd_vsh_flag "$VSH" "--ledger")
 # Agave keeps its snapshots in the ledger unless --snapshots says otherwise
 AGAVE_SNAPSHOTS=$(fd_vsh_flag "$VSH" "--snapshots")
@@ -525,6 +566,16 @@ AGAVE_IDENTITY=$(fd_vsh_flag "$VSH" "--identity")
 if [[ -z "$AGAVE_LEDGER" || -z "$AGAVE_IDENTITY" ]]; then
   log_error "Could not find --ledger and --identity in ${VALIDATOR_SH}"
   exit 1
+fi
+
+# The default snapshot mirror, and the public RPC the pre-start download falls
+# back on, are mainnet's. On another cluster the download is left out unless a
+# mirror for that cluster was given.
+FD_MAINNET=true
+[[ "$(fd_vsh_flag "$VSH" "--expected-genesis-hash")" == "$MAINNET_GENESIS_HASH" ]] || FD_MAINNET=false
+if ! $FD_MAINNET && $SNAPSHOT_PREFETCH && [[ -z "$SNAPSHOT_MIRROR" ]]; then
+  SNAPSHOT_PREFETCH=false
+  log_info "Not a mainnet validator.sh: no snapshot pre-download (the default mirror is mainnet's). --snapshot-mirror <url> names one for this cluster"
 fi
 
 # Which keys these paths really are: identity.json is usually a symlink that
@@ -566,7 +617,11 @@ if [[ "$MODE" == "status" ]]; then
   echo "  Agave:           ${AGAVE_SERVICE}.service $(fact agave_active) / $(fact agave_enabled)   (${SOURCE_LABEL})"
   echo "  Firedancer:      firedancer.service $(fact fd_active) / $(fact fd_enabled)"
   echo "  Staged release:  ${FD_DIR}: $(fact fd_release) $(fact fd_version)"
-  echo "  Staged config:   $(fact fd_config)   unit: $(fact fd_unit)   arb signer: $(fact fd_signer)"
+  if $FD_VANILLA; then
+    echo "  Staged config:   $(fact fd_config) (vanilla Firedancer)   unit: $(fact fd_unit)"
+  else
+    echo "  Staged config:   $(fact fd_config)   unit: $(fact fd_unit)   arb signer: $(fact fd_signer)"
+  fi
   if [[ "$(fact fd_config)" == "yes" ]]; then
     # Read as the validator user; says nothing when the config is not readable to it
     OUTLOOK=$(huge_page_outlook "$(required_gigantic_pages "$(probe "${FD_BIN} mem --config ${FD_CONFIG} 2>&1")")")
@@ -845,10 +900,12 @@ SCRIPT
   log_info "Watch it load the snapshot and catch up:"
   log_info "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo journalctl -u firedancer -f'"
   log_info "  ${SSH_CMD} -t ${ADMIN_HOST} 'sudo ${FD_BIN} ready --config ${FD_CONFIG}'"
-  log_info "Then check the Control port and tell Hexis it is up:"
-  log_info "  ${SSH_CMD} ${SOL_HOST} 'ss -lntp | grep ${FD_CONTROL_PORT}'"
-  log_info ""
-  log_info "The arb tiles start enabled — there is no arb-enable step on Firedancer."
+  if ! $FD_VANILLA; then
+    log_info "Then check the Control port and tell Hexis it is up:"
+    log_info "  ${SSH_CMD} ${SOL_HOST} 'ss -lntp | grep ${FD_CONTROL_PORT}'"
+    log_info ""
+    log_info "The arb tiles start enabled — there is no arb-enable step on Firedancer."
+  fi
   $USES_JAG_SNAP && log_info "jag-snap is stopped and ${JAG_SNAP_PORT}/tcp is closed: this host no longer serves snapshots."
   log_info "Back to Agave: $0 rollback --host ${SSH_HOST} --ssh-key ${SSH_KEY}"
   exit 0
@@ -1076,17 +1133,23 @@ fi
 # --- Hardware and OS -------------------------------------------------------
 log_info "Host: $(fact model), $(fact mem_gib) GiB RAM, glibc $(fact glibc)"
 
-if [[ -z "$FD_ASSET" ]]; then
-  FD_ASSET=$(fd_pick_asset "$(fact vendor)" "$(fact family)" "$(fact flags)") || {
-    log_error "This CPU has no AVX2 — no Hexis Firedancer build runs on it"
-    exit 1
-  }
-fi
-log_info "Build: ${FD_ASSET}"
+if $FD_VANILLA; then
+  # Built by the operator: whether it runs here is found out when it is run,
+  # right after the upload and before anything else is changed.
+  log_info "Build: vanilla Firedancer${FD_BINARY:+, from ${FD_BINARY}}"
+else
+  if [[ -z "$FD_ASSET" ]]; then
+    FD_ASSET=$(fd_pick_asset "$(fact vendor)" "$(fact family)" "$(fact flags)") || {
+      log_error "This CPU has no AVX2 — no Hexis Firedancer build runs on it"
+      exit 1
+    }
+  fi
+  log_info "Build: ${FD_ASSET}"
 
-if [[ -n "$(fact glibc)" ]] && ! fd_version_ge "$(fact glibc)" "$FD_MIN_GLIBC"; then
-  log_error "glibc $(fact glibc) is older than the ${FD_MIN_GLIBC} this build needs (Ubuntu 24.04 or newer)"
-  exit 1
+  if [[ -n "$(fact glibc)" ]] && ! fd_version_ge "$(fact glibc)" "$FD_MIN_GLIBC"; then
+    log_error "glibc $(fact glibc) is older than the ${FD_MIN_GLIBC} this build needs (Ubuntu 24.04 or newer)"
+    exit 1
+  fi
 fi
 
 # --- What the Agave setup tells us ------------------------------------------
@@ -1107,6 +1170,7 @@ FDC_GENESIS_HASH=$(fd_vsh_flag "$VSH" "--expected-genesis-hash")
 FDC_SHRED_VERSION=$(fd_vsh_flag "$VSH" "--expected-shred-version")
 FDC_INTERFACE="$FD_INTERFACE"
 FDC_RPC="$FD_ENABLE_RPC"
+FDC_VANILLA="$FD_VANILLA"
 
 if [[ -z "$FDC_VOTE_ACCOUNT" ]]; then
   log_warn "No --vote-account in ${VALIDATOR_SH} — Firedancer will not vote"
@@ -1115,8 +1179,9 @@ if [[ -z "$FDC_ENTRYPOINTS" || -z "$FDC_GENESIS_HASH" ]]; then
   log_error "Could not find --entrypoint and --expected-genesis-hash in ${VALIDATOR_SH}"
   exit 1
 fi
-if [[ "$FDC_GENESIS_HASH" != "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d" ]]; then
+if ! $FD_MAINNET && ! $FD_VANILLA; then
   log_error "The Hexis Concorde is mainnet only, and ${VALIDATOR_SH} is not a mainnet config"
+  log_error "  Vanilla Firedancer runs on other clusters: build it and pass --vanilla --fd-binary <path>"
   exit 1
 fi
 
@@ -1147,9 +1212,19 @@ if ! $FD_NO_BLOCK_ENGINE; then
     log_error "  closest to this host, or --no-block-engine to run with no bundles"
     exit 1
   fi
-  FDC_TIP_PAY=$(fd_vsh_flag "$VSH" "--tip-payment-program-pubkey");       FDC_TIP_PAY="${FDC_TIP_PAY:-$FD_TIP_PAYMENT_PROGRAM}"
-  FDC_TIP_DIST=$(fd_vsh_flag "$VSH" "--tip-distribution-program-pubkey"); FDC_TIP_DIST="${FDC_TIP_DIST:-$FD_TIP_DISTRIBUTION_PROGRAM}"
-  FDC_TIP_AUTH=$(fd_vsh_flag "$VSH" "--merkle-root-upload-authority");    FDC_TIP_AUTH="${FDC_TIP_AUTH:-$FD_TIP_DISTRIBUTION_AUTHORITY}"
+  FDC_TIP_PAY=$(fd_vsh_flag "$VSH" "--tip-payment-program-pubkey")
+  FDC_TIP_DIST=$(fd_vsh_flag "$VSH" "--tip-distribution-program-pubkey")
+  FDC_TIP_AUTH=$(fd_vsh_flag "$VSH" "--merkle-root-upload-authority")
+  if ! $FD_MAINNET && [[ -z "$FDC_TIP_PAY" || -z "$FDC_TIP_DIST" || -z "$FDC_TIP_AUTH" ]]; then
+    # The defaults below are Jito's mainnet programs: wrong on any other cluster
+    log_error "${VALIDATOR_SH} does not name Jito's tip programs and upload authority for this cluster."
+    log_error "  Add them there (--tip-payment-program-pubkey, --tip-distribution-program-pubkey,"
+    log_error "  --merkle-root-upload-authority), or pass --no-block-engine"
+    exit 1
+  fi
+  FDC_TIP_PAY="${FDC_TIP_PAY:-$FD_TIP_PAYMENT_PROGRAM}"
+  FDC_TIP_DIST="${FDC_TIP_DIST:-$FD_TIP_DISTRIBUTION_PROGRAM}"
+  FDC_TIP_AUTH="${FDC_TIP_AUTH:-$FD_TIP_DISTRIBUTION_AUTHORITY}"
   FDC_COMMISSION_BPS="${FD_COMMISSION_BPS:-$(fd_vsh_flag "$VSH" "--commission-bps")}"
   if [[ -z "$FDC_COMMISSION_BPS" ]]; then
     log_error "No Jito tip commission to carry over — pass --commission-bps <bps>"
@@ -1167,7 +1242,12 @@ reject_placeholder "--shred-receiver-address" "$FDC_SHRED_DESTS"
 FDC_RSS_SIMPLE=false
 [[ "$FDC_SHRED_DESTS" == *"${FD_DOUBLEZERO_GROUP}:"* ]] && FDC_RSS_SIMPLE=true
 
-FDC_METRICS_ADDR="${FD_METRICS_ADDR:-$(fact ip)}"
+if $FD_VANILLA; then
+  # Nobody outside the host reads them, and perch on the host reads loopback
+  FDC_METRICS_ADDR="${FD_METRICS_ADDR:-127.0.0.1}"
+else
+  FDC_METRICS_ADDR="${FD_METRICS_ADDR:-$(fact ip)}"
+fi
 if [[ -z "$FDC_METRICS_ADDR" ]]; then
   log_error "Could not work out this host's IPv4 — pass --metrics-address"
   exit 1
@@ -1182,7 +1262,9 @@ if [[ "$SOURCE" == "hexis" ]]; then
   ARB_CONFIG_TEXT=$(probe "cat ${ARB_CONFIG_PATH}")
 fi
 
-if [[ -n "$FD_SIGNER" ]]; then
+if $FD_VANILLA; then
+  SIGNER_FROM="none"   # no arb, so no signer
+elif [[ -n "$FD_SIGNER" ]]; then
   SIGNER_FROM="upload"
 elif $FD_GENERATE_SIGNER; then
   SIGNER_FROM="generate"
@@ -1200,7 +1282,9 @@ fi
 # Token ledgers travel with the signer: the ones in arb-config.toml, or the
 # Hexis defaults when the signer is the one Hexis issues.
 JUP_LEDGER=""; OKX_LEDGER=""
-if [[ -n "$ARB_CONFIG_TEXT" ]]; then
+if $FD_VANILLA; then
+  :
+elif [[ -n "$ARB_CONFIG_TEXT" ]]; then
   JUP_LEDGER=$(fd_toml_get "$ARB_CONFIG_TEXT" "jupiter_token_ledger")
   OKX_LEDGER=$(fd_toml_get "$ARB_CONFIG_TEXT" "okx_token_ledger")
 elif [[ "$SIGNER_FROM" == "upload" ]]; then
@@ -1211,27 +1295,32 @@ $FD_JUPITER_LEDGER_SET && JUP_LEDGER="$FD_JUPITER_LEDGER"
 $FD_OKX_LEDGER_SET && OKX_LEDGER="$FD_OKX_LEDGER"
 
 # --- The Concorde's own tables ------------------------------------------------
-if [[ -n "$FD_CONCORDE_TABLES" ]]; then
-  CONCORDE_TEXT=$(cat "$FD_CONCORDE_TABLES")
+if $FD_VANILLA; then
+  # Vanilla Firedancer has no [arb] table and refuses a key it does not know
+  CONFIG_TEXT="$(fd_render_base_config reawaken.sh)"
 else
-  log_info "Fetching the Concorde config tables from ${HEXIS_REPO} (${FD_DOCS_BRANCH})"
-  CONCORDE_TEXT=$(fd_fetch_concorde_tables) || { log_error "Could not fetch config.toml.example — pass --concorde-tables <path>"; exit 1; }
-fi
-if ! grep -q '^\[arb\]' <<<"$CONCORDE_TEXT" || ! grep -qE '^[[:space:]]*signer_key_path[[:space:]]*=' <<<"$CONCORDE_TEXT"; then
-  log_error "The Concorde config tables have no [arb] table with signer_key_path — refusing to guess"
-  exit 1
-fi
+  if [[ -n "$FD_CONCORDE_TABLES" ]]; then
+    CONCORDE_TEXT=$(cat "$FD_CONCORDE_TABLES")
+  else
+    log_info "Fetching the Concorde config tables from ${HEXIS_REPO} (${FD_DOCS_BRANCH})"
+    CONCORDE_TEXT=$(fd_fetch_concorde_tables) || { log_error "Could not fetch config.toml.example — pass --concorde-tables <path>"; exit 1; }
+  fi
+  if ! grep -q '^\[arb\]' <<<"$CONCORDE_TEXT" || ! grep -qE '^[[:space:]]*signer_key_path[[:space:]]*=' <<<"$CONCORDE_TEXT"; then
+    log_error "The Concorde config tables have no [arb] table with signer_key_path — refusing to guess"
+    exit 1
+  fi
 
-CONFIG_TEXT="$(fd_render_base_config reawaken.sh)
+  CONFIG_TEXT="$(fd_render_base_config reawaken.sh)
 
 $(fd_render_concorde_tables "$CONCORDE_TEXT" "$FD_SIGNER_PATH" "$JUP_LEDGER" "$OKX_LEDGER")"
+fi
 
 # --- Plan ------------------------------------------------------------------
 echo ""
 if [[ "$MODE" == "upgrade" ]]; then
   log_info "Plan for ${SOL_HOST} (Firedancer ${OLD_RELEASE} -> ${FD_TAG:-$(basename "$FD_BINARY")}; settings from ${VALIDATOR_SH}):"
 else
-  log_info "Plan for ${SOL_HOST} (${SOURCE_LABEL} -> Firedancer with the Concorde):"
+  log_info "Plan for ${SOL_HOST} (${SOURCE_LABEL} -> $($FD_VANILLA && echo "$FD_VANILLA_LABEL" || echo "Firedancer with the Concorde")):"
 fi
 log_info "  Identity:       ${IDENTITY_LABEL}"
 log_info "  Vote account:   ${FDC_VOTE_ACCOUNT:-none}"
@@ -1255,21 +1344,30 @@ if [[ -n "$FDC_SNAPSHOT_ALLOW_LIST" ]]; then
 else
   log_info "  Snapshots from: any gossip peer (Firedancer's default)"
 fi
-log_info "  Metrics:        ${FDC_METRICS_ADDR}:${FD_METRICS_PORT}  (open to ${FD_METRICS_ALLOW})"
-log_info "  Control:        port ${FD_CONTROL_PORT}  (open to ${FD_CONTROL_ALLOW})"
-case "$SIGNER_FROM" in
-  upload)   log_info "  Arb signer:     ${FD_SIGNER} (uploaded)" ;;
-  generate) log_warn "  Arb signer:     generated on the host — fund it; flash loans off until Hexis has its MarginFi account" ;;
-  keep)     log_info "  Arb signer:     ${FD_SIGNER_PATH} (already installed)" ;;
-  *)        log_info "  Arb signer:     ${SIGNER_FROM} (the Hexis Agave signer)" ;;
-esac
-log_info "  Token ledgers:  jupiter ${JUP_LEDGER:-none}, okx ${OKX_LEDGER:-none}"
+if $FD_VANILLA; then
+  log_info "  Metrics:        ${FDC_METRICS_ADDR}:${FD_METRICS_PORT}  (no firewall rule is added for it)"
+  log_info "  Arb:            none — vanilla Firedancer. No signer, no Control port"
+else
+  log_info "  Metrics:        ${FDC_METRICS_ADDR}:${FD_METRICS_PORT}  (open to ${FD_METRICS_ALLOW})"
+  log_info "  Control:        port ${FD_CONTROL_PORT}  (open to ${FD_CONTROL_ALLOW})"
+  case "$SIGNER_FROM" in
+    upload)   log_info "  Arb signer:     ${FD_SIGNER} (uploaded)" ;;
+    generate) log_warn "  Arb signer:     generated on the host — fund it; flash loans off until Hexis has its MarginFi account" ;;
+    keep)     log_info "  Arb signer:     ${FD_SIGNER_PATH} (already installed)" ;;
+    *)        log_info "  Arb signer:     ${SIGNER_FROM} (the Hexis Agave signer)" ;;
+  esac
+  log_info "  Token ledgers:  jupiter ${JUP_LEDGER:-none}, okx ${OKX_LEDGER:-none}"
+fi
 if $FD_ENABLE_RPC; then
   log_info "  RPC:            on (127.0.0.1:8899)"
 else
   log_warn "  RPC:            off — anything reading 127.0.0.1:8899 on this host (solana catchup) stops working"
 fi
-log_warn "  Snapshots:      none made or served. Cutover, upgrade and every start of the unit fetch the full one from the mirror when the one on disk is too old"
+if $SNAPSHOT_PREFETCH; then
+  log_warn "  Snapshots:      none made or served. Cutover, upgrade and every start of the unit fetch the full one from the mirror when the one on disk is too old"
+else
+  log_warn "  Snapshots:      none made or served, and none pre-downloaded: every start downloads the full one from its peers"
+fi
 if $USES_JAG_SNAP; then
   log_warn "  jag-snap:       retired at cutover (container stopped, ${JAG_SNAP_PORT}/tcp closed); rollback brings it back"
 fi
@@ -1319,11 +1417,18 @@ if [[ -n "$FD_BINARY" ]]; then
       exit 1
     fi
     while IFS= read -r line; do log_error "  host says: ${line}"; done <<< "$WHY"
-    log_error "  (an Illegal instruction means the build is for a newer CPU — try --fd-asset firedancer-linux-amd64)"
+    if $FD_VANILLA; then
+      log_error "  (an Illegal instruction means it was built for a newer CPU than this host's: build it here, or with MACHINE=linux_gcc_x86_64)"
+    else
+      log_error "  (an Illegal instruction means the build is for a newer CPU — try --fd-asset firedancer-linux-amd64)"
+    fi
     remote "rm -f ${FD_DIR}/firedancer.incoming"
     exit 1
   fi
   RELEASE_NAME="${FD_TAG:-${NEW_VERSION%% *}}"
+  # Becomes a directory name on the host. What a binary says about itself is not
+  # always a plain version, so fall back on a name made from the file's checksum.
+  [[ "$RELEASE_NAME" =~ $RE_RELEASE_TAG ]] || RELEASE_NAME="build-$(sha256_local "$FD_BINARY" | cut -c1-12)"
   log_info "Staging ${RELEASE_NAME} (${NEW_VERSION})"
 
   # Versioned directory plus an atomically renamed symlink, as ascend.sh does. A
@@ -1354,13 +1459,20 @@ if [[ "$SIGNER_FROM" == "upload" ]]; then
 fi
 
 case "$SIGNER_FROM" in
+  none)     SIGNER_STEP="true" ;;
   upload)   SIGNER_STEP="install -o root -g root -m 0600 ${FD_SIGNER_PATH}.incoming ${FD_SIGNER_PATH} && rm -f ${FD_SIGNER_PATH}.incoming" ;;
   generate) SIGNER_STEP="test -e ${FD_SIGNER_PATH} || ${FD_BIN} keys new ${FD_SIGNER_PATH}; chown root:root ${FD_SIGNER_PATH}; chmod 0600 ${FD_SIGNER_PATH}" ;;
   keep)     SIGNER_STEP="true" ;;
   *)        SIGNER_STEP="install -o root -g root -m 0600 ${SIGNER_FROM} ${FD_SIGNER_PATH}" ;;
 esac
 
-log_info "Preparing directories and the arb signer"
+SIGNER_REPORT="echo \"arb signer: \$(${FD_BIN} keys pubkey ${FD_SIGNER_PATH} 2>/dev/null || echo unreadable)\""
+if $FD_VANILLA; then
+  SIGNER_REPORT="true"
+  log_info "Preparing directories"
+else
+  log_info "Preparing directories and the arb signer"
+fi
 root_script <<SCRIPT
 set -e
 if ! id -u ${FDC_USER} >/dev/null 2>&1; then
@@ -1373,7 +1485,7 @@ chmod ${FD_SNAPSHOTS_MODE} "${FDC_SNAPSHOTS}"
 
 # Firedancer reads the signer as root at boot, before it drops privileges
 ${SIGNER_STEP}
-echo "arb signer: \$(${FD_BIN} keys pubkey ${FD_SIGNER_PATH} 2>/dev/null || echo unreadable)"
+${SIGNER_REPORT}
 SCRIPT
 
 # --- Config: write, check against the real binary, then install -----------------
@@ -1428,12 +1540,20 @@ UNIT_PREFETCH=on
 $SNAPSHOT_PREFETCH || UNIT_PREFETCH=off
 UNIT_TEXT="$(fd_render_unit "$FD_BIN" "$FD_CONFIG" "$AGAVE_SERVICE" "$UNIT_PREFETCH")"
 UFW_RULES=""
-for src in $FD_CONTROL_ALLOW; do
-  UFW_RULES+="ufw allow from ${src} to any port ${FD_CONTROL_PORT} proto tcp >/dev/null
+UFW_SAYS="Control ${FD_CONTROL_PORT} from ${FD_CONTROL_ALLOW}; metrics ${FD_METRICS_PORT} from ${FD_METRICS_ALLOW}; p2p udp ${FD_P2P_UDP_PORTS}"
+UFW_OFF_SAYS="ufw is not active — firewall ${FD_CONTROL_PORT}/tcp and ${FD_METRICS_PORT}/tcp to the Hexis addresses yourself"
+if $FD_VANILLA; then
+  # Nothing of Hexis's to let in: only Firedancer's own p2p ports
+  UFW_SAYS="p2p udp ${FD_P2P_UDP_PORTS}"
+  UFW_OFF_SAYS="ufw is not active — nothing restricts what reaches this host"
+else
+  for src in $FD_CONTROL_ALLOW; do
+    UFW_RULES+="ufw allow from ${src} to any port ${FD_CONTROL_PORT} proto tcp >/dev/null
 "
-done
-UFW_RULES+="ufw allow from ${FD_METRICS_ALLOW} to any port ${FD_METRICS_PORT} proto tcp >/dev/null
+  done
+  UFW_RULES+="ufw allow from ${FD_METRICS_ALLOW} to any port ${FD_METRICS_PORT} proto tcp >/dev/null
 "
+fi
 for port in $FD_P2P_UDP_PORTS; do
   UFW_RULES+="ufw allow ${port}/udp >/dev/null
 "
@@ -1452,9 +1572,9 @@ systemctl daemon-reload
 echo "firedancer.service installed — enabled: \$(systemctl is-enabled firedancer 2>/dev/null || true)"
 
 if ufw status 2>/dev/null | grep -q "Status: active"; then
-${UFW_RULES}  echo "ufw: Control ${FD_CONTROL_PORT} from ${FD_CONTROL_ALLOW}; metrics ${FD_METRICS_PORT} from ${FD_METRICS_ALLOW}; p2p udp ${FD_P2P_UDP_PORTS}"
+${UFW_RULES}  echo "ufw: ${UFW_SAYS}"
 else
-  echo "ufw is not active — firewall ${FD_CONTROL_PORT}/tcp and ${FD_METRICS_PORT}/tcp to the Hexis addresses yourself"
+  echo "${UFW_OFF_SAYS}"
 fi
 SCRIPT
 
@@ -1478,7 +1598,11 @@ log_info "============================================"
 log_info "stage complete — ${RUNNING} is still what runs on ${SOL_HOST}"
 log_info "============================================"
 log_info "Staged:  ${FD_BIN} -> $(probe "readlink ${FD_BIN}")"
-log_info "         ${FD_CONFIG}, ${FD_SIGNER_PATH}, ${FD_UNIT}"
+if $FD_VANILLA; then
+  log_info "         ${FD_CONFIG}, ${FD_UNIT}"
+else
+  log_info "         ${FD_CONFIG}, ${FD_SIGNER_PATH}, ${FD_UNIT}"
+fi
 log_info ""
 [[ -n "${HUGE_PAGE_OUTLOOK:-}" ]] && log_info "Huge pages: ${HUGE_PAGE_OUTLOOK}"
 log_info "Nothing was stopped or started. When you are ready:"

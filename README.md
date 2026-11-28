@@ -12,18 +12,19 @@ Scripts that take a Solana validator from a bare Ubuntu server to a running node
 > **"Arise."** — one command, and the validator rises from the shadows.
 
 **What you can use.** Setting up a Jito or Agave validator from their public source needs
-nothing but this repository, and that is what most of this page is about. The Hexis arb
-client and Firedancer with the Hexis Concorde come from private releases: those parts work
-only if Hexis has given you access, and are described in [docs/hexis.md](docs/hexis.md) and
-[docs/firedancer.md](docs/firedancer.md). Without that access, leave `--hexis`,
-`--client firedancer`, `ascend.sh` and `reawaken.sh` alone.
+nothing but this repository, and that is what most of this page is about. So does vanilla
+Firedancer, once you have built it: see [docs/firedancer.md](docs/firedancer.md). The Hexis
+arb client and Firedancer with the Hexis Concorde come from private releases: those parts
+work only if Hexis has given you access, and are described in [docs/hexis.md](docs/hexis.md)
+and [docs/firedancer.md](docs/firedancer.md). Without that access, leave `--hexis`,
+`--fd-tag` and `ascend.sh` alone.
 
 | Script | What it is | What it does |
 |---|---|---|
 | `arise.sh` | Raising a new shadow soldier | **Start here for a new server.** Turns a fresh server into a validator: disks, kernel tuning, Jito build or Hexis binary, region detection, systemd, firewall, perch watchtower |
 | `system.sh` | The System: status window and quests | **Start here for any server that already runs a validator.** Reports what the host runs and routes each move to the script that owns it |
 | `ascend.sh` | Levelling up | Upgrades the Hexis Agave client, or moves a Jito / plain Agave validator onto it |
-| `reawaken.sh` | A Re-Awakening | Moves a running validator onto Firedancer with the Hexis Concorde, upgrades it there, and takes it back |
+| `reawaken.sh` | A Re-Awakening | Moves a running validator onto Firedancer (vanilla, or with the Hexis Concorde), upgrades it there, and takes it back |
 
 - New server: [Prerequisites](#prerequisites), then [Usage](#usage)
 - Server that already runs a validator: [`system.sh`](#servers-that-already-run-a-validator)
@@ -93,6 +94,7 @@ On the **target server**:
 | **Agave** | `--client agave --client-version v4.4.1` | Built on the server from `anza-xyz/agave`. No Block Engine or tip flags |
 | **Jito + Hexis** | `--client jito --hexis --hexis-tag <tag>` | Private Hexis release, fetched locally with `gh` (or `--hexis-binary <path>`). Mainnet only |
 | **Firedancer** (Hexis Concorde) | `--client firedancer --fd-tag <tag>` | Private release, fetched locally with `gh` (or `--fd-binary <path>`). Mainnet only |
+| **Firedancer** (vanilla) | `--client firedancer --fd-vanilla --fd-binary <path>` | A binary you built from `firedancer-io/firedancer`, which publishes source only. Any network |
 
 Leave `--client-version` off and the script lists recent release tags to pick from.
 
@@ -140,6 +142,7 @@ claims depend on.
 | `--client-repo` | HTTPS git repo to build from (default: the client's public repo) |
 | `--build-client` | Build from source even with `--hexis` (off by default — see below) |
 | `--fd-tag` / `--fd-binary` | Firedancer release to stage with `--client firedancer` |
+| `--fd-vanilla` | Vanilla Firedancer instead of the Hexis Concorde. Needs `--fd-binary`: see [docs/firedancer.md](docs/firedancer.md#vanilla-firedancer) |
 | `--concorde-tables` | Local copy of the Concorde config tables, instead of fetching them with `gh` (passed on to `reawaken.sh`) |
 | `--restart` | On a host with a running validator: wait for a restart window and move it onto what was just installed. From or to Firedancer this hands over to `reawaken.sh`, which asks first |
 | `--min-idle-time` | Minutes without a leader slot that `--restart` waits for (default: `20`) |
@@ -371,12 +374,12 @@ What it makes of each kind of host:
 | Jito, mainnet | Jito | `hexis`, `firedancer` |
 | Hexis Agave | Hexis Agave and its release | `upgrade`, `firedancer` |
 | Firedancer with the Hexis Concorde, installed by `reawaken.sh` | that, plus the Agave client kept behind it | `upgrade`, `agave` |
-| Any Agave client on testnet or devnet | the client | none: the Hexis builds are mainnet only |
-| A Firedancer installed some other way (an upstream build taking Jito bundles, say) | what its config says it is | none: reported and left alone |
+| Vanilla Firedancer, installed by `reawaken.sh --vanilla` | vanilla Firedancer, plus the Agave client kept behind it | `agave`. For `upgrade` it prints the command: there is no release to fetch, so you build the new tag and pass it with `--fd-binary` |
+| Any Agave client on testnet or devnet | the client | none from here: the Hexis builds are mainnet only. Vanilla Firedancer is staged with `reawaken.sh stage --vanilla` |
+| A Firedancer installed some other way (not in `/home/sol/firedancer`) | what its config says it is | none: reported and left alone |
 
-These scripts install and upgrade the Hexis builds only. They do not upgrade a plain
-Agave or Jito validator in place, and they do not install or upgrade an upstream
-Firedancer.
+`system.sh` only ever fetches the Hexis builds. It does not upgrade a plain Agave or Jito
+validator in place (that is `arise.sh`), and it does not build vanilla Firedancer.
 
 A cutover that needed a reboot (see [docs/firedancer.md](docs/firedancer.md#moving-to-firedancer-reawakensh)) leaves its last steps undone, because
 Firedancer comes up by itself after the reboot. `system.sh` sees that jag-snap is still
@@ -433,13 +436,15 @@ Things to know:
 
 ## Hexis and Firedancer
 
-Both need a private release from Hexis and run on mainnet only.
+The Hexis arb client and Firedancer with the Hexis Concorde need a private release from
+Hexis and run on mainnet only. Vanilla Firedancer needs neither, only a binary you built.
 
 - [docs/hexis.md](docs/hexis.md): installing the Hexis arb client with `arise.sh --hexis`, the
   two credentials, turning the arb on, flash loans, and upgrading or migrating a running
   host with `ascend.sh`. The same upgrade done by hand is in [HEXIS-UPGRADE.md](HEXIS-UPGRADE.md).
-- [docs/firedancer.md](docs/firedancer.md): a new Firedancer host, moving a running validator
-  onto Firedancer and back with `reawaken.sh`, snapshots, perch, and the identity swap.
+- [docs/firedancer.md](docs/firedancer.md): vanilla Firedancer or the Hexis Concorde. A new
+  Firedancer host, moving a running validator onto Firedancer and back with `reawaken.sh`,
+  snapshots, perch, and the identity swap.
 
 ---
 
@@ -488,7 +493,7 @@ lib/hexis.sh       shared Hexis defaults, logging, config rendering, checksum ve
 lib/firedancer.sh  validator.sh parsing, Firedancer config and unit rendering, snapshot
                    hand-over and pre-download
 test/run.sh        test suite — no dependencies
-docs/              the Hexis arb client and Firedancer, which need a private release
+docs/              the Hexis arb client (private release) and Firedancer
 ```
 
 The scripts source `lib/`, so they must be run from a checkout rather than copied

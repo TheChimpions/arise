@@ -193,6 +193,7 @@ echo \"fd_active=\$(systemctl is-active firedancer 2>/dev/null)\"
 echo \"fd_enabled=\$(systemctl is-enabled firedancer 2>/dev/null)\"
 echo \"fd_release=\$(readlink ${FD_DIR}/firedancer 2>/dev/null | sed -e 's|^releases/||' -e 's|/firedancer\$||')\"
 echo \"fd_config=\$(test -f ${FD_DIR}/config.toml && echo yes || echo no)\"
+echo \"fd_arb=\$(if [ ! -r ${FD_DIR}/config.toml ]; then echo unknown; elif grep -q '^\[arb\]' ${FD_DIR}/config.toml; then echo yes; else echo no; fi)\"
 echo \"fd_previous=\$(cat ${FD_DIR}/.previous-release 2>/dev/null)\"
 echo \"jag_snap=\$(ss -lnt 2>/dev/null | grep -q ':18899 ' && echo up || echo down)\"
 echo \"perch_local=\$($(perch_local_rpc_dead_cmd "$SOL_USER"))\"
@@ -286,6 +287,13 @@ report_host() {
   return 0
 }
 
+# The Firedancer in ${FD_DIR}: the Hexis Concorde, or a vanilla build the
+# operator made, told apart by whether its config has an [arb] table.
+FD_IS_VANILLA=false
+[[ "$(fact fd_config)" == "yes" && "$(fact fd_arb)" == "no" ]] && FD_IS_VANILLA=true
+$FD_IS_VANILLA && FD_FLAVOR_LABEL="$FD_VANILLA_LABEL"
+VANILLA_UPGRADE_HINT="vanilla Firedancer has no prebuilt releases: build the new tag for this host, then ./reawaken.sh upgrade ${HOST_ARGS} --fd-binary <path>"
+
 case "$SOURCE" in
   hexis) SOURCE_LABEL="Hexis Agave" ;;
   jito)  SOURCE_LABEL="Jito" ;;
@@ -331,7 +339,8 @@ route() {
     upgrade)
       case "$STATE" in
         firedancer)
-          if [[ -z "$NEW_FD" ]]; then NOTE="could not read the release list — pass --tag"
+          if $FD_IS_VANILLA && [[ -z "$TAG" ]]; then NOTE="$VANILLA_UPGRADE_HINT"
+          elif [[ -z "$NEW_FD" ]]; then NOTE="could not read the release list — pass --tag"
           elif [[ "$NEW_FD" == "$(fact fd_release)" ]]; then NOTE="already on ${NEW_FD}"
           else CMD="./reawaken.sh upgrade ${HOST_ARGS} --fd-tag '${NEW_FD}'"; fi ;;
         hexis)
@@ -361,7 +370,7 @@ route() {
         CMD="./reawaken.sh cutover ${HOST_ARGS}"
         NOTE="$(fact fd_release) is staged; this stops ${SOURCE_LABEL} and starts it"
       elif [[ -z "$NEW_FD" ]]; then
-        NOTE="could not read the release list — pass --tag"
+        NOTE="could not read the Hexis release list — pass --tag. For vanilla Firedancer, build it and run: ./reawaken.sh stage ${HOST_ARGS} --vanilla --fd-binary <path>"
       else
         CMD="./reawaken.sh stage ${HOST_ARGS} --fd-tag '${NEW_FD}'"
         NOTE="stages only; run the same goal again to cut over"
@@ -427,7 +436,7 @@ describe_fd() {
 echo ""
 echo "  Host:            ${SOL_HOST}"
 if [[ "$STATE" == "firedancer" ]]; then
-  echo "  Runs:            Firedancer with the Hexis Concorde"
+  echo "  Runs:            ${FD_FLAVOR_LABEL}"
   echo "  Agave:           ${SOURCE_LABEL}${HEXIS_DIR:+ $(fact agave_release)}, ${AGAVE_SERVICE}.service $(fact agave_active) (kept for going back)"
 else
   echo "  Runs:            ${SOURCE_LABEL}${HEXIS_DIR:+ $(fact agave_release)}, ${AGAVE_SERVICE}.service $(fact agave_active)"
@@ -454,6 +463,7 @@ if [[ -z "$GOAL" ]]; then
   done
   route upgrade
   [[ -z "$CMD" && "$NOTE" == already* ]] && echo "    upgrade     nothing to do: ${NOTE}"
+  [[ -z "$CMD" && "$STATE" == "firedancer" ]] && $FD_IS_VANILLA && echo "    upgrade     ${VANILLA_UPGRADE_HINT}"
   echo ""
   echo "  Run one of them:  $0 <goal> ${HOST_ARGS}"
   echo ""
