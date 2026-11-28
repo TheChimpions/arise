@@ -34,6 +34,10 @@ The README's "Security model" section is the full list. In short:
 - Values that end up in a command or a file on the server are checked against a strict
   pattern first: flags, release tags, and what is read back from `validator.sh` and the
   config files on the host.
+- The flags `arise.sh` records on the host (`/home/sol/.arise-flags`) hold no credential
+  and no path on your machine. What `system.sh` reads back from that file is checked
+  line by line and only printed: read the command before you run it, as the validator
+  user can write the file.
 - No credential is stored in this repository. The two Hexis credentials are supplied at
   run time and can be kept in `hexis.env`, which git ignores.
 - `arise.sh` runs every script on the server under `set -euo pipefail` and stops at the

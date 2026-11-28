@@ -146,8 +146,13 @@ set_host_args() {
   HOST_ARGS="--host ${SSH_HOST} --ssh-key $(printf '%q' "$SSH_KEY")"
   [[ "$SOL_USER" != "sol" ]] && HOST_ARGS+=" --user ${SOL_USER}"
   [[ "$ADMIN_USER" != "monarch" ]] && HOST_ARGS+=" --admin-user ${ADMIN_USER}"
-  # What arise.sh needs to change the client or version of a host it set up
-  ARISE_HINT="./arise.sh ${HOST_ARGS} --identity <staked_identity.json> --vote-account <pubkey> --network <net> --client <jito|agave> --client-version <tag> --restart"
+  # What arise.sh needs to change the client or version of a host it set up:
+  # the flags it recorded there on its last run, or the ones to fill in.
+  if [[ -n "${ARISE_RECORDED:-}" ]]; then
+    ARISE_HINT="./arise.sh ${HOST_ARGS} --identity <staked_identity.json> ${ARISE_RECORDED} --restart"
+  else
+    ARISE_HINT="./arise.sh ${HOST_ARGS} --identity <staked_identity.json> --vote-account <pubkey> --network <net> --client <jito|agave> --client-version <tag> --restart"
+  fi
   return 0
 }
 set_host_args
@@ -167,6 +172,18 @@ if ! probe "echo ok" | grep -q ok; then
 else
   VSH=$(probe "cat ${VALIDATOR_SH}")
   [[ -z "$VSH" ]] && STATE="fresh"
+fi
+
+# The flags arise.sh recorded on its last run here. The validator user can
+# write that file, so only lines that are a plain flag and value are taken,
+# and they are printed, never run.
+ARISE_RECORDED=""
+ARISE_RECORDED_ON=""
+if [[ -z "$STATE" ]]; then
+  ARISE_FLAGS=$(probe "head -n 100 /home/${SOL_USER}/${ARISE_FLAGS_NAME}")
+  ARISE_RECORDED=$(arise_flags_command "$ARISE_FLAGS")
+  ARISE_RECORDED_ON=$(arise_flags_date "$ARISE_FLAGS")
+  set_host_args
 fi
 
 # A Firedancer that is running from somewhere other than ${FD_DIR}: one these
@@ -482,9 +499,17 @@ if [[ -z "$GOAL" ]]; then
   echo ""
   echo "  Run one of them:  $0 <goal> ${HOST_ARGS}"
   echo ""
-  echo "  Jito <-> Agave, leaving Hexis, or a new Jito/Agave version — arise.sh, with"
-  echo "  the flags this host was set up with:"
-  echo "    ${ARISE_HINT}"
+  if [[ -n "$ARISE_RECORDED" ]]; then
+    echo "  Jito <-> Agave, leaving Hexis, or a new Jito/Agave version — arise.sh, with the"
+    echo "  flags of its last run here${ARISE_RECORDED_ON:+ (${ARISE_RECORDED_ON})} and --client / --client-version changed:"
+    echo "    ${ARISE_HINT}"
+    echo "  Credentials and local files (--hexis-binary, --fd-binary, ...) are not recorded: add back any you used."
+  else
+    echo "  Jito <-> Agave, leaving Hexis, or a new Jito/Agave version — arise.sh, with"
+    echo "  the flags this host was set up with:"
+    echo "    ${ARISE_HINT}"
+    echo "  (arise.sh records them on the host from its next run on, and they are then shown here.)"
+  fi
   if [[ "$STATE" == "firedancer" ]]; then
     echo "  Here that installs the client beside Firedancer; 'agave' above then switches to it."
   fi

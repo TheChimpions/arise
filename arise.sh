@@ -354,6 +354,9 @@ EOF
   exit "${1:-1}"
 }
 
+# Kept as given: what is recorded on the host at the end is taken from these
+ORIG_ARGS=("$@")
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --host)           need_arg "$@"; SSH_HOST="$2";       shift 2 ;;
@@ -2867,6 +2870,20 @@ fi
 echo "Leftover check complete"
 SCRIPT
 } | root_script
+
+# ---------------------------------------------------------------------------
+# Record the flags of this run on the host, for the next one. system.sh reads
+# them back to print the command that changes this host's client or version.
+# ---------------------------------------------------------------------------
+ARISE_FLAGS_PATH="${SOL_HOME}/${ARISE_FLAGS_NAME}"
+log_info "Recording this run's flags in ${ARISE_FLAGS_PATH} (no credentials, no local paths)"
+SETTLED_FLAGS=()
+# Settled during the run when not given: the release picked from the list, the
+# commission typed at the prompt
+[[ "$CLIENT_VERSION" =~ $RE_REF ]] && SETTLED_FLAGS+=(--client-version "$CLIENT_VERSION")
+[[ "$COMMISSION_BPS" =~ ^[0-9]{1,5}$ ]] && SETTLED_FLAGS+=(--commission-bps "$COMMISSION_BPS")
+arise_flags_record ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} ${SETTLED_FLAGS[@]+"${SETTLED_FLAGS[@]}"} \
+  | sol_put "$ARISE_FLAGS_PATH" 600
 
 # ---------------------------------------------------------------------------
 # Done

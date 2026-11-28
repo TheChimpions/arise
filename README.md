@@ -343,6 +343,18 @@ and uses the first that gets in and holds sudo. It says which one it found, and 
 command it prints or runs carries `--admin-user <name>`. An `--admin-user` you pass is
 used as given.
 
+**The flags the host was set up with.** `arise.sh` ends each run by writing its flags to
+`/home/sol/.arise-flags` (mode 600), and `system.sh` reads them back, so the `arise.sh`
+command it prints for a client or version change is the real one instead of one with
+placeholders. Never written: the Hexis credentials, `--metrics-config`, paths to files on
+your machine (`--identity`, `--ssh-key`, `--hexis-binary`, `--fd-binary`, `--hexis-signer`,
+`--hexis-config`, `--concorde-tables`), `--host` and the users, and what only applied to
+one run (`--restart`, `--dry-run`, `--confirm-format`, the restart window). Add those back
+yourself. A release picked from the list and a commission typed at the prompt are
+recorded as if they had been flags. A host set up before this has no such file until
+`arise.sh` runs on it again. The validator user owns the file, so `system.sh` takes only
+lines that are a plain flag and value, and prints the command without running it.
+
 **Host checks.** The report also looks at a few things that are wrong whatever client
 runs, each with the command that fixes it: a `/` not owned by root, the validator user
 in the `docker` group or holding sudo, a firewall that is off, and keypair files other
@@ -391,7 +403,8 @@ back to `cutover`, which then only does those steps.
 
 `arise.sh` describes what a host should be, so changing client is the same command
 with a different `--client`. Run it with the flags the host was set up with, the new
-client, and `--restart`:
+client, and `--restart`. `./system.sh --host <ip> --ssh-key <key>` prints that command
+with the flags recorded on the host:
 
 ```bash
 # Jito -> Agave
