@@ -23,6 +23,9 @@ NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+# need_arg "$@" — in a flag loop: the flag at $1 takes a value, and there is one.
+# Without it a flag given last dies on "$2: unbound variable" under set -u.
+need_arg() { [[ $# -ge 2 ]] || { log_error "$1 requires a value"; usage; }; }
 
 # ---------------------------------------------------------------------------
 # Hexis defaults

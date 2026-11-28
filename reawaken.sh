@@ -54,6 +54,7 @@ ADMIN_USER="monarch"          # holds sudo; sol does not
 VALIDATOR_SH=""              # defaults to /home/$SOL_USER/validator.sh
 AGAVE_SERVICE="sol"
 DRY_RUN=false
+HOST_KEY_FP=""
 ASSUME_YES=false
 NOW=false
 # Minutes with no leader slot ahead before the validator is stopped. A move
@@ -175,6 +176,10 @@ Config (stage):
 
 Paths:
   --user <name>                 Validator user (default: ${SOL_USER})
+  --host-key-fingerprint <fp>   SHA256:... fingerprint of the server's SSH host key, from
+                                your provider's console. The host must have that key or
+                                nothing connects. Without it the first connection
+                                trusts the key it is shown.
   --admin-user <name>           User that holds sudo (default: ${ADMIN_USER}). All root
                                 work goes through it; the validator user has no sudo
   --validator-script <path>     Agave startup script (default: /home/<user>/validator.sh)
@@ -196,55 +201,56 @@ Other:
   --dry-run                     Print what would happen, change nothing
   -h, --help                    Show this help
 EOF
-  exit 1
+  exit "${1:-1}"
 }
 
 [[ $# -eq 0 ]] && usage
 case "$1" in
   stage|cutover|rollback|upgrade|unit|status) MODE="$1"; shift ;;
-  -h|--help) usage ;;
+  -h|--help) usage 0 ;;
   *) log_error "First argument must be 'stage', 'cutover', 'rollback', 'upgrade', 'unit' or 'status'"; usage ;;
 esac
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --host)             SSH_HOST="$2"; shift 2 ;;
-    --ssh-key)          SSH_KEY="$2"; shift 2 ;;
-    --user)             SOL_USER="$2"; shift 2 ;;
-    --admin-user)       ADMIN_USER="$2"; shift 2 ;;
-    --validator-script) VALIDATOR_SH="$2"; shift 2 ;;
-    --agave-service)    AGAVE_SERVICE="$2"; shift 2 ;;
-    --fd-tag)           FD_TAG="$2"; shift 2 ;;
-    --fd-binary)        FD_BINARY="$2"; shift 2 ;;
-    --fd-asset)         FD_ASSET="$2"; shift 2 ;;
+    --host)             need_arg "$@"; SSH_HOST="$2"; shift 2 ;;
+    --ssh-key)          need_arg "$@"; SSH_KEY="$2"; shift 2 ;;
+    --host-key-fingerprint) need_arg "$@"; HOST_KEY_FP="$2"; shift 2 ;;
+    --user)             need_arg "$@"; SOL_USER="$2"; shift 2 ;;
+    --admin-user)       need_arg "$@"; ADMIN_USER="$2"; shift 2 ;;
+    --validator-script) need_arg "$@"; VALIDATOR_SH="$2"; shift 2 ;;
+    --agave-service)    need_arg "$@"; AGAVE_SERVICE="$2"; shift 2 ;;
+    --fd-tag)           need_arg "$@"; FD_TAG="$2"; shift 2 ;;
+    --fd-binary)        need_arg "$@"; FD_BINARY="$2"; shift 2 ;;
+    --fd-asset)         need_arg "$@"; FD_ASSET="$2"; shift 2 ;;
     --previous)         FD_PREVIOUS=true; shift ;;
     --vanilla)         FD_VANILLA=true; shift ;;
-    --fd-dir)           FD_DIR="$2"; shift 2 ;;
-    --fd-user)          FD_USER="$2"; shift 2 ;;
-    --fd-base)          FD_BASE="$2"; shift 2 ;;
-    --fd-accounts)      FD_ACCOUNTS="$2"; shift 2 ;;
-    --interface)        FD_INTERFACE="$2"; shift 2 ;;
-    --metrics-address)  FD_METRICS_ADDR="$2"; shift 2 ;;
+    --fd-dir)           need_arg "$@"; FD_DIR="$2"; shift 2 ;;
+    --fd-user)          need_arg "$@"; FD_USER="$2"; shift 2 ;;
+    --fd-base)          need_arg "$@"; FD_BASE="$2"; shift 2 ;;
+    --fd-accounts)      need_arg "$@"; FD_ACCOUNTS="$2"; shift 2 ;;
+    --interface)        need_arg "$@"; FD_INTERFACE="$2"; shift 2 ;;
+    --metrics-address)  need_arg "$@"; FD_METRICS_ADDR="$2"; shift 2 ;;
     --enable-rpc)       FD_ENABLE_RPC=true; shift ;;
     --snapshot-allow-any) FD_SNAPSHOT_ALLOW_ANY=true; shift ;;
-    --snapshot-mirror)  SNAPSHOT_MIRROR="$2"; shift 2 ;;
+    --snapshot-mirror)  need_arg "$@"; SNAPSHOT_MIRROR="$2"; shift 2 ;;
     --no-snapshot-prefetch) SNAPSHOT_PREFETCH=false; shift ;;
-    --block-engine-url) FD_BUNDLE_URL="$2"; shift 2 ;;
-    --commission-bps)   FD_COMMISSION_BPS="$2"; shift 2 ;;
+    --block-engine-url) need_arg "$@"; FD_BUNDLE_URL="$2"; shift 2 ;;
+    --commission-bps)   need_arg "$@"; FD_COMMISSION_BPS="$2"; shift 2 ;;
     --no-block-engine)  FD_NO_BLOCK_ENGINE=true; shift ;;
-    --shred-destinations) FD_SHRED_DESTS="$2"; FD_SHRED_DESTS_SET=true; shift 2 ;;
-    --hexis-signer)     FD_SIGNER="$2"; shift 2 ;;
+    --shred-destinations) need_arg "$@"; FD_SHRED_DESTS="$2"; FD_SHRED_DESTS_SET=true; shift 2 ;;
+    --hexis-signer)     need_arg "$@"; FD_SIGNER="$2"; shift 2 ;;
     --generate-signer)  FD_GENERATE_SIGNER=true; shift ;;
-    --concorde-tables)  FD_CONCORDE_TABLES="$2"; shift 2 ;;
-    --jupiter-token-ledger) FD_JUPITER_LEDGER="$2"; FD_JUPITER_LEDGER_SET=true; shift 2 ;;
-    --okx-token-ledger) FD_OKX_LEDGER="$2"; FD_OKX_LEDGER_SET=true; shift 2 ;;
-    --min-idle-time)    MIN_IDLE_TIME="$2"; shift 2 ;;
-    --max-delinquent-stake) MAX_DELINQUENT_STAKE="$2"; shift 2 ;;
+    --concorde-tables)  need_arg "$@"; FD_CONCORDE_TABLES="$2"; shift 2 ;;
+    --jupiter-token-ledger) need_arg "$@"; FD_JUPITER_LEDGER="$2"; FD_JUPITER_LEDGER_SET=true; shift 2 ;;
+    --okx-token-ledger) need_arg "$@"; FD_OKX_LEDGER="$2"; FD_OKX_LEDGER_SET=true; shift 2 ;;
+    --min-idle-time)    need_arg "$@"; MIN_IDLE_TIME="$2"; shift 2 ;;
+    --max-delinquent-stake) need_arg "$@"; MAX_DELINQUENT_STAKE="$2"; shift 2 ;;
     --wait-for-new-snapshot) SKIP_SNAPSHOT_CHECK=false; shift ;;
     --now)              NOW=true; shift ;;
     --yes)              ASSUME_YES=true; shift ;;
     --dry-run)          DRY_RUN=true; shift ;;
-    -h|--help)          usage ;;
+    -h|--help)          usage 0 ;;
     *) log_error "Unknown option: $1"; usage ;;
   esac
 done

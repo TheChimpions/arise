@@ -22,7 +22,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-for lib in hexis.sh firedancer.sh; do
+for lib in hexis.sh firedancer.sh remote.sh; do
   if [[ ! -f "${ROOT}/lib/${lib}" ]]; then
     echo "Missing ${ROOT}/lib/${lib} — run this from a checkout, not as a lone copied file" >&2
     exit 1
@@ -32,6 +32,8 @@ done
 source "${ROOT}/lib/hexis.sh"
 # shellcheck source=lib/firedancer.sh
 source "${ROOT}/lib/firedancer.sh"
+# shellcheck source=lib/remote.sh
+source "${ROOT}/lib/remote.sh"
 
 AGAVE_ASSET="agave-validator-linux-amd64"
 FD_ASSET_GENERIC="firedancer-linux-amd64"
@@ -45,6 +47,7 @@ ADMIN_USER_SET=false         # true when --admin-user was given: then it is not 
 AGAVE_SERVICE="sol"
 TAG=""
 PRINT_ONLY=false
+HOST_KEY_FP=""
 PASS=()
 
 usage() {
@@ -66,6 +69,9 @@ new --client / --client-version, and --restart. It needs your keys, so it is not
 run from here.
 
 Options:
+  --host-key-fingerprint <fp>
+                       SHA256:... fingerprint of the server's SSH host key. The host
+                       must have that key or nothing connects
   --tag <tag>          Release to use instead of the newest
   --user <name>        Validator user (default: ${SOL_USER})
   --admin-user <name>  Admin user that holds sudo (default: ${ADMIN_USER})
@@ -75,7 +81,7 @@ Options:
 
 Everything after '--' goes to the script that is run, e.g. '-- --dry-run' or '-- --now'.
 EOF
-  exit 1
+  exit "${1:-1}"
 }
 
 case "${1:-}" in
@@ -84,15 +90,16 @@ esac
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --host)          SSH_HOST="$2"; shift 2 ;;
-    --ssh-key)       SSH_KEY="$2"; shift 2 ;;
-    --user)          SOL_USER="$2"; shift 2 ;;
-    --admin-user)    ADMIN_USER="$2"; ADMIN_USER_SET=true; shift 2 ;;
-    --agave-service) AGAVE_SERVICE="$2"; shift 2 ;;
-    --tag)           TAG="$2"; shift 2 ;;
+    --host)          need_arg "$@"; SSH_HOST="$2"; shift 2 ;;
+    --ssh-key)       need_arg "$@"; SSH_KEY="$2"; shift 2 ;;
+    --host-key-fingerprint) need_arg "$@"; HOST_KEY_FP="$2"; shift 2 ;;
+    --user)          need_arg "$@"; SOL_USER="$2"; shift 2 ;;
+    --admin-user)    need_arg "$@"; ADMIN_USER="$2"; ADMIN_USER_SET=true; shift 2 ;;
+    --agave-service) need_arg "$@"; AGAVE_SERVICE="$2"; shift 2 ;;
+    --tag)           need_arg "$@"; TAG="$2"; shift 2 ;;
     --print)         PRINT_ONLY=true; shift ;;
     --)              shift; PASS=("$@"); break ;;
-    -h|--help)       usage ;;
+    -h|--help)       usage 0 ;;
     *) log_error "Unknown option or goal: $1"; usage ;;
   esac
 done
@@ -112,10 +119,17 @@ done
 SOL_HOST="${SOL_USER}@${SSH_HOST}"
 VALIDATOR_SH="/home/${SOL_USER}/validator.sh"
 FD_DIR="/home/${SOL_USER}/firedancer"
+# With a fingerprint the host key is settled before the first connection. The
+# script handed over to then finds it in known_hosts.
+HOST_KEY_CHECK="accept-new"
+if [[ -n "$HOST_KEY_FP" ]]; then
+  pin_host_key "$SSH_HOST" "$HOST_KEY_FP" || exit 1
+  HOST_KEY_CHECK="yes"
+fi
 # Key login only, as in lib/remote.sh: a failed key never falls back to a
 # password prompt.
 SSH_OPTS=(
-  -o StrictHostKeyChecking=accept-new
+  -o "StrictHostKeyChecking=${HOST_KEY_CHECK}"
   -o ConnectTimeout=10
   -o IdentitiesOnly=yes
   -o BatchMode=yes
@@ -123,6 +137,7 @@ SSH_OPTS=(
   -o KbdInteractiveAuthentication=no
   -i "$SSH_KEY"
 )
+[[ -n "${KNOWN_HOSTS_FILE:-}" ]] && SSH_OPTS+=(-o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}")
 # Builds the arguments every printed command carries. Called again when the
 # admin user turns out to be someone other than the default.
 set_host_args() {

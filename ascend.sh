@@ -51,6 +51,7 @@ HEXIS_DIR=""                 # defaults to /home/$SOL_USER/hexis
 VALIDATOR_SH=""              # defaults to /home/$SOL_USER/validator.sh
 LEDGER_PATH=""               # parsed out of validator.sh when not given
 DRY_RUN=false
+HOST_KEY_FP=""
 ASSUME_YES=false
 RESTART=false
 MIN_IDLE_TIME="20"
@@ -103,6 +104,10 @@ Binary source (upgrade always, migrate always):
 
 Paths:
   --user <name>                 Validator user (default: ${SOL_USER})
+  --host-key-fingerprint <fp>   SHA256:... fingerprint of the server's SSH host key, from
+                                your provider's console. The host must have that key or
+                                nothing connects. Without it the first connection
+                                trusts the key it is shown.
   --admin-user <name>           User that holds sudo (default: ${ADMIN_USER}). All root
                                 work goes through it; the validator user has no sudo
   --hexis-dir <path>            Install dir (default: /home/<user>/hexis)
@@ -156,59 +161,60 @@ Other:
   --dry-run                     Print what would happen, change nothing
   -h, --help                    Show this help
 EOF
-  exit 1
+  exit "${1:-1}"
 }
 
 [[ $# -eq 0 ]] && usage
 case "$1" in
   upgrade|migrate|promote) MODE="$1"; shift ;;
-  -h|--help)       usage ;;
+  -h|--help)       usage 0 ;;
   *) log_error "First argument must be 'upgrade', 'migrate' or 'promote'"; usage ;;
 esac
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --host)            SSH_HOST="$2";  shift 2 ;;
-    --ssh-key)         SSH_KEY="$2";   shift 2 ;;
-    --user)            SOL_USER="$2";  shift 2 ;;
-    --admin-user)      ADMIN_USER="$2"; shift 2 ;;
-    --hexis-dir)       HEXIS_DIR="$2"; shift 2 ;;
-    --validator-script) VALIDATOR_SH="$2"; shift 2 ;;
-    --ledger)          LEDGER_PATH="$2"; shift 2 ;;
-    --hexis-tag)       HEXIS_TAG="$2"; shift 2 ;;
-    --hexis-binary)    HEXIS_BINARY="$2"; shift 2 ;;
-    --hexis-setup-tag) HEXIS_SETUP_TAG="$2"; shift 2 ;;
-    --hexis-setup-binary) HEXIS_SETUP_BINARY="$2"; shift 2 ;;
-    --hexis-config)    HEXIS_CONFIG="$2"; shift 2 ;;
-    --hexis-signer)    HEXIS_SIGNER="$2"; shift 2 ;;
-    --hexis-profit-wallet) HEXIS_PROFIT_WALLET="$2"; shift 2 ;;
-    --hexis-program-id) HEXIS_PROGRAM_ID="$2"; shift 2 ;;
-    --hexis-jup-key)   HEXIS_JUP_KEY="$2"; HEXIS_JUP_KEY_SET=true; shift 2 ;;
-    --hexis-metrics-config) HEXIS_METRICS_CONFIG="$2"; HEXIS_METRICS_CONFIG_SET=true; shift 2 ;;
-    --hexis-lookup-tables) HEXIS_LOOKUP_TABLES="$2"; shift 2 ;;
-    --hexis-jupiter-token-ledger) HEXIS_JUPITER_TOKEN_LEDGER="$2"; shift 2 ;;
-    --hexis-okx-token-ledger) HEXIS_OKX_TOKEN_LEDGER="$2"; shift 2 ;;
-    --hexis-base-mints) HEXIS_BASE_MINTS="$2"; shift 2 ;;
-    --hexis-marginfi-account) HEXIS_MARGINFI_ACCOUNT="$2"; shift 2 ;;
+    --host)            need_arg "$@"; SSH_HOST="$2";  shift 2 ;;
+    --ssh-key)         need_arg "$@"; SSH_KEY="$2";   shift 2 ;;
+    --host-key-fingerprint) need_arg "$@"; HOST_KEY_FP="$2"; shift 2 ;;
+    --user)            need_arg "$@"; SOL_USER="$2";  shift 2 ;;
+    --admin-user)      need_arg "$@"; ADMIN_USER="$2"; shift 2 ;;
+    --hexis-dir)       need_arg "$@"; HEXIS_DIR="$2"; shift 2 ;;
+    --validator-script) need_arg "$@"; VALIDATOR_SH="$2"; shift 2 ;;
+    --ledger)          need_arg "$@"; LEDGER_PATH="$2"; shift 2 ;;
+    --hexis-tag)       need_arg "$@"; HEXIS_TAG="$2"; shift 2 ;;
+    --hexis-binary)    need_arg "$@"; HEXIS_BINARY="$2"; shift 2 ;;
+    --hexis-setup-tag) need_arg "$@"; HEXIS_SETUP_TAG="$2"; shift 2 ;;
+    --hexis-setup-binary) need_arg "$@"; HEXIS_SETUP_BINARY="$2"; shift 2 ;;
+    --hexis-config)    need_arg "$@"; HEXIS_CONFIG="$2"; shift 2 ;;
+    --hexis-signer)    need_arg "$@"; HEXIS_SIGNER="$2"; shift 2 ;;
+    --hexis-profit-wallet) need_arg "$@"; HEXIS_PROFIT_WALLET="$2"; shift 2 ;;
+    --hexis-program-id) need_arg "$@"; HEXIS_PROGRAM_ID="$2"; shift 2 ;;
+    --hexis-jup-key)   need_arg "$@"; HEXIS_JUP_KEY="$2"; HEXIS_JUP_KEY_SET=true; shift 2 ;;
+    --hexis-metrics-config) need_arg "$@"; HEXIS_METRICS_CONFIG="$2"; HEXIS_METRICS_CONFIG_SET=true; shift 2 ;;
+    --hexis-lookup-tables) need_arg "$@"; HEXIS_LOOKUP_TABLES="$2"; shift 2 ;;
+    --hexis-jupiter-token-ledger) need_arg "$@"; HEXIS_JUPITER_TOKEN_LEDGER="$2"; shift 2 ;;
+    --hexis-okx-token-ledger) need_arg "$@"; HEXIS_OKX_TOKEN_LEDGER="$2"; shift 2 ;;
+    --hexis-base-mints) need_arg "$@"; HEXIS_BASE_MINTS="$2"; shift 2 ;;
+    --hexis-marginfi-account) need_arg "$@"; HEXIS_MARGINFI_ACCOUNT="$2"; shift 2 ;;
     --no-hexis-flash-loans) HEXIS_MARGINFI_ACCOUNT=""; shift ;;
-    --hexis-marginfi-banks) HEXIS_MARGINFI_BANKS="$2"; shift 2 ;;
-    --hexis-marginfi-program-id) HEXIS_MARGINFI_PROGRAM_ID="$2"; shift 2 ;;
-    --hexis-control-bind) HEXIS_CONTROL_BIND="$2"; shift 2 ;;
-    --hexis-control-allow) HEXIS_CONTROL_ALLOW="$2"; shift 2 ;;
+    --hexis-marginfi-banks) need_arg "$@"; HEXIS_MARGINFI_BANKS="$2"; shift 2 ;;
+    --hexis-marginfi-program-id) need_arg "$@"; HEXIS_MARGINFI_PROGRAM_ID="$2"; shift 2 ;;
+    --hexis-control-bind) need_arg "$@"; HEXIS_CONTROL_BIND="$2"; shift 2 ;;
+    --hexis-control-allow) need_arg "$@"; HEXIS_CONTROL_ALLOW="$2"; shift 2 ;;
     --no-hexis-control) HEXIS_CONTROL=false; shift ;;
     --stage-only)      STAGE_ONLY=true; shift ;;
-    --release)         PROMOTE_RELEASE="$2"; shift 2 ;;
+    --release)         need_arg "$@"; PROMOTE_RELEASE="$2"; shift 2 ;;
     --list)            LIST_RELEASES=true; shift ;;
     --restart)         RESTART=true;   shift ;;
-    --min-idle-time)   MIN_IDLE_TIME="$2"; shift 2 ;;
-    --max-delinquent-stake) MAX_DELINQUENT_STAKE="$2"; shift 2 ;;
+    --min-idle-time)   need_arg "$@"; MIN_IDLE_TIME="$2"; shift 2 ;;
+    --max-delinquent-stake) need_arg "$@"; MAX_DELINQUENT_STAKE="$2"; shift 2 ;;
     --skip-new-snapshot-check) SKIP_SNAPSHOT_CHECK=true; shift ;;
     --wait-for-new-snapshot) SKIP_SNAPSHOT_CHECK=false; shift ;;
-    --metrics-config) METRICS_CONFIG="$2"; METRICS_CONFIG_SET=true; shift 2 ;;
+    --metrics-config) need_arg "$@"; METRICS_CONFIG="$2"; METRICS_CONFIG_SET=true; shift 2 ;;
     --fix-metrics)     FIX_METRICS=true; shift ;;
     --yes)             ASSUME_YES=true; shift ;;
     --dry-run)         DRY_RUN=true;   shift ;;
-    -h|--help)         usage ;;
+    -h|--help)         usage 0 ;;
     *) log_error "Unknown option: $1"; usage ;;
   esac
 done

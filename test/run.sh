@@ -1294,6 +1294,31 @@ group "CLI validation"
   it "arise rejects an unknown flag"
   assert_contains "$(arise --nonsense)" "Unknown option"
 
+  # A value flag given last used to die on "$2: unbound variable" under set -u
+  for script in arise.sh ascend.sh reawaken.sh system.sh; do
+    case "$script" in
+      ascend.sh)   mode="upgrade" ;;
+      reawaken.sh) mode="status" ;;
+      *)           mode="" ;;
+    esac
+    it "$script names the flag that is missing its value"
+    # shellcheck disable=SC2086
+    out=$( (cd "$ROOT" && ./"$script" $mode --host) 2>&1 )
+    assert_contains "$out" "--host requires a value"
+    it "$script does not hit an unbound variable on a flag with no value"
+    assert_not_contains "$out" "unbound variable"
+
+    it "$script --help exits 0 and prints usage"
+    out=$( (cd "$ROOT" && ./"$script" --help) 2>&1 ); rc=$?
+    assert_eq "$rc" "0"
+    it "$script --help shows the usage text"
+    assert_contains "$out" "Usage:"
+    it "$script exits 1 on an unknown flag"
+    # shellcheck disable=SC2086
+    (cd "$ROOT" && ./"$script" $mode --nonsense) >/dev/null 2>&1; rc=$?
+    assert_eq "$rc" "1"
+  done
+
   # Printed commands are copy-pasted against real hosts. Without IdentitiesOnly
   # the agent offers every loaded key and can trip the server's MaxAuthTries.
   it "printed ssh commands carry the key and IdentitiesOnly"
@@ -2837,6 +2862,101 @@ group "client switch (arise.sh on a live host)"
 
   it "a dry run says what --restart would do"
   assert_contains "$(arise "${sw_base[@]}" --dry-run --restart)" "[DRY RUN] --restart: if a validator is running, would wait for a restart window"
+fi
+
+if should_run "hostkey"; then
+  echo "host key pinning"
+  # shellcheck source=../lib/hexis.sh
+  source "${ROOT}/lib/hexis.sh"
+  # shellcheck source=../lib/remote.sh
+  source "${ROOT}/lib/remote.sh"
+
+  ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/hostkey" <<<y >/dev/null 2>&1
+  ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/otherkey" <<<y >/dev/null 2>&1
+  HK_FP=$(ssh-keygen -lf "$WORK/hostkey.pub" | awk '{print $2}')
+  OTHER_FP=$(ssh-keygen -lf "$WORK/otherkey.pub" | awk '{print $2}')
+  printf '# 1.2.3.4:22 SSH-2.0-OpenSSH\n1.2.3.4 %s\n' "$(cut -d' ' -f1,2 "$WORK/hostkey.pub")" > "$WORK/scan"
+  pin() { KNOWN_HOSTS_FILE="$1" STUB_KEYSCAN="${3-$WORK/scan}" pin_host_key 1.2.3.4 "$2" 2>&1; }
+
+  it "a host whose scanned key has the fingerprint is added to known_hosts"
+  out=$(pin "$WORK/kh1" "$HK_FP"); rc=$?
+  assert_eq "$rc" "0"
+  it "the key that was added is the scanned one"
+  assert_contains "$(cat "$WORK/kh1")" "$(cut -d' ' -f2 "$WORK/hostkey.pub")"
+
+  it "a key already in known_hosts with the fingerprint needs no scan"
+  out=$(STUB_LOG="$WORK/pin-known.log" pin "$WORK/kh1" "$HK_FP" /nonexistent); rc=$?
+  assert_eq "$rc" "0"
+  it "and the host is not asked for its keys again"
+  assert_file_missing "$WORK/pin-known.log"
+  it "and known_hosts is not added to twice"
+  assert_eq "$(wc -l < "$WORK/kh1" | tr -d ' ')" "1"
+
+  it "a host that offers a different key is refused"
+  out=$(pin "$WORK/kh2" "$OTHER_FP"); rc=$?
+  assert_eq "$rc" "1"
+  it "the refusal names the key the host does offer"
+  assert_contains "$out" "It offers: ${HK_FP}"
+  it "nothing is written to known_hosts for a refused host"
+  assert_file_missing "$WORK/kh2"
+
+  it "a known_hosts entry with another key does not satisfy the fingerprint"
+  out=$(pin "$WORK/kh1" "$OTHER_FP"); rc=$?
+  assert_eq "$rc" "1"
+
+  it "a host that answers with no key is refused"
+  out=$(pin "$WORK/kh3" "$HK_FP" /nonexistent); rc=$?
+  assert_contains "$out" "Could not read a host key"
+  it "with a failing status"
+  assert_eq "$rc" "1"
+
+  it "a fingerprint that is not a SHA256 one is refused"
+  out=$(pin "$WORK/kh3" "MD5:aa:bb:cc"); rc=$?
+  assert_contains "$out" "must look like SHA256:"
+
+  it "system.sh connects to nothing when the fingerprint does not match"
+  out=$(KNOWN_HOSTS_FILE="$WORK/kh4" STUB_KEYSCAN="$WORK/scan" STUB_LOG="$WORK/pin-sys.log" \
+    system --host 1.2.3.4 --ssh-key "$WORK/key" --host-key-fingerprint "$OTHER_FP")
+  assert_contains "$out" "not connecting"
+  it "ssh is never run for it"
+  assert_not_contains "$(grep -v '^ssh-keyscan' "$WORK/pin-sys.log")" "1.2.3.4"
+
+  it "system.sh with a matching fingerprint connects with strict host key checking"
+  KNOWN_HOSTS_FILE="$WORK/kh5" STUB_KEYSCAN="$WORK/scan" STUB_LOG="$WORK/pin-sys-ok.log" \
+    STUB_RESPONSES="$ROOT/test/fixtures/host-hexis.responses" \
+    system --host 1.2.3.4 --ssh-key "$WORK/key" --host-key-fingerprint "$HK_FP" >/dev/null
+  assert_contains "$(cat "$WORK/pin-sys-ok.log")" "StrictHostKeyChecking=yes"
+  it "and never with accept-new"
+  assert_not_contains "$(cat "$WORK/pin-sys-ok.log")" "accept-new"
+
+  for script in ascend reawaken; do
+    mode=upgrade; extra=(--hexis-binary "$WORK/binary")
+    if [[ "$script" == reawaken ]]; then mode=status; extra=(--yes); fi
+    it "$script.sh connects to nothing when the fingerprint does not match"
+    out=$( (cd "$ROOT" && KNOWN_HOSTS_FILE="$WORK/kh-$script" STUB_KEYSCAN="$WORK/scan" STUB_LOG="$WORK/pin-$script.log" \
+      ./"$script".sh "$mode" --host 1.2.3.4 --ssh-key "$WORK/key" "${extra[@]}" \
+      --host-key-fingerprint "$OTHER_FP") 2>&1 )
+    assert_contains "$out" "not connecting"
+    it "$script.sh runs no ssh for it"
+    assert_not_contains "$(grep -v '^ssh-keyscan' "$WORK/pin-$script.log" 2>/dev/null)" "1.2.3.4"
+  done
+
+  it "arise.sh connects to nothing when the fingerprint does not match"
+  out=$(KNOWN_HOSTS_FILE="$WORK/kh-arise" STUB_KEYSCAN="$WORK/scan" STUB_LOG="$WORK/pin-arise.log" \
+    arise --host 1.2.3.4 --ssh-key "$WORK/key" --identity "$WORK/id.json" \
+    --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network testnet --host-key-fingerprint "$OTHER_FP")
+  assert_contains "$out" "not connecting"
+  it "arise.sh runs no ssh for it"
+  assert_not_contains "$(grep -v '^ssh-keyscan' "$WORK/pin-arise.log" 2>/dev/null)" "1.2.3.4"
+
+  it "arise.sh warns when the host is unknown and no fingerprint was given"
+  out=$(KNOWN_HOSTS_FILE="$WORK/kh-empty" arise --host 1.2.3.4 --ssh-key "$WORK/key" --identity "$WORK/id.json" \
+    --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network testnet --dry-run)
+  assert_contains "$out" "is not in known_hosts"
+  it "arise.sh does not warn about a host that is already known"
+  out=$(KNOWN_HOSTS_FILE="$WORK/kh1" arise --host 1.2.3.4 --ssh-key "$WORK/key" --identity "$WORK/id.json" \
+    --vote-account 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 --network testnet --dry-run)
+  assert_not_contains "$out" "is not in known_hosts"
 fi
 
 # ---------------------------------------------------------------------------
